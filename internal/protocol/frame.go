@@ -59,6 +59,21 @@ func ParseFrame(buf []byte) (Frame, error) {
 		return Frame{}, errors.New("frame truncated: payload exceeds buffer length")
 	}
 
+	// Zero-length payloads: return nil slice without calling unsafe.Slice,
+	// which would require buf[HeaderSize] to be a valid address even when
+	// the buffer length equals HeaderSize exactly.
+	if payloadLen == 0 {
+		return Frame{
+			Command:    cmd,
+			StreamID:   streamID,
+			PayloadLen: 0,
+			Payload:    nil,
+		}, nil
+	}
+
+	// SAFE: We verified len(buf) >= HeaderSize + int(payloadLen) above.
+	// payloadLen > 0, so &buf[HeaderSize] is within bounds, and the slice
+	// length payloadLen is bounded by the remaining buffer bytes.
 	payload := unsafe.Slice(&buf[HeaderSize], payloadLen)
 
 	return Frame{
@@ -106,6 +121,16 @@ func ReleaseBuffer(bp *[]byte) {
 		return
 	}
 	bufPool.Put(bp)
+}
+
+// PayloadLen extracts the payload length from a frame buffer at offset 6.
+// SAFETY: Caller must ensure len(buf) >= HeaderSize (10).
+func PayloadLen(buf []byte) uint32 {
+	if len(buf) < HeaderSize {
+		return 0
+	}
+	// SAFE: len(buf) >= 10, reading 4 bytes at offset 6 (bytes 6..9).
+	return *(*uint32)(unsafe.Pointer(&buf[6]))
 }
 
 func FrameSize(payloadLen uint32) int {
