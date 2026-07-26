@@ -117,7 +117,13 @@ func main() {
 	logger.Info("metrics server started", "addr", cfg.MetricsAddr)
 
 	routerMetrics := &prometheusMetrics{}
-	router := broker.NewRouter(routerMetrics)
+	policy := broker.ParseBackpressurePolicy(cfg.Broker.BackpressurePolicy)
+	router := broker.NewRouter(
+		routerMetrics,
+		broker.WithQueueSize(cfg.Broker.QueueSize),
+		broker.WithBackpressurePolicy(policy),
+	)
+	logger.Info("router initialized", "queue_size", cfg.Broker.QueueSize, "backpressure_policy", policy.String())
 
 	opts := []transport.Option{
 		transport.WithLogger(logger),

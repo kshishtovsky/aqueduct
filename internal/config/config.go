@@ -16,6 +16,7 @@ type Config struct {
 	TLS         TLSConfig       `yaml:"tls"`
 	AAL         AALConfig       `yaml:"aal"`
 	ACL         ACLConfig       `yaml:"acl"`
+	Broker      BrokerConfig    `yaml:"broker"`
 	Transport   TransportConfig `yaml:"transport"`
 }
 
@@ -49,6 +50,12 @@ type ACLConfig struct {
 	Rules   []ACLRuleConfig `yaml:"rules"`
 }
 
+// BrokerConfig defines async queue size and backpressure isolation policies.
+type BrokerConfig struct {
+	QueueSize          int    `yaml:"queue_size"`
+	BackpressurePolicy string `yaml:"backpressure_policy"` // "drop_oldest", "drop_newest", "disconnect"
+}
+
 // TransportConfig defines internal buffer limits.
 type TransportConfig struct {
 	MaxBufSize  int `yaml:"max_buf_size"`
@@ -73,6 +80,10 @@ func Default() *Config {
 			Enabled: false,
 			Default: "none",
 			Rules:   nil,
+		},
+		Broker: BrokerConfig{
+			QueueSize:          1024,
+			BackpressurePolicy: "drop_oldest",
 		},
 		Transport: TransportConfig{
 			MaxBufSize:  64 * 1024,
@@ -138,6 +149,14 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_ACL_DEFAULT"); v != "" {
 		cfg.ACL.Default = v
+	}
+	if v := os.Getenv("AQUEDUCT_BROKER_QUEUE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Broker.QueueSize = n
+		}
+	}
+	if v := os.Getenv("AQUEDUCT_BROKER_BACKPRESSURE_POLICY"); v != "" {
+		cfg.Broker.BackpressurePolicy = v
 	}
 	if v := os.Getenv("AQUEDUCT_TRANSPORT_MAX_BUF_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
