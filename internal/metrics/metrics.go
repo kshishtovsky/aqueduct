@@ -102,6 +102,27 @@ var (
 			Help: "Total number of historical AAL frames replayed during subscriber backfill",
 		},
 	)
+
+	ClusterPeersActive = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "aqueduct_cluster_peers_active",
+			Help: "Current number of active peer connections in the cluster",
+		},
+	)
+
+	ClusterFramesForwarded = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "aqueduct_cluster_frames_forwarded_total",
+			Help: "Total number of frames forwarded to peer nodes",
+		},
+	)
+
+	ClusterFramesReceived = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "aqueduct_cluster_frames_received_total",
+			Help: "Total number of mesh-forwarded frames received from peer nodes",
+		},
+	)
 )
 
 func init() {
@@ -118,4 +139,7 @@ func init() {
 	prometheus.MustRegister(DurableSubscribersActive)
 	prometheus.MustRegister(ConsumerOffset)
 	prometheus.MustRegister(AALBackfillFrames)
+	prometheus.MustRegister(ClusterPeersActive)
+	prometheus.MustRegister(ClusterFramesForwarded)
+	prometheus.MustRegister(ClusterFramesReceived)
 }

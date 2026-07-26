@@ -18,6 +18,12 @@ type Config struct {
 	ACL         ACLConfig       `yaml:"acl"`
 	Broker      BrokerConfig    `yaml:"broker"`
 	Transport   TransportConfig `yaml:"transport"`
+	Cluster     ClusterConfig   `yaml:"cluster"`
+}
+
+// ClusterConfig holds peer addresses for Direct Mesh Federation.
+type ClusterConfig struct {
+	Peers []string `yaml:"peers"` // Peer addresses e.g. ["node-b:4242", "node-c:4242"]
 }
 
 // TLSConfig defines TLS certificate and mTLS settings.

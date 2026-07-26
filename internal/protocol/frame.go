@@ -8,8 +8,12 @@ import (
 )
 
 const (
-	MagicByte  = 0x1F
-	HeaderSize = 10
+	MagicByte       = 0x1F
+	HeaderSize      = 10
+	// MeshForwardedBit is set in the Command byte (bit 7) to mark frames that have
+	// already been forwarded by a peer node. Receivers must NOT re-forward such frames,
+	// preventing mesh broadcast storms. The lower 7 bits remain the command opcode.
+	MeshForwardedBit Command = 0x80
 )
 
 const (
@@ -48,7 +52,9 @@ func ParseFrame(buf []byte) (Frame, error) {
 		return Frame{}, errors.New("invalid magic byte")
 	}
 
-	cmd := Command(buf[1])
+	// Mask off the MeshForwarded bit before opcode validation; preserve it in the Frame.
+	rawCmd := Command(buf[1])
+	cmd := rawCmd & ^MeshForwardedBit
 	if cmd < CmdPublish || cmd > CmdAck {
 		return Frame{}, errors.New("unknown command")
 	}
@@ -79,11 +85,26 @@ func ParseFrame(buf []byte) (Frame, error) {
 	payload := unsafe.Slice(&buf[HeaderSize], payloadLen)
 
 	return Frame{
-		Command:    cmd,
+		Command:    rawCmd, // preserve MeshForwarded bit for callers
 		StreamID:   streamID,
 		PayloadLen: payloadLen,
 		Payload:    payload,
 	}, nil
+}
+
+// IsForwarded reports whether the MeshForwarded flag is set on a frame command byte.
+func IsForwarded(cmd Command) bool {
+	return cmd&MeshForwardedBit != 0
+}
+
+// SetForwarded returns the command byte with the MeshForwarded flag set.
+func SetForwarded(cmd Command) Command {
+	return cmd | MeshForwardedBit
+}
+
+// OpcodeOf strips the MeshForwarded bit and returns the bare opcode.
+func OpcodeOf(cmd Command) Command {
+	return cmd & ^MeshForwardedBit
 }
 
 func SerializeFrame(cmd Command, streamID uint32, payload []byte) *[]byte {
