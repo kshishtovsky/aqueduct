@@ -1,4 +1,4 @@
-# Tutorial: Getting Started with Aqueduct (v1.3.0)
+# Tutorial: Getting Started with Aqueduct (v1.5.0)
 
 This tutorial guides you through installing, configuring, running, and interacting with the Aqueduct message broker.
 
@@ -64,6 +64,11 @@ broker:
 transport:
   max_buf_size: 65536
   read_buf_size: 1024
+
+cluster:
+  peers:
+    - "192.168.1.10:4242"
+    - "192.168.1.11:4242"
 ```
 
 ---

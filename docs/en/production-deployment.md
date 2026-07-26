@@ -1,4 +1,4 @@
-# How-to: Production Deployment & Security (v1.3.0)
+# How-to: Production Deployment & Security (v1.5.0)
 
 This guide details best practices for deploying Aqueduct securely in enterprise production environments.
 
@@ -65,3 +65,41 @@ sysctl -w net.core.rmem_max=25000000
 sysctl -w net.core.wmem_max=25000000
 ulimit -n 65536
 ```
+
+---
+
+## 5. Cluster Deployment (v1.5.0+)
+
+Deploy multiple Aqueduct brokers in a direct mesh for horizontal scaling. Each broker connects to all others:
+
+| Node | Address | Role |
+|------|---------|------|
+| Broker A | `192.168.1.10:4242` | Peer |
+| Broker B | `192.168.1.11:4242` | Peer |
+| Broker C | `192.168.1.12:4242` | Peer |
+
+### Configuration
+
+Each node lists the **other** nodes (not itself):
+
+```yaml
+cluster:
+  peers:
+    - "192.168.1.10:4242"
+    - "192.168.1.11:4242"
+    - "192.168.1.12:4242"
+```
+
+### Forwarding Behavior
+
+- A message published on any node is forwarded to all peers
+- The MeshForwarded bit prevents re-forwarding loops
+- No consensus or leader election -- the mesh is fully decentralized
+- Peer connections use the same mTLS configuration as client connections
+
+### Network Requirements
+
+- All nodes must be reachable via UDP on the configured port
+- Each node must be configured with its own TLS certificate/key
+- For 3+ node topologies, each node must list all other peers
+- No ordering guarantees across nodes (fire-and-forget)
