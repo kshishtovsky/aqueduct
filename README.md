@@ -9,20 +9,26 @@
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
 > [!IMPORTANT]
-> **Production Ready (v1.0.0)**
-> Aqueduct strictly requires **TLS 1.3** and provides built-in memory hardening against oversized payload DoS attacks, alongside disk-backed Append-Only Logging (AAL) and YAML/ENV configuration loading.
+> **Production Ready (v1.3.0)**
+> Aqueduct features **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **message TTL**, and **MQTT wildcard topic routing**.
 
 ---
 
 ## Features
 
-- **QUIC Transport Layer**: Built on QUIC multiplexing with 0-RTT connection establishment, stream isolation, and amplification protection.
-- **Zero-Copy Binary Protocol**: Flat 10-byte binary header parser (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) using zero-allocation pointer operations.
-- **Structure of Arrays (SoA) Router**: In-memory direct mesh pub/sub routing using flat arrays for L1/L2 CPU cache locality.
-- **Append-Only Logging (AAL)**: Synchronous zero-allocation disk logging (`0 allocs/op`) directly from network buffers into OS page cache.
-- **Memory Hardening**: Strict stream-level OOM protection enforcing `maxBufSize` limits.
-- **Flexible Configuration**: YAML configuration file support with `AQUEDUCT_*` environment variable overrides.
-- **Prometheus & Grafana**: Built-in HTTP server (`:9090`) serving `/metrics` and `/healthz` endpoints, with ready-to-run Docker Compose stack.
+- **QUIC Transport Layer**: Multiplexed QUIC connection handling with 0-RTT connection establishment, stream isolation, and amplification protection.
+- **Zero-Copy Binary Protocol**: Flat 10-byte binary header parser (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) using zero-allocation pointer arithmetic and cross-platform Little-Endian safety.
+- **Structure of Arrays (SoA) Router**: In-memory direct mesh pub/sub routing using flat arrays for CPU L1/L2 cache locality.
+- **Async Fan-Out & Ring Queues**: Per-subscriber non-blocking bounded channels and Writer goroutines eliminating Head-of-Line blocking.
+- **Slow Consumer Isolation (Backpressure)**: Configurable queue overflow handling (`drop_oldest`, `drop_newest`, `disconnect`).
+- **Atomic Reference Counting (`MessageRef`)**: Safe zero-allocation buffer recycling into `sync.Pool` when count drops to zero (`0 allocs/op`).
+- **MQTT Wildcard Topic Routing**: Zero-allocation single-level (`+`) and multi-level (`#`) pattern matching (< 51 ns/op, `0 allocs/op`).
+- **Message Time-To-Live (TTL)**: Lazy message expiration on dequeue (`ttl:<ms>:<payload>` format).
+- **Encrypted Append-Only Logging (AAL)**: AES-256-GCM encrypted persistence with cryptographically unique 12-byte nonces (4-byte random session prefix) and streaming length-prefixed records.
+- **AAL Replay on Startup**: Restores state before opening the QUIC UDP listener socket, preventing message loss on restart.
+- **AAL File Rotation**: Automatic log compaction when file size exceeds `max_aal_size`.
+- **mTLS & Zero-Allocation ACL**: Dual-side TLS 1.3 authentication and non-commutative FNV-1a composite hash matrix permission engine.
+- **Prometheus Observability**: Comprehensive metrics (`/metrics`) and ready-to-run Docker Compose stack with Grafana dashboard.
 
 ---
 
@@ -71,10 +77,26 @@ tls:
   generate: true
   cert_file: ""
   key_file: ""
+  require_client_cert: false
+  client_ca_file: ""
 
 aal:
   enabled: false
   file_path: ""
+  key: "" # Base64 encoded 32-byte key for AES-256-GCM
+  max_aal_size: 104857600 # 100 MB max size before rotation
+
+acl:
+  enabled: false
+  default: "none"
+  rules:
+    - client: "service-a"
+      topic: "orders"
+      permission: "publish"
+
+broker:
+  queue_size: 1024
+  backpressure_policy: "drop_oldest"
 
 transport:
   max_buf_size: 65536
@@ -90,64 +112,42 @@ transport:
 | `AQUEDUCT_TLS_GENERATE` | `tls.generate` | `false` |
 | `AQUEDUCT_TLS_CERT_FILE` | `tls.cert_file` | `/etc/certs/cert.pem` |
 | `AQUEDUCT_TLS_KEY_FILE` | `tls.key_file` | `/etc/certs/key.pem` |
+| `AQUEDUCT_TLS_REQUIRE_CLIENT_CERT` | `tls.require_client_cert` | `true` |
+| `AQUEDUCT_TLS_CLIENT_CA_FILE` | `tls.client_ca_file` | `/etc/certs/ca.pem` |
 | `AQUEDUCT_AAL_ENABLED` | `aal.enabled` | `true` |
 | `AQUEDUCT_AAL_FILE_PATH` | `aal.file_path` | `/var/log/aal.log` |
+| `AQUEDUCT_AAL_KEY` | `aal.key` | `base64_encoded_key` |
+| `AQUEDUCT_AAL_MAX_SIZE` | `aal.max_aal_size` | `104857600` |
+| `AQUEDUCT_ACL_ENABLED` | `acl.enabled` | `true` |
+| `AQUEDUCT_BROKER_QUEUE_SIZE` | `broker.queue_size` | `2048` |
+| `AQUEDUCT_BROKER_BACKPRESSURE_POLICY` | `broker.backpressure_policy` | `drop_oldest` |
 | `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
 
 ---
 
 ## Benchmarking (`aqueduct-bench`)
 
-Aqueduct includes a high-performance QUIC load-testing utility in `cmd/aqueduct-bench`.
-
-### Build & Run Benchmark
+Run the included high-concurrency load testing CLI:
 
 ```bash
-# Build the benchmark tool
-go build -o bin/aqueduct-bench ./cmd/aqueduct-bench
-
-# Run against a local broker instance (10 workers, 100,000 requests, 128-byte payload)
-./bin/aqueduct-bench -addr 127.0.0.1:4242 -c 10 -n 100000 -size 128 -topic bench
+go run ./cmd/aqueduct-bench/main.go \
+  -addr 127.0.0.1:4242 \
+  -streams 10 \
+  -messages 100000 \
+  -payload-size 128
 ```
 
-### Options
+---
 
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `-addr` | `127.0.0.1:4242` | Target broker UDP address |
-| `-c` | `10` | Number of concurrent connections/streams |
-| `-n` | `100000` | Total number of publish messages |
-| `-size` | `128` | Message payload size in bytes |
-| `-topic` | `bench` | Target topic for message publish |
+## Documentation (Diátaxis Framework)
+
+- **Tutorial**: [Getting Started Guide](docs/en/getting-started.md)
+- **Reference**: [Binary Protocol Specification](docs/en/protocol-spec.md)
+- **Explanation**: [Architecture & Memory Model](docs/en/architecture.md)
+- **How-to Guide**: [Production Deployment & Security](docs/en/production-deployment.md)
 
 ---
 
-## Client Code Examples
+## License
 
-Minimal client examples demonstrating binary frame assembly over QUIC:
-
-- [Go Client Example](examples/go/main.go) — Native `quic-go` implementation.
-- [Python Client Example](examples/python/client.py) — `aioquic` asynchronous client.
-- [Node.js Buffer Example](examples/nodejs/client.js) — Binary frame packing example.
-
----
-
-## Performance & Benchmarks
-
-Benchmarked on AMD Ryzen 5 5500U (Linux amd64):
-
-| Benchmark | Latency / Throughput | Memory / Op | Allocations |
-| :--- | :--- | :--- | :--- |
-| `BenchmarkRouterPublishWithAAL` | **1403 ns/op** (10.69 MB/s) | **0 B/op** | **0 allocs/op** |
-| `BenchmarkQUICRoundTrip` | **2448 ns/op** (56.37 MB/s) | **53 B/op** | **1 alloc/op** |
-
----
-
-## Documentation
-
-Explore our comprehensive documentation following the Diátaxis framework:
-
-- [Getting Started Tutorial](docs/en/getting-started.md) — Step-by-step guide for first-time users.
-- [Production Deployment Guide](docs/en/production-deployment.md) — Configuring TLS 1.3, AAL, and Prometheus monitoring.
-- [Binary Protocol Specification](docs/en/protocol-spec.md) — Complete frame header layout and command codes.
-- [Architecture & Memory Model](docs/en/architecture.md) — In-depth explanation of SoA routing and zero-copy strategy.
+MIT License. See [LICENSE](LICENSE) for details.
