@@ -36,7 +36,7 @@ func FuzzParseFrame(f *testing.F) {
 		if frame.PayloadLen > 0 && len(frame.Payload) != int(frame.PayloadLen) {
 			t.Errorf("Payload length mismatch: PayloadLen=%d, len(Payload)=%d", frame.PayloadLen, len(frame.Payload))
 		}
-		if frame.Command < CmdPublish || frame.Command > CmdPublishBatch {
+		if frame.Command < CmdPublish || frame.Command > CmdNack {
 			t.Errorf("invalid command: %d", frame.Command)
 		}
 	})

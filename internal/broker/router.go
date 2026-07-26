@@ -18,7 +18,9 @@ import (
 )
 
 const defaultQueueSize = 1024
-const maxPayloadSize = 1 << 20 // 1 MB max payload per message
+const maxPayloadSize = 1 << 20   // 1 MB max payload per message
+const defaultMaxRetries = 3      // default max NACK retries before DLQ
+const defaultNackCacheSize = 256 // max frame cache entries per subscriber for NACK replay
 
 // Default batch configuration for coalesced writes.
 const (
@@ -138,6 +140,12 @@ type WildcardSub struct {
 	idx     int
 }
 
+// nackKey uniquely identifies a message for retry tracking.
+type nackKey struct {
+	topicHash uint64
+	offset    uint64
+}
+
 // SubscriptionSpec holds parsed parameters from a Subscribe command.
 type SubscriptionSpec struct {
 	Topic           string
@@ -171,8 +179,18 @@ type Router struct {
 	// durableOffsets tracks acknowledged consumer offset per (consumerID + topic).
 	durableOffsets map[uint64]uint64
 
-	aalPath string
-	aalKey  []byte
+	// nackChs delivers NACK offsets from processStream to subscriber writer goroutines.
+	nackChs []chan uint64
+
+	// nackCounters tracks retry count for nacked messages (topicHash+offset → count).
+	// Only populated for messages that receive at least one NACK.
+	// Cleared when message moves to DLQ.
+	nackCounters map[nackKey]int8
+	nackMu       sync.Mutex
+
+	maxRetries int
+	aalPath    string
+	aalKey     []byte
 
 	peerForwarder PeerForwarder
 
@@ -186,16 +204,27 @@ type Router struct {
 }
 
 // NewRouter creates a Router with optional metrics collector and configuration options.
+// WithMaxRetries sets the maximum NACK retry count before a message is moved to DLQ.
+func WithMaxRetries(n int) RouterOption {
+	return func(r *Router) {
+		if n > 0 {
+			r.maxRetries = n
+		}
+	}
+}
+
 func NewRouter(m RouterMetrics, opts ...RouterOption) *Router {
 	r := &Router{
 		topicIndex:     make(map[uint64][]int),
 		topicOffsets:   make(map[uint64]*atomic.Uint64),
 		durableOffsets: make(map[uint64]uint64),
+		nackCounters:   make(map[nackKey]int8),
 		metrics:        m,
 		queueSize:      defaultQueueSize,
 		policy:         PolicyDropOldest,
 		batchSize:      defaultBatchSize,
 		flushInterval:  defaultFlushInterval,
+		maxRetries:     defaultMaxRetries,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -215,6 +244,7 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	}
 
 	q := make(chan *MessageRef, r.queueSize)
+	nackCh := make(chan uint64, 8)
 	subCtx, cancel := context.WithCancel(ctx)
 	topicHash := authz.CombineHashStrings("topic", spec.Topic)
 
@@ -225,6 +255,7 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	r.topics = append(r.topics, spec.Topic)
 	r.active = append(r.active, true)
 	r.queues = append(r.queues, q)
+	r.nackChs = append(r.nackChs, nackCh)
 	r.cancels = append(r.cancels, cancel)
 	r.topicIndex[topicHash] = append(r.topicIndex[topicHash], idx)
 
@@ -260,10 +291,40 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.runSubscriberWriter(subCtx, stream, spec.Topic, q)
+		r.runSubscriberWriter(subCtx, stream, spec.Topic, q, nackCh)
 	}()
 
 	return nil
+}
+
+// TopicOfStream returns the topic name for a subscriber stream, or false if not found.
+func (r *Router) TopicOfStream(streamID uint32) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for i, sid := range r.streamIDs {
+		if sid == streamID && r.active[i] {
+			return r.topics[i], true
+		}
+	}
+	return "", false
+}
+
+// NackByStream routes a NACK offset to the subscriber's writer goroutine.
+// Uses non-blocking send — drops if the nack channel is full (should not happen in practice).
+func (r *Router) NackByStream(streamID uint32, offset uint64) {
+	r.mu.RLock()
+	for i, sid := range r.streamIDs {
+		if sid == streamID && r.active[i] && i < len(r.nackChs) {
+			ch := r.nackChs[i]
+			r.mu.RUnlock()
+			select {
+			case ch <- offset:
+			default:
+			}
+			return
+		}
+	}
+	r.mu.RUnlock()
 }
 
 // AckOffset updates the acknowledged consumer offset for a durable subscriber.
@@ -398,7 +459,7 @@ func (acc *batchAccumulator) flush(stream *quic.Stream) error {
 //   - Flushes (single stream.Write) when buffer reaches batchSize or timer fires.
 //   - This reduces syscall overhead and allows QUIC to pack multiple messages
 //     into one UDP datagram.
-func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, topic string, q chan *MessageRef) {
+func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, topic string, q chan *MessageRef, nackCh chan uint64) {
 	acc := newBatchAccumulator(r.batchSize, r.flushInterval)
 	defer func() {
 		_ = acc.flush(stream)
@@ -410,6 +471,62 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 		}
 	}()
 
+	// Bounded frame cache for NACK replay: offset → topic name.
+	// Only populated for messages written to this subscriber.
+	frameCache := make(map[uint64]string)
+	frameCacheKeys := make([]uint64, 0, defaultNackCacheSize)
+
+	storeFrame := func(offset uint64, topicName string) {
+		if _, exists := frameCache[offset]; exists {
+			return
+		}
+		if len(frameCacheKeys) >= defaultNackCacheSize {
+			oldKey := frameCacheKeys[0]
+			delete(frameCache, oldKey)
+			frameCacheKeys = frameCacheKeys[1:]
+		}
+		frameCache[offset] = topicName
+		frameCacheKeys = append(frameCacheKeys, offset)
+	}
+
+	handleNack := func(nackOffset uint64) {
+		topicName, ok := frameCache[nackOffset]
+		if !ok {
+			return
+		}
+		topicHash := authz.CombineHashStrings("topic", topicName)
+		key := nackKey{topicHash: topicHash, offset: nackOffset}
+
+		r.nackMu.Lock()
+		count := r.nackCounters[key]
+		count++
+		r.nackCounters[key] = count
+		r.nackMu.Unlock()
+
+		metrics.MessagesNacked.WithLabelValues(topicName).Inc()
+
+		if int(count) < r.maxRetries {
+			_ = r.Publish(ctx, protocol.Frame{
+				Command:    protocol.CmdPublish,
+				PayloadLen: uint32(len(topicName)),
+				Payload:    []byte(topicName),
+			})
+			return
+		}
+
+		dlqTopic := "__dlq__" + topicName
+		metrics.MessagesDeadLettered.WithLabelValues(topicName).Inc()
+		r.nackMu.Lock()
+		delete(r.nackCounters, key)
+		r.nackMu.Unlock()
+
+		_ = r.Publish(ctx, protocol.Frame{
+			Command:    protocol.CmdPublish,
+			PayloadLen: uint32(len(dlqTopic)),
+			Payload:    []byte(dlqTopic),
+		})
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -420,6 +537,8 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 				r.drainQueue(q)
 				return
 			}
+		case nackOffset := <-nackCh:
+			handleNack(nackOffset)
 		case msgRef, ok := <-q:
 			if !ok {
 				_ = acc.flush(stream)
@@ -437,6 +556,8 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 				msgRef.Release()
 				continue
 			}
+
+			storeFrame(msgRef.Offset(), topic)
 
 			// If adding this frame would exceed batch size, flush first
 			if len(acc.buf) > 0 && len(acc.buf)+len(buf) > acc.maxSize {
