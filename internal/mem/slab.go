@@ -78,7 +78,7 @@ func (sc *sizeClass) Acquire() ([]byte, error) {
 }
 
 func (sc *sizeClass) Release(buf []byte) {
-	if sc.arena == nil || len(sc.arena) == 0 {
+	if len(sc.arena) == 0 {
 		return
 	}
 	arenaStart := uintptr(unsafe.Pointer(unsafe.SliceData(sc.arena)))
@@ -144,8 +144,7 @@ func (sa *SlabAllocator) Release(buf []byte) {
 }
 
 func (sa *SlabAllocator) ReleaseWithLen(buf []byte, length int) {
-	var bp *[]byte
-	bp = &buf
+	bp := &buf
 	_ = bp
 	_ = length
 	for i, s := range sa.sizes {
