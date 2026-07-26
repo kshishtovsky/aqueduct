@@ -1243,6 +1243,241 @@ func TestConsumerACK(t *testing.T) {
 	}
 }
 
+// TestPublishBatchToSubscriber verifies that a CmdPublishBatch frame with
+// multiple sub-messages reaches subscribers correctly.
+func TestPublishBatchToSubscriber(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		for {
+			stream, err := conn.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go func(s *quic.Stream) {
+				buf := make([]byte, 4096)
+				n, err := s.Read(buf)
+				if err != nil {
+					return
+				}
+				frame, err := protocol.ParseFrame(buf[:n])
+				if err != nil {
+					return
+				}
+				if frame.Command == protocol.CmdSubscribe {
+					_ = router.Subscribe(ctx, s, frame)
+				}
+			}(stream)
+		}
+	}()
+
+	conn := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub: %v", err)
+	}
+	sendFrame(t, sub, protocol.CmdSubscribe, 1, []byte("topic:batch-topic"))
+	time.Sleep(300 * time.Millisecond)
+
+	// Build a batch of 5 sub-frames, each with the batch topic as payload
+	var subFrames []*[]byte
+	for i := range 5 {
+		payload := []byte("batch-topic")
+		f := protocol.SerializeFrame(protocol.CmdPublish, uint32(i), payload)
+		subFrames = append(subFrames, f)
+	}
+
+	// Concatenate all sub-frames into batch payload
+	totalLen := 0
+	for _, f := range subFrames {
+		totalLen += len(*f)
+	}
+	batchPayload := make([]byte, 0, totalLen)
+	for _, f := range subFrames {
+		batchPayload = append(batchPayload, *f...)
+	}
+	for _, f := range subFrames {
+		protocol.ReleaseBuffer(f)
+	}
+
+	// Publish batch
+	batchFrame := protocol.Frame{
+		Command:    protocol.CmdPublishBatch,
+		PayloadLen: uint32(len(batchPayload)),
+		Payload:    batchPayload,
+	}
+	if err := router.PublishBatch(ctx, batchFrame); err != nil {
+		t.Fatalf("PublishBatch: %v", err)
+	}
+
+	// Sub should receive all 5 messages (they may be coalesced into one write)
+	received := 0
+	sub.SetReadDeadline(time.Now().Add(3 * time.Second))
+	readBuf := make([]byte, 4096)
+	off := 0
+	for received < 5 {
+		n, err := sub.Read(readBuf[off:])
+		if err != nil {
+			break
+		}
+		off += n
+		consumed := 0
+		for consumed < off {
+			if off-consumed < protocol.HeaderSize {
+				break
+			}
+			f, parseErr := protocol.ParseFrame(readBuf[consumed:off])
+			if parseErr != nil {
+				break
+			}
+			received++
+			consumed += f.Size()
+		}
+		copy(readBuf, readBuf[consumed:off])
+		off -= consumed
+	}
+	if received != 5 {
+		t.Errorf("expected 5 received messages, got %d", received)
+	}
+}
+
+// TestPublishBatchEmpty verifies PublishBatch with no subscribers.
+func TestPublishBatchEmpty(t *testing.T) {
+	router := NewRouter(nil)
+	defer router.Close()
+
+	subPayload := []byte("no-subs")
+	subFrame := protocol.SerializeFrame(protocol.CmdPublish, 0, subPayload)
+	defer protocol.ReleaseBuffer(subFrame)
+
+	batchFrame := protocol.Frame{
+		Command:    protocol.CmdPublishBatch,
+		PayloadLen: uint32(len(*subFrame)),
+		Payload:    *subFrame,
+	}
+	if err := router.PublishBatch(context.Background(), batchFrame); err != nil {
+		t.Errorf("PublishBatch to empty topic should succeed: %v", err)
+	}
+}
+
+// BenchmarkBatchPublish measures throughput for 100k messages in batches of 100.
+// Target: 1M+ RPS, 0 allocs/op on hot path.
+func BenchmarkBatchPublish(b *testing.B) {
+	router := NewRouter(nil)
+	defer router.Close()
+
+	// Build sub-frames for the batch (100 per batch, each 128 bytes payload)
+	const batchSize = 100
+	const msgSize = 128
+
+	var batchParts []*[]byte
+	totalBatchBytes := 0
+	for i := range batchSize {
+		payload := make([]byte, msgSize)
+		payload[0] = byte(i)
+		f := protocol.SerializeFrame(protocol.CmdPublish, uint32(i), payload)
+		batchParts = append(batchParts, f)
+		totalBatchBytes += len(*f)
+	}
+
+	batchPayload := make([]byte, 0, totalBatchBytes)
+	for _, f := range batchParts {
+		batchPayload = append(batchPayload, *f...)
+	}
+	for _, f := range batchParts {
+		protocol.ReleaseBuffer(f)
+	}
+
+	totalPayloadBytes := int64(totalBatchBytes)
+
+	batchFrame := protocol.Frame{
+		Command:    protocol.CmdPublishBatch,
+		PayloadLen: uint32(len(batchPayload)),
+		Payload:    batchPayload,
+	}
+
+	b.SetBytes(totalPayloadBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = router.PublishBatch(context.Background(), batchFrame)
+	}
+}
+
+// BenchmarkPublishSingleVsBatch compares single publish vs batch publish throughput.
+func BenchmarkPublishSingleVsBatch(b *testing.B) {
+	router := NewRouter(nil)
+	defer router.Close()
+
+	const msgSize = 128
+	payload := make([]byte, msgSize)
+
+	singleFrame := protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(payload)),
+		Payload:    payload,
+	}
+
+	b.Run("single", func(b *testing.B) {
+		b.SetBytes(int64(protocol.FrameSize(uint32(len(payload)))))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = router.Publish(context.Background(), singleFrame)
+		}
+	})
+
+	// Batch of 100 identical messages
+	const batchSize = 100
+	var batchParts []*[]byte
+	totalBatchBytes := 0
+	for i := range batchSize {
+		f := protocol.SerializeFrame(protocol.CmdPublish, uint32(i), payload)
+		batchParts = append(batchParts, f)
+		totalBatchBytes += len(*f)
+	}
+	batchPayload := make([]byte, 0, totalBatchBytes)
+	for _, f := range batchParts {
+		batchPayload = append(batchPayload, *f...)
+	}
+	for _, f := range batchParts {
+		protocol.ReleaseBuffer(f)
+	}
+
+	batchFrame := protocol.Frame{
+		Command:    protocol.CmdPublishBatch,
+		PayloadLen: uint32(len(batchPayload)),
+		Payload:    batchPayload,
+	}
+
+	b.Run("batch_100", func(b *testing.B) {
+		b.SetBytes(int64(totalBatchBytes))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = router.PublishBatch(context.Background(), batchFrame)
+		}
+	})
+}
+
 // BenchmarkDurablePublish measures publish latency with topic offset tracking.
 func BenchmarkDurablePublish(b *testing.B) {
 	router := NewRouter(nil)
