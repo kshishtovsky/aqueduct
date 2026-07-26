@@ -147,6 +147,13 @@ var (
 		},
 		[]string{"topic"},
 	)
+
+	TracingSpansTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "aqueduct_tracing_spans_total",
+			Help: "Total number of tracing spans created",
+		},
+	)
 )
 
 func init() {
@@ -169,4 +176,5 @@ func init() {
 	prometheus.MustRegister(MessagesNacked)
 	prometheus.MustRegister(MessagesDeadLettered)
 	prometheus.MustRegister(MessagesRateLimited)
+	prometheus.MustRegister(TracingSpansTotal)
 }
