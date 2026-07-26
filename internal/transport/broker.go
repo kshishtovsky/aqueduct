@@ -215,6 +215,21 @@ func (b *Broker) Addr() net.Addr {
 	return b.listener.Addr()
 }
 
+// AuthzEngine returns the active authorization engine.
+func (b *Broker) AuthzEngine() *authz.Engine {
+	return b.authz
+}
+
+// SetAuthzEngine updates the active authorization engine.
+func (b *Broker) SetAuthzEngine(e *authz.Engine) {
+	b.authz = e
+}
+
+// Router returns the pub/sub router.
+func (b *Broker) Router() *broker.Router {
+	return b.router
+}
+
 // runAcceptLoop accepts incoming QUIC connections and spawns stream processors.
 func runAcceptLoop(b *Broker, jig context.Context, ln *quic.Listener) {
 	for {
@@ -496,7 +511,7 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 						metrics.TracingSpansTotal.Inc()
 					}
 				}
-				if err := b.router.Publish(publishCtx, frame); err != nil {
+				if err := b.router.PublishWithClientID(publishCtx, frame, clientIDStr); err != nil {
 					b.logger.Warn("publish error", "err", err)
 				}
 				endSpan()

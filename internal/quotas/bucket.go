@@ -9,16 +9,16 @@ import (
 type Bucket struct {
 	tokens   atomic.Int64
 	capacity int64
-	rate     int64
+	rate     atomic.Int64
 	stopCh   chan struct{}
 }
 
 func NewBucket(rate int, capacity int) *Bucket {
 	b := &Bucket{
 		capacity: int64(capacity),
-		rate:     int64(rate),
 		stopCh:   make(chan struct{}),
 	}
+	b.rate.Store(int64(rate))
 	b.tokens.Store(int64(capacity))
 	if rate > 0 {
 		go b.refillLoop()
@@ -32,7 +32,11 @@ func (b *Bucket) refillLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			added := int64(float64(b.rate) * 0.1)
+			currentRate := b.rate.Load()
+			if currentRate <= 0 {
+				continue
+			}
+			added := int64(float64(currentRate) * 0.1)
 			if added <= 0 {
 				added = 1
 			}
@@ -67,6 +71,12 @@ func (b *Bucket) TryAcquire() bool {
 	}
 }
 
+func (b *Bucket) SetRate(rate int) {
+	if b != nil {
+		b.rate.Store(int64(rate))
+	}
+}
+
 func (b *Bucket) Stop() {
 	if b != nil && b.stopCh != nil {
 		close(b.stopCh)
@@ -74,8 +84,8 @@ func (b *Bucket) Stop() {
 }
 
 type Manager struct {
-	mu            sync.RWMutex
-	buckets       map[string]*Bucket
+	mu            sync.Mutex
+	bucketsPtr    atomic.Pointer[map[string]*Bucket]
 	defaultBucket *Bucket
 }
 
@@ -84,33 +94,66 @@ func NewManager(defaultRate, defaultBurst int) *Manager {
 	if defaultRate > 0 {
 		db = NewBucket(defaultRate, defaultBurst)
 	}
-	return &Manager{
-		buckets:       make(map[string]*Bucket),
+	m := &Manager{
 		defaultBucket: db,
 	}
+	initMap := make(map[string]*Bucket)
+	m.bucketsPtr.Store(&initMap)
+	return m
 }
 
+// TryAcquire checks rate limiting for clientID on hot path without acquiring any mutexes (lock-free RCU).
 func (m *Manager) TryAcquire(clientID string) bool {
 	if m == nil {
 		return true
 	}
 
-	m.mu.RLock()
-	b, ok := m.buckets[clientID]
-	m.mu.RUnlock()
+	bucketsMap := m.bucketsPtr.Load()
+	var b *Bucket
+	if bucketsMap != nil {
+		b = (*bucketsMap)[clientID]
+	}
 
-	if !ok {
+	if b == nil {
 		b = m.defaultBucket
 	}
 
 	return b.TryAcquire()
 }
 
+// SetRate updates or creates a client bucket rate dynamically.
 func (m *Manager) SetRate(clientID string, rate, burst int) {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if old, ok := m.buckets[clientID]; ok {
-		old.Stop()
+
+	curMap := m.bucketsPtr.Load()
+	if curMap != nil {
+		if old, ok := (*curMap)[clientID]; ok {
+			old.SetRate(rate)
+			return
+		}
 	}
-	m.buckets[clientID] = NewBucket(rate, burst)
+
+	newCap := 1
+	if curMap != nil {
+		newCap += len(*curMap)
+	}
+	newMap := make(map[string]*Bucket, newCap)
+	if curMap != nil {
+		for k, v := range *curMap {
+			newMap[k] = v
+		}
+	}
+	if burst <= 0 {
+		if rate > 0 {
+			burst = rate
+		} else {
+			burst = 1000
+		}
+	}
+	newMap[clientID] = NewBucket(rate, burst)
+	m.bucketsPtr.Store(&newMap)
 }

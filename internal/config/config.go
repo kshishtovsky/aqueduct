@@ -17,11 +17,18 @@ type Config struct {
 	TLS         TLSConfig         `yaml:"tls"`
 	AAL         AALConfig         `yaml:"aal"`
 	ACL         ACLConfig         `yaml:"acl"`
+	Admin       AdminConfig       `yaml:"admin"`
 	Broker      BrokerConfig      `yaml:"broker"`
 	Transport   TransportConfig   `yaml:"transport"`
 	Cluster     ClusterConfig     `yaml:"cluster"`
 	Tracing     TracingConfig     `yaml:"tracing"`
 	Compression CompressionConfig `yaml:"compression"`
+}
+
+// AdminConfig defines settings for the gRPC Admin API.
+type AdminConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Addr    string `yaml:"addr"`
 }
 
 // TracingConfig defines OpenTelemetry tracing settings.
@@ -149,6 +156,10 @@ func Default() *Config {
 			Default: "none",
 			Rules:   nil,
 		},
+		Admin: AdminConfig{
+			Enabled: false,
+			Addr:    ":9091",
+		},
 		Broker: BrokerConfig{
 			QueueSize:          1024,
 			BackpressurePolicy: "drop_oldest",
@@ -239,6 +250,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_ACL_DEFAULT"); v != "" {
 		cfg.ACL.Default = v
+	}
+	if v := os.Getenv("AQUEDUCT_ADMIN_ENABLED"); v != "" {
+		cfg.Admin.Enabled = parseBool(v, cfg.Admin.Enabled)
+	}
+	if v := os.Getenv("AQUEDUCT_ADMIN_ADDR"); v != "" {
+		cfg.Admin.Addr = v
 	}
 	if v := os.Getenv("AQUEDUCT_BROKER_QUEUE_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
