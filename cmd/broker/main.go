@@ -1,9 +1,216 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"flag"
 	"fmt"
+	"log/slog"
+	"math/big"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/kshishtovsky/aqueduct/internal/aal"
+	"github.com/kshishtovsky/aqueduct/internal/broker"
+	"github.com/kshishtovsky/aqueduct/internal/config"
+	"github.com/kshishtovsky/aqueduct/internal/metrics"
+	"github.com/kshishtovsky/aqueduct/internal/protocol"
+	"github.com/kshishtovsky/aqueduct/internal/transport"
 )
 
 func main() {
-	fmt.Println("aqueduct broker starting...")
+	configFile := flag.String("config", "", "Path to YAML configuration file")
+	certFile := flag.String("cert", "", "Path to TLS certificate file")
+	keyFile := flag.String("key", "", "Path to TLS private key file")
+	aalFile := flag.String("aal", "", "Path to Append-Only Log file")
+	addrFlag := flag.String("addr", "", "Broker listen UDP address")
+	metricsAddrFlag := flag.String("metrics-addr", "", "Metrics HTTP server address")
+	flag.Parse()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	cfg, err := config.Load(*configFile)
+	if err != nil {
+		logger.Error("failed to load configuration", "err", err)
+		os.Exit(1)
+	}
+
+	// CLI flag overrides
+	if *addrFlag != "" {
+		cfg.ListenAddr = *addrFlag
+	}
+	if *metricsAddrFlag != "" {
+		cfg.MetricsAddr = *metricsAddrFlag
+	}
+	if *certFile != "" {
+		cfg.TLS.CertFile = *certFile
+		cfg.TLS.Generate = false
+	}
+	if *keyFile != "" {
+		cfg.TLS.KeyFile = *keyFile
+		cfg.TLS.Generate = false
+	}
+	if *aalFile != "" {
+		cfg.AAL.Enabled = true
+		cfg.AAL.FilePath = *aalFile
+	}
+
+	var tlsConf *tls.Config
+
+	if !cfg.TLS.Generate && cfg.TLS.CertFile != "" && cfg.TLS.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+		if err != nil {
+			logger.Error("failed to load TLS certificate and key", "cert", cfg.TLS.CertFile, "key", cfg.TLS.KeyFile, "err", err)
+			os.Exit(1)
+		}
+		tlsConf = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"aqueduct-v1"},
+			MinVersion:   tls.VersionTLS13,
+		}
+		logger.Info("using production TLS certificate", "cert", cfg.TLS.CertFile, "key", cfg.TLS.KeyFile)
+	} else {
+		logger.Warn("Using ephemeral self-signed certificate. Do not use in production.")
+		tlsConf, err = generateSelfSignedTLS()
+		if err != nil {
+			logger.Error("failed to generate TLS config", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	if err := metrics.StartServer(cfg.MetricsAddr); err != nil {
+		logger.Error("failed to start metrics server", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("metrics server started", "addr", cfg.MetricsAddr)
+
+	routerMetrics := &prometheusMetrics{}
+	router := broker.NewRouter(routerMetrics)
+
+	opts := []transport.Option{
+		transport.WithLogger(logger),
+		transport.WithRouter(router),
+		transport.WithMaxBufSize(cfg.Transport.MaxBufSize),
+		transport.WithReadBufSize(cfg.Transport.ReadBufSize),
+	}
+
+	if cfg.AAL.Enabled && cfg.AAL.FilePath != "" {
+		aalLog, err := aal.Open(cfg.AAL.FilePath)
+		if err != nil {
+			logger.Error("failed to open AAL file", "path", cfg.AAL.FilePath, "err", err)
+			os.Exit(1)
+		}
+		logger.Info("append-only logging enabled", "path", cfg.AAL.FilePath)
+		opts = append(opts, transport.WithAAL(aalLog))
+	}
+
+	b := transport.New(opts...)
+
+	b.Handle(protocol.CmdPublish, func(ctx context.Context, frame protocol.Frame) ([]byte, error) {
+		logger.Info("publish received", "stream_id", frame.StreamID, "payload_len", frame.PayloadLen)
+		return nil, nil
+	})
+
+	b.Handle(protocol.CmdSubscribe, func(ctx context.Context, frame protocol.Frame) ([]byte, error) {
+		logger.Info("subscribe received", "stream_id", frame.StreamID, "payload_len", frame.PayloadLen)
+		return nil, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := b.Listen(ctx, cfg.ListenAddr, tlsConf); err != nil {
+		logger.Error("failed to start listener", "err", err)
+		os.Exit(1)
+	}
+
+	logger.Info("broker started", "addr", b.Addr())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	sig := <-sigCh
+	logger.Info("received signal, shutting down", "signal", sig)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := b.Shutdown(shutdownCtx); err != nil {
+		logger.Error("shutdown error", "err", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("broker stopped gracefully")
 }
+
+// prometheusMetrics adapts the global Prometheus counters to the RouterMetrics interface.
+type prometheusMetrics struct{}
+
+func (m *prometheusMetrics) OnPublish(topic string) {
+	metrics.MessagesPublished.WithLabelValues(topic).Inc()
+}
+
+func (m *prometheusMetrics) OnDeliver(topic string) {
+	metrics.MessagesDelivered.WithLabelValues(topic).Inc()
+}
+
+func (m *prometheusMetrics) SetActiveSubscribers(n float64) {
+	metrics.ActiveSubscribers.Set(n)
+}
+
+func generateSelfSignedTLS() (*tls.Config, error) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+
+	template := &x509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               pkix.Name{Organization: []string{"Aqueduct"}},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return nil, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"aqueduct-v1"},
+		MinVersion:   tls.VersionTLS13,
+	}, nil
+}
+
+

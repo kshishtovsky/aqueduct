@@ -1,19 +1,45 @@
 package metrics
 
-var (
-	FramesParsed     uint64
-	FramesSerialized uint64
-	ParseErrors      uint64
+import (
+	"github.com/prometheus/client_golang/prometheus"
 )
 
-func IncFramesParsed() {
-	FramesParsed++
-}
+var (
+	MessagesPublished = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_published_total",
+			Help: "Total number of messages published per topic",
+		},
+		[]string{"topic"},
+	)
 
-func IncFramesSerialized() {
-	FramesSerialized++
-}
+	MessagesDelivered = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_delivered_total",
+			Help: "Total number of messages delivered per topic",
+		},
+		[]string{"topic"},
+	)
 
-func IncParseErrors() {
-	ParseErrors++
+	ActiveSubscribers = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "aqueduct_active_subscribers",
+			Help: "Current number of active subscribers across all topics",
+		},
+	)
+
+	FrameParseDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "aqueduct_frame_parse_duration_ns",
+			Help:    "Histogram of frame parse duration in nanoseconds",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(MessagesPublished)
+	prometheus.MustRegister(MessagesDelivered)
+	prometheus.MustRegister(ActiveSubscribers)
+	prometheus.MustRegister(FrameParseDuration)
 }
