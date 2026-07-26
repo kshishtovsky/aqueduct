@@ -89,7 +89,7 @@ func (pm *PeerManager) reconnectLoop(ctx context.Context, p *PeerRef) {
 
 		stream, err := conn.OpenStreamSync(ctx)
 		if err != nil {
-			conn.CloseWithError(0, "stream open failed")
+			_ = conn.CloseWithError(0, "stream open failed")
 			continue
 		}
 
