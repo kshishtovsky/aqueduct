@@ -1,4 +1,4 @@
-# Reference: Binary Protocol Specification (v1.11.0)
+# Reference: Binary Protocol Specification (v1.13.0)
 
 This document provides the formal technical specification for Aqueduct's zero-copy binary wire protocol.
 
@@ -40,17 +40,24 @@ Aqueduct uses a flat 10-byte binary header followed by an optional TLV Extension
 | Opcode | Name | Description | Payload Format |
 | :--- | :--- | :--- | :--- |
 | `0x01` | `CmdPublish` | Publish message to topic | `[ttl:<ms>:]<topic_name>` or raw message |
-| `0x02` | `CmdSubscribe` | Subscribe QUIC stream to topic | `topic:<topic_name>` (supports `+` and `#` wildcards) |
+| `0x02` | `CmdSubscribe` | Subscribe QUIC stream to topic or Consumer Group | `topic:<name>[:group:<group_id>][:durable:<client_id>:<offset>]` |
 | `0x03` | `CmdUnsubscribe`| Unsubscribe stream from topic | `topic:<topic_name>` |
 | `0x04` | `CmdPublishBatch` | Publish batch of sub-frames atomically | Flat array of standard frames `[Magic][Cmd][StreamID][Len][Payload]...` |
 | `0x05` | `CmdNack` | Negative acknowledgment by message offset | `[offset: 8]` — 8-byte little-endian uint64 message offset |
+
+### Consumer Groups Payload Framing (`v1.13.0`)
+Competing consumers join a named Consumer Group by supplying `:group:<group_id>` in the `CmdSubscribe` payload:
+- **Standard Group Subscription**: `topic:orders:group:payment-workers`
+- **Durable Group Subscription**: `topic:orders:group:payment-workers:durable:worker1:0`
+
+Within each Consumer Group registered on a topic, messages are load-balanced across active group members via **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`). Group Durable Offsets are updated automatically on consumer ACKs.
 
 ### Control Bits (Bits 6 & 7)
 
 - **MeshForwarded Flag (Bit 7, `0x80`)**: Set when a frame is forwarded from another cluster broker node. Prevents re-forwarding loops in mesh topology.
 - **HasExtensions Flag (Bit 6, `0x40`)**: Set when the frame contains a TLV Extension block immediately following the 10-byte header.
 
----
+When `Command & 0x40 != 0`, the payload region begins with a 2-byte `ExtTotalLen` followed by packed TLV entries `[Type: 1B][Length: 1B][Value: N Bytes]`:
 
 ## 3. TLV Extension Block Format
 
