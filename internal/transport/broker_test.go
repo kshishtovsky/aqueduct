@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
+	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/broker"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/quic-go/quic-go"
@@ -793,3 +794,117 @@ func testBenchTLS(b *testing.B) (server, client *tls.Config) {
 
 	return server, client
 }
+
+func TestBrokerAuthzAllowedAndDenied(t *testing.T) {
+	sTLS, cTLS := testTLSConfig(t)
+	r := broker.NewRouter(nil)
+
+	aclEngine := authz.NewBuilder(authz.PermNone).
+		Allow("anonymous", "allowed_topic", authz.PermPublish|authz.PermSubscribe).
+		Build()
+
+	b := New(WithRouter(r), WithAuthz(aclEngine))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := b.Listen(ctx, "127.0.0.1:0", sTLS); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() {
+		shCtx, shCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shCancel()
+		_ = b.Shutdown(shCtx)
+	}()
+
+	addr := b.Addr().String()
+	conn, err := quic.DialAddr(context.Background(), addr, cTLS, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "test done") }()
+
+	// 1. Allowed Subscribe
+	subStream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		t.Fatalf("open sub stream: %v", err)
+	}
+	subBuf := protocol.SerializeFrame(protocol.CmdSubscribe, 1, []byte("allowed_topic"))
+	if _, err := subStream.Write(*subBuf); err != nil {
+		t.Fatalf("write subscribe allowed: %v", err)
+	}
+	protocol.ReleaseBuffer(subBuf)
+
+	// 2. Denied Publish to forbidden topic
+	pubStream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		t.Fatalf("open pub stream: %v", err)
+	}
+	deniedBuf := protocol.SerializeFrame(protocol.CmdPublish, 2, []byte("forbidden_topic"))
+	if _, err := pubStream.Write(*deniedBuf); err != nil {
+		t.Fatalf("write publish forbidden: %v", err)
+	}
+	protocol.ReleaseBuffer(deniedBuf)
+
+	// Read on pubStream should fail due to stream cancellation (code 401)
+	readBuf := make([]byte, 100)
+	_ = pubStream.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err = pubStream.Read(readBuf)
+	if err == nil {
+		t.Error("expected read error on denied stream, got nil")
+	}
+}
+
+func BenchmarkRouterPublishWithAuthz(b *testing.B) {
+	sTLS, cTLS := testBenchTLS(b)
+	r := broker.NewRouter(nil)
+
+	aclEngine := authz.NewBuilder(authz.PermNone).
+		Allow("anonymous", "bench", authz.PermPublish).
+		Build()
+
+	broker := New(WithRouter(r), WithAuthz(aclEngine))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := broker.Listen(ctx, "127.0.0.1:0", sTLS); err != nil {
+		b.Fatalf("listen: %v", err)
+	}
+	defer func() {
+		shCtx, shCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shCancel()
+		_ = broker.Shutdown(shCtx)
+	}()
+
+	addr := broker.Addr().String()
+	conn, err := quic.DialAddrEarly(
+		context.Background(),
+		addr,
+		cTLS,
+		&quic.Config{MaxIdleTimeout: 30 * time.Second},
+	)
+	if err != nil {
+		b.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "bench done") }()
+
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		b.Fatalf("open stream: %v", err)
+	}
+
+	payload := []byte("bench")
+	buf := protocol.SerializeFrame(protocol.CmdPublish, 1, payload)
+	defer protocol.ReleaseBuffer(buf)
+
+	b.SetBytes(int64(protocol.FrameSize(uint32(len(payload)))))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := stream.Write(*buf); err != nil {
+			b.Fatalf("write: %v", err)
+		}
+	}
+}
+
+
