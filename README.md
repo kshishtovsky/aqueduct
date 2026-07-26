@@ -83,8 +83,6 @@ transport:
 
 ### Environment Variable Overrides
 
-All values in `config.yaml` can be overridden via environment variables:
-
 | Environment Variable | Overrides | Example |
 | :--- | :--- | :--- |
 | `AQUEDUCT_LISTEN_ADDR` | `listen_addr` | `:4242` |
@@ -95,6 +93,32 @@ All values in `config.yaml` can be overridden via environment variables:
 | `AQUEDUCT_AAL_ENABLED` | `aal.enabled` | `true` |
 | `AQUEDUCT_AAL_FILE_PATH` | `aal.file_path` | `/var/log/aal.log` |
 | `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
+
+---
+
+## Benchmarking (`aqueduct-bench`)
+
+Aqueduct includes a high-performance QUIC load-testing utility in `cmd/aqueduct-bench`.
+
+### Build & Run Benchmark
+
+```bash
+# Build the benchmark tool
+go build -o bin/aqueduct-bench ./cmd/aqueduct-bench
+
+# Run against a local broker instance (10 workers, 100,000 requests, 128-byte payload)
+./bin/aqueduct-bench -addr 127.0.0.1:4242 -c 10 -n 100000 -size 128 -topic bench
+```
+
+### Options
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-addr` | `127.0.0.1:4242` | Target broker UDP address |
+| `-c` | `10` | Number of concurrent connections/streams |
+| `-n` | `100000` | Total number of publish messages |
+| `-size` | `128` | Message payload size in bytes |
+| `-topic` | `bench` | Target topic for message publish |
 
 ---
 
