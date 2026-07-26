@@ -18,10 +18,10 @@
 * **НЕ используешь** `sync.Mutex` на горячем пути, если есть lock-free альтернативы (`atomic`, seqlocks, шардирование).
 * **НЕ создаёшь** отдельный буфер для установки MeshForwarded бита на горячем пути — **mutate in-place + restore**, иначе стековый массив «убегает» в heap через `quic.Stream.Write`.
 
-## 2. Контекст и окружение (v1.7.0)
+## 2. Контекст и окружение (v1.9.0)
 
-Проект: сверхбыстрый мессендж-брокер на QUIC (текущая версия v1.5.0).
-Версия Go: 1.23+, библиотека `quic-go` v0.61.0 (`*quic.Stream`, а не `quic.Stream` — метод `OpenStreamSync` возвращает указатель).
+Проект: сверхбыстрый мессендж-брокер на QUIC (текущая версия v1.9.0).
+Версия Go: 1.25+, библиотека `quic-go` v0.61.0 (`*quic.Stream`, а не `quic.Stream` — метод `OpenStreamSync` возвращает указатель).
 Окружение: Локальная ФС, терминал (bash), web-search, `gh` CLI.
 Используется последняя **СТАБИЛЬНАЯ** версия Go и библиотек (RC и beta запрещены). Зависимости фиксируются в `go.sum`.
 
@@ -31,6 +31,11 @@
 - **In-place mutation** для zero-alloc forwarding: `rawBuf[1] = orig | byte(MeshForwardedBit)` → `s.Write(rawBuf)` → `rawBuf[1] = orig`. Никакой `var combined [256]byte` — он убегает в heap через `quic.Stream.Write`.
 - **PeerManager.New**: слайс пиров формируется полностью до запуска reconnectLoop-горутин, иначе data race между `append` и `range`.
 - **Router.Publish**: проверка `hasPeers` выполняется ДО раннего возврата при `len(indices) == 0`, иначе сообщения не форвардятся в кластер при отсутствии локальных подписчиков.
+- **TLV Extensions (HasExtensionsBit** — бит 6 Command-байта, маска `0x40`): опциональный блок после хедера `[ExtTotalLen:2][Type:1][Len:1][Val:N]…`. Zero-copy парсинг через `unsafe.Slice`. Неизвестные TLV-типы молча пропускаются. DataLen на проводе = ExtBlockSize + PayloadLen; старые парсеры корректно скипают.
+- **W3C Trace Context** (TLV Type `0x01`): `[TraceID:16][SpanID:8][TraceFlags:1]`. Извлекается через `ExtractTraceContext` — 0 allocs, ~4ns.
+- **OpcodeOf** маскирует **оба** контрольных бита (`cmd & ^0x80 & ^0x40`), чтобы вернуть чистый opcode.
+- **Config-gated OTel tracer**: при `tracing.enabled: false` — nil-трейсер, все операции инлайн no-op (~3.4ns). При включении — batched OTLP gRPC exporter.
+- **Router сохраняет TLV-блок** при ресериализации: `SerializeFrameWithExtensions` когда `frame.HasExtensions()`. Подписчик/пир получает TLV нетронутым.
 
 ## 3. Технологический стек и конвенции
 
@@ -39,7 +44,7 @@
 ### Архитектурные требования к брокеру
 
 1. **Транспорт (QUIC-Core):** Библиотека `quic-go`. Мультиплексирование через Stream ID. Обязательная поддержка 0-RTT. Защита от Amplification атак (лимиты на ранние данные).
-2. **Протокол (Zero-Copy Framing):** In-Memory First. Бинарный протокол: `[Magic: 1] [Cmd: 1] [StreamID: 4] [Payload Length: 4] [Payload: N]`. Бит 7 Command-байта — MeshForwarded флаг.
+2. **Протокол (Zero-Copy Framing):** In-Memory First. Бинарный протокол: `[Magic: 1] [Cmd: 1] [StreamID: 4] [DataLen: 4] [ExtBlock: N] [Payload: N]`. Бит 7 Command-байта — MeshForwarded, бит 6 — HasExtensions. DataLen покрывает ExtBlock + Payload.
 3. **Безопасность парсера:** Строгая валидация границ до вызова `unsafe`. Если `Payload Length` превышает размер буфера или максимальный лимит (MaxFrameSize) — пакет уничтожается, соединение может быть закрыто (DoS protection).
 4. **Память (DoD & SoA):** Хранение метаданных в плоских массивах. Zero-Copy Send/Receive. Использование `sync.Pool` для переиспользования буферов.
 5. **Кластеризация (Direct Mesh):** P2P соединения без консенсуса (no Raft/Paxos). Fire-and-forget форвардинг. Защита от штормов через MeshForwarded бит. PeerManager с reconnectLoop и экспоненциальным backoff.
@@ -54,6 +59,7 @@
 | **Логирование** | `log`, `fmt` | Структурированный логгер (`zerolog`), отключенный на горячем пути (уровень >= Warn). |
 | **Метрики** | Кастомные счётчики | **Prometheus client** (с оптимизацией под Go). |
 | **Безопасность** | OOB чтения, паники на данных | Интеграция `go test -fuzz` для всех парсеров фреймов. |
+| **Трассировка** | OTel overhead при disabled | Config-gated nil-safe wrapper, compiler-inlined nil check (~3.4ns no-op). |
 
 ## 4. Поведенческое ядро
 
@@ -97,7 +103,7 @@
 * При мерже новой версии: создай тэг (`git tag vX.Y.Z main && git push origin vX.Y.Z`), обнови CHANGELOG.md.
 * В конце сессии: `git push origin --all` (все ветки) + `git push origin --tags`.
 * После завершения фичи обнови Description и Topics репозитория через `gh repo edit`.
-* **Pre-commit hooks:** activate with `git config core.hooksPath .githooks` — runs `golangci-lint` + `go test -race` on changed packages before every commit.
+* **Pre-commit hooks:** activated with `git config core.hooksPath .githooks` — runs `golangci-lint` + `go test -race` on changed packages before every commit.
 
 ## 8. Формат вывода и коммуникации
 
