@@ -115,6 +115,7 @@ func TestRouterPublishOneToTwo(t *testing.T) {
 	sTLS, cTLS := genTLS(t)
 
 	router := NewRouter(nil)
+	defer router.Close()
 
 	quicConf := &quic.Config{Allow0RTT: true, MaxIdleTimeout: 30 * time.Second}
 	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
@@ -178,7 +179,6 @@ func TestRouterPublishOneToTwo(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Publish a message on the "orders" topic.
-	// The payload is the topic name for routing; subscribers receive it as the message.
 	payload := []byte("orders")
 	pubFrame := protocol.Frame{
 		Command:    protocol.CmdPublish,
@@ -216,6 +216,176 @@ func TestRouterPublishOneToTwo(t *testing.T) {
 	}
 	if string(recv2.Payload) != "orders" {
 		t.Errorf("sub2: expected 'orders', got %q", recv2.Payload)
+	}
+}
+
+// TestRouterAsyncSlowConsumerDropOldest tests 3 subscribers (2 fast, 1 slow).
+// Fast subscribers receive all messages without delay; slow subscriber drops oldest without blocking publisher.
+func TestRouterAsyncSlowConsumerDropOldest(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+
+	router := NewRouter(nil, WithQueueSize(10), WithBackpressurePolicy(PolicyDropOldest))
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func(s *quic.Stream) {
+						buf := make([]byte, 1024)
+						n, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						frame, err := protocol.ParseFrame(buf[:n])
+						if err != nil {
+							return
+						}
+						if frame.Command == protocol.CmdSubscribe {
+							_ = router.Subscribe(ctx, s, frame)
+						}
+					}(stream)
+				}
+			}()
+		}
+	}()
+
+	// Fast sub 1
+	conn1 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub1, err := conn1.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub1: %v", err)
+	}
+	sendFrame(t, sub1, protocol.CmdSubscribe, 1, []byte("topic:fast-topic"))
+
+	// Fast sub 2
+	conn2 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub2, err := conn2.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub2: %v", err)
+	}
+	sendFrame(t, sub2, protocol.CmdSubscribe, 2, []byte("topic:fast-topic"))
+
+	// Slow sub 3
+	conn3 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub3, err := conn3.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub3: %v", err)
+	}
+	sendFrame(t, sub3, protocol.CmdSubscribe, 3, []byte("topic:fast-topic"))
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Publish 100 messages rapidly
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		pubFrame := protocol.Frame{
+			Command:    protocol.CmdPublish,
+			PayloadLen: 10,
+			Payload:    []byte("fast-topic"),
+		}
+		if err := router.Publish(ctx, pubFrame); err != nil {
+			t.Fatalf("publish error: %v", err)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// Publisher must finish in less than 50ms despite slow subscriber!
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("publisher was blocked by slow subscriber! took %v", elapsed)
+	}
+
+	// Verify fast subscribers read messages cleanly
+	sub1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	if _, err := sub1.Read(buf); err != nil {
+		t.Errorf("fast sub1 read failed: %v", err)
+	}
+
+	sub2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := sub2.Read(buf); err != nil {
+		t.Errorf("fast sub2 read failed: %v", err)
+	}
+}
+
+// TestRouterAsyncSlowConsumerDisconnect tests automatic disconnect policy on overflow.
+func TestRouterAsyncSlowConsumerDisconnect(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+
+	router := NewRouter(nil, WithQueueSize(5), WithBackpressurePolicy(PolicyDisconnect))
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 1024)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		frame, err := protocol.ParseFrame(buf[:n])
+		if err != nil {
+			return
+		}
+		_ = router.Subscribe(ctx, stream, frame)
+	}()
+
+	conn := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub: %v", err)
+	}
+	sendFrame(t, sub, protocol.CmdSubscribe, 1, []byte("topic:disco-topic"))
+	time.Sleep(300 * time.Millisecond)
+
+	// Publish 50 messages to overflow small queue (size 5)
+	for i := 0; i < 50; i++ {
+		_ = router.Publish(ctx, protocol.Frame{
+			Command:    protocol.CmdPublish,
+			PayloadLen: 11,
+			Payload:    []byte("disco-topic"),
+		})
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify subscriber was disconnected (countActive drops to 0)
+	if router.countActiveLocked() != 0 {
+		t.Errorf("expected 0 active subscribers after disconnect overflow, got %d", router.countActiveLocked())
 	}
 }
 
@@ -283,6 +453,8 @@ func TestRouterUnsubscribe(t *testing.T) {
 	}
 
 	router := NewRouter(nil)
+	defer router.Close()
+
 	_ = router.Subscribe(ctx, stream, protocol.Frame{
 		Command:    protocol.CmdSubscribe,
 		StreamID:   1,
@@ -317,6 +489,7 @@ func (m *mockMetrics) SetActiveSubscribers(n float64) {
 func TestRouterMetrics(t *testing.T) {
 	mm := &mockMetrics{}
 	router := NewRouter(mm)
+	defer router.Close()
 
 	sTLS, cTLS := genTLS(t)
 	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
@@ -375,6 +548,8 @@ func TestRouterMetrics(t *testing.T) {
 	if mm.published.Load() != 1 {
 		t.Errorf("expected 1 OnPublish, got %d", mm.published.Load())
 	}
+
+	time.Sleep(200 * time.Millisecond)
 	if mm.delivered.Load() != 1 {
 		t.Errorf("expected 1 OnDeliver, got %d", mm.delivered.Load())
 	}
@@ -383,6 +558,8 @@ func TestRouterMetrics(t *testing.T) {
 // TestRouterPublishToEmptyTopic verifies publish to a topic with no subscribers.
 func TestRouterPublishToEmptyTopic(t *testing.T) {
 	router := NewRouter(nil)
+	defer router.Close()
+
 	err := router.Publish(context.Background(), protocol.Frame{
 		Command:    protocol.CmdPublish,
 		Payload:    []byte("empty-topic"),
@@ -396,6 +573,8 @@ func TestRouterPublishToEmptyTopic(t *testing.T) {
 // TestRouterPublishOversizedPayload verifies the max payload guard.
 func TestRouterPublishOversizedPayload(t *testing.T) {
 	router := NewRouter(nil)
+	defer router.Close()
+
 	oversized := make([]byte, maxPayloadSize+1)
 	err := router.Publish(context.Background(), protocol.Frame{
 		Command:    protocol.CmdPublish,
@@ -407,8 +586,8 @@ func TestRouterPublishOversizedPayload(t *testing.T) {
 	}
 }
 
-// BenchmarkRouterPublish measures fan-out speed for 1, 5, and 10 subscribers.
-func BenchmarkRouterPublish(b *testing.B) {
+// BenchmarkRouterPublishAsync measures publisher latency for 1, 5, and 10 subscribers.
+func BenchmarkRouterPublishAsync(b *testing.B) {
 	for _, numSubs := range []int{1, 5, 10} {
 		b.Run(fmt.Sprintf("subs=%d", numSubs), func(b *testing.B) {
 			sTLS, cTLS := genTLS(b)
@@ -423,6 +602,7 @@ func BenchmarkRouterPublish(b *testing.B) {
 			defer cancel()
 
 			router := NewRouter(nil)
+			defer router.Close()
 
 			go func() {
 				for {
@@ -467,23 +647,24 @@ func BenchmarkRouterPublish(b *testing.B) {
 			time.Sleep(300 * time.Millisecond)
 
 			topic := []byte("bench")
+			pubFrame := protocol.Frame{
+				Command:    protocol.CmdPublish,
+				PayloadLen: uint32(len(topic)),
+				Payload:    topic,
+			}
+
 			b.SetBytes(int64(protocol.FrameSize(uint32(len(topic)))))
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				_ = router.Publish(ctx, protocol.Frame{
-					Command:    protocol.CmdPublish,
-					PayloadLen: uint32(len(topic)),
-					Payload:    topic,
-				})
+				_ = router.Publish(ctx, pubFrame)
 			}
 		})
 	}
 }
 
-// BenchmarkRouterPublishWithAAL measures publish performance with AAL enabled,
-// confirming zero heap allocations during disk writes.
+// BenchmarkRouterPublishWithAAL measures publish performance with AAL enabled.
 func BenchmarkRouterPublishWithAAL(b *testing.B) {
 	logPath := filepath.Join(b.TempDir(), "aal_bench.log")
 	aalLog, err := aal.Open(logPath)
@@ -493,6 +674,8 @@ func BenchmarkRouterPublishWithAAL(b *testing.B) {
 	defer aalLog.Close()
 
 	router := NewRouter(nil)
+	defer router.Close()
+
 	topic := []byte("bench")
 	frame := protocol.Frame{
 		Command:    protocol.CmdPublish,
@@ -515,4 +698,3 @@ func BenchmarkRouterPublishWithAAL(b *testing.B) {
 		_ = router.Publish(context.Background(), frame)
 	}
 }
-
