@@ -45,10 +45,10 @@ type Broker struct {
 	listener *quic.Listener
 	handlers map[protocol.Command]Handler
 	router   *broker.Router
-	aal     *aal.Log
-	authz   *authz.Engine
-	aalPath string
-	aalKey  []byte
+	aal      *aal.Log
+	authz    *authz.Engine
+	aalPath  string
+	aalKey   []byte
 
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
@@ -367,7 +367,7 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 		if b.authz != nil {
 			var requiredPerm authz.Permission
 			switch frame.Command {
-			case protocol.CmdPublish:
+			case protocol.CmdPublish, protocol.CmdPublishBatch:
 				requiredPerm = authz.PermPublish
 			case protocol.CmdSubscribe:
 				requiredPerm = authz.PermSubscribe
@@ -381,8 +381,8 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 			}
 		}
 
-		// Append-Only Logging for CmdPublish
-		if frame.Command == protocol.CmdPublish && b.aal != nil {
+		// Append-Only Logging for CmdPublish and CmdPublishBatch
+		if (frame.Command == protocol.CmdPublish || frame.Command == protocol.CmdPublishBatch) && b.aal != nil {
 			if err := b.aal.WriteFrame(buf[consumed : consumed+totalLen]); err != nil {
 				logger.Warn("aal write error", "err", err)
 			}
@@ -410,7 +410,13 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 				continue
 			case protocol.CmdPublish:
 				if err := b.router.Publish(jig, frame); err != nil {
-					logger.Warn("publish error", "err", err)
+					b.logger.Warn("publish error", "err", err)
+				}
+				consumed += totalLen
+				continue
+			case protocol.CmdPublishBatch:
+				if err := b.router.PublishBatch(jig, frame); err != nil {
+					b.logger.Warn("batch publish error", "err", err)
 				}
 				consumed += totalLen
 				continue

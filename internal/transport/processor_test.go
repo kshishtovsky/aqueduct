@@ -32,6 +32,46 @@ func TestReadBufPool_PutBufSmall(t *testing.T) {
 	_rp.PutBuf(small) // should not panic
 }
 
+func TestExtractTopicBytes(t *testing.T) {
+	tests := []struct {
+		input []byte
+		want  string
+	}{
+		{[]byte("topic:orders"), "orders"},
+		{[]byte("topic:"), ""},
+		{[]byte("plain"), "plain"},
+		{[]byte("topic:prefix:extra"), "prefix:extra"},
+	}
+
+	for _, tt := range tests {
+		got := extractTopicBytes(tt.input)
+		if string(got) != tt.want {
+			t.Errorf("extractTopicBytes(%q) = %q, want %q", string(tt.input), string(got), tt.want)
+		}
+	}
+}
+
+func TestParseAckPayload(t *testing.T) {
+	consumer, topic, offset, err := parseAckPayload([]byte("topic:orders:consumer:svc-a:offset:42"))
+	if err != nil {
+		t.Fatalf("parseAckPayload: %v", err)
+	}
+	if topic != "orders" {
+		t.Errorf("expected topic 'orders', got %q", topic)
+	}
+	if consumer != "svc-a" {
+		t.Errorf("expected consumer 'svc-a', got %q", consumer)
+	}
+	if offset != 42 {
+		t.Errorf("expected offset 42, got %d", offset)
+	}
+
+	_, _, _, err = parseAckPayload([]byte("invalid"))
+	if err == nil {
+		t.Error("expected error for invalid ack payload")
+	}
+}
+
 func TestPayloadLen(t *testing.T) {
 	buf := make([]byte, protocol.HeaderSize+10)
 	*(*uint32)(unsafe.Pointer(&buf[6])) = 42
