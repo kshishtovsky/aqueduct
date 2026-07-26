@@ -19,30 +19,57 @@ import (
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
 	"github.com/kshishtovsky/aqueduct/internal/broker"
+	"github.com/kshishtovsky/aqueduct/internal/config"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/kshishtovsky/aqueduct/internal/transport"
 )
 
 func main() {
+	configFile := flag.String("config", "", "Path to YAML configuration file")
 	certFile := flag.String("cert", "", "Path to TLS certificate file")
 	keyFile := flag.String("key", "", "Path to TLS private key file")
 	aalFile := flag.String("aal", "", "Path to Append-Only Log file")
-	addrFlag := flag.String("addr", ":4242", "Broker listen UDP address")
-	metricsAddrFlag := flag.String("metrics-addr", ":9090", "Metrics HTTP server address")
+	addrFlag := flag.String("addr", "", "Broker listen UDP address")
+	metricsAddrFlag := flag.String("metrics-addr", "", "Metrics HTTP server address")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
-	var tlsConf *tls.Config
-	var err error
+	cfg, err := config.Load(*configFile)
+	if err != nil {
+		logger.Error("failed to load configuration", "err", err)
+		os.Exit(1)
+	}
 
-	if *certFile != "" && *keyFile != "" {
-		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	// CLI flag overrides
+	if *addrFlag != "" {
+		cfg.ListenAddr = *addrFlag
+	}
+	if *metricsAddrFlag != "" {
+		cfg.MetricsAddr = *metricsAddrFlag
+	}
+	if *certFile != "" {
+		cfg.TLS.CertFile = *certFile
+		cfg.TLS.Generate = false
+	}
+	if *keyFile != "" {
+		cfg.TLS.KeyFile = *keyFile
+		cfg.TLS.Generate = false
+	}
+	if *aalFile != "" {
+		cfg.AAL.Enabled = true
+		cfg.AAL.FilePath = *aalFile
+	}
+
+	var tlsConf *tls.Config
+
+	if !cfg.TLS.Generate && cfg.TLS.CertFile != "" && cfg.TLS.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 		if err != nil {
-			logger.Error("failed to load TLS certificate and key", "cert", *certFile, "key", *keyFile, "err", err)
+			logger.Error("failed to load TLS certificate and key", "cert", cfg.TLS.CertFile, "key", cfg.TLS.KeyFile, "err", err)
 			os.Exit(1)
 		}
 		tlsConf = &tls.Config{
@@ -50,7 +77,7 @@ func main() {
 			NextProtos:   []string{"aqueduct-v1"},
 			MinVersion:   tls.VersionTLS13,
 		}
-		logger.Info("using production TLS certificate", "cert", *certFile, "key", *keyFile)
+		logger.Info("using production TLS certificate", "cert", cfg.TLS.CertFile, "key", cfg.TLS.KeyFile)
 	} else {
 		logger.Warn("Using ephemeral self-signed certificate. Do not use in production.")
 		tlsConf, err = generateSelfSignedTLS()
@@ -60,40 +87,34 @@ func main() {
 		}
 	}
 
-	// Start metrics HTTP server on :9090 or flag/env override.
-	metricsAddr := *metricsAddrFlag
-	if envAddr := os.Getenv("METRICS_ADDR"); envAddr != "" && metricsAddr == ":9090" {
-		metricsAddr = envAddr
-	}
-	if err := metrics.StartServer(metricsAddr); err != nil {
+	if err := metrics.StartServer(cfg.MetricsAddr); err != nil {
 		logger.Error("failed to start metrics server", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("metrics server started", "addr", metricsAddr)
+	logger.Info("metrics server started", "addr", cfg.MetricsAddr)
 
-	// Create router with Prometheus metrics.
 	routerMetrics := &prometheusMetrics{}
 	router := broker.NewRouter(routerMetrics)
 
 	opts := []transport.Option{
 		transport.WithLogger(logger),
 		transport.WithRouter(router),
+		transport.WithMaxBufSize(cfg.Transport.MaxBufSize),
+		transport.WithReadBufSize(cfg.Transport.ReadBufSize),
 	}
 
-	if *aalFile != "" {
-		aalLog, err := aal.Open(*aalFile)
+	if cfg.AAL.Enabled && cfg.AAL.FilePath != "" {
+		aalLog, err := aal.Open(cfg.AAL.FilePath)
 		if err != nil {
-			logger.Error("failed to open AAL file", "path", *aalFile, "err", err)
+			logger.Error("failed to open AAL file", "path", cfg.AAL.FilePath, "err", err)
 			os.Exit(1)
 		}
-		logger.Info("append-only logging enabled", "path", *aalFile)
+		logger.Info("append-only logging enabled", "path", cfg.AAL.FilePath)
 		opts = append(opts, transport.WithAAL(aalLog))
 	}
 
 	b := transport.New(opts...)
 
-	// Publish/Subscribe are handled by the built-in router.
-	// The handler system remains available for custom commands.
 	b.Handle(protocol.CmdPublish, func(ctx context.Context, frame protocol.Frame) ([]byte, error) {
 		logger.Info("publish received", "stream_id", frame.StreamID, "payload_len", frame.PayloadLen)
 		return nil, nil
@@ -107,12 +128,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	addr := *addrFlag
-	if envAddr := os.Getenv("BROKER_ADDR"); envAddr != "" && addr == ":4242" {
-		addr = envAddr
-	}
-
-	if err := b.Listen(ctx, addr, tlsConf); err != nil {
+	if err := b.Listen(ctx, cfg.ListenAddr, tlsConf); err != nil {
 		logger.Error("failed to start listener", "err", err)
 		os.Exit(1)
 	}
@@ -196,4 +212,5 @@ func generateSelfSignedTLS() (*tls.Config, error) {
 		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
+
 

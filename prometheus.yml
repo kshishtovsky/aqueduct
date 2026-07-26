@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'aqueduct'
+    static_configs:
+      - targets: ['aqueduct:9090']
