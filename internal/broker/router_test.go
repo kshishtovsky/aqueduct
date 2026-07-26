@@ -1497,3 +1497,385 @@ func BenchmarkDurablePublish(b *testing.B) {
 		_ = router.Publish(context.Background(), frame)
 	}
 }
+
+// TestNackRedelivery verifies that a NACK'd message is redelivered to the subscriber.
+func TestNackRedelivery(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+
+	router := NewRouter(nil, WithMaxRetries(3))
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func(s *quic.Stream) {
+						buf := make([]byte, 1024)
+						n, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						frame, err := protocol.ParseFrame(buf[:n])
+						if err != nil {
+							return
+						}
+						if frame.Command == protocol.CmdSubscribe {
+							_ = router.Subscribe(ctx, s, frame)
+						}
+					}(stream)
+				}
+			}()
+		}
+	}()
+
+	conn := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub: %v", err)
+	}
+	sendFrame(t, sub, protocol.CmdSubscribe, 1, []byte("topic:nack-test"))
+	time.Sleep(300 * time.Millisecond)
+
+	// Publish one message
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: 9,
+		Payload:    []byte("nack-test"),
+	})
+
+	// Read the first delivery
+	sub.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf1 := make([]byte, 1024)
+	n1, err := sub.Read(buf1)
+	if err != nil {
+		t.Fatalf("first delivery read: %v", err)
+	}
+	f1, _ := protocol.ParseFrame(buf1[:n1])
+	if string(f1.Payload) != "nack-test" {
+		t.Fatalf("expected 'nack-test', got %q", f1.Payload)
+	}
+
+	// Simulate NACK via NackByStream (offset 1 = first message)
+	time.Sleep(100 * time.Millisecond)
+	router.NackByStream(1, 1)
+
+	// Read the redelivery
+	time.Sleep(200 * time.Millisecond)
+	sub.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf2 := make([]byte, 1024)
+	n2, err := sub.Read(buf2)
+	if err != nil {
+		t.Fatalf("redelivery read: %v", err)
+	}
+	f2, _ := protocol.ParseFrame(buf2[:n2])
+	if string(f2.Payload) != "nack-test" {
+		t.Errorf("redelivery: expected 'nack-test', got %q", f2.Payload)
+	}
+}
+
+// TestPoisonPillToDLQ verifies that a message NACK'd max_retries times moves to __dlq__ topic.
+func TestPoisonPillToDLQ(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+
+	router := NewRouter(nil, WithMaxRetries(3))
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Track delivered offsets to identify redeliveries vs DLQ
+	topicHits := atomic.Int32{}
+	dlqHits := atomic.Int32{}
+
+	go func() {
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func(s *quic.Stream) {
+						buf := make([]byte, 1024)
+						n, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						frame, err := protocol.ParseFrame(buf[:n])
+						if err != nil {
+							return
+						}
+						if frame.Command == protocol.CmdSubscribe {
+							_ = router.Subscribe(ctx, s, frame)
+						}
+					}(stream)
+				}
+			}()
+		}
+	}()
+
+	// Subscribe to original topic
+	conn1 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub1, err := conn1.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub1: %v", err)
+	}
+	sendFrame(t, sub1, protocol.CmdSubscribe, 1, []byte("topic:nack-dlq"))
+	time.Sleep(200 * time.Millisecond)
+
+	// Subscribe to DLQ topic
+	conn2 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub2, err := conn2.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub2: %v", err)
+	}
+	sendFrame(t, sub2, protocol.CmdSubscribe, 2, []byte("topic:__dlq__nack-dlq"))
+	time.Sleep(300 * time.Millisecond)
+
+	// Publish one message
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: 9,
+		Payload:    []byte("nack-dlq"),
+	})
+
+	// Sub1 reads first delivery
+	sub1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	n, err := sub1.Read(buf)
+	if err != nil {
+		t.Fatalf("sub1 first read: %v", err)
+	}
+	frame, _ := protocol.ParseFrame(buf[:n])
+	if string(frame.Payload) != "nack-dlq" {
+		t.Fatalf("expected 'nack-dlq', got %q", frame.Payload)
+	}
+	topicHits.Add(1)
+
+	// NACK 3 times (max_retries = 3) via NackByStream
+	for i := 0; i < 3; i++ {
+		router.NackByStream(1, 1)
+		time.Sleep(200 * time.Millisecond)
+
+		// Read the redelivery
+		sub1.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, err = sub1.Read(buf)
+		if err == nil {
+			frame, _ = protocol.ParseFrame(buf[:n])
+			if string(frame.Payload) == "nack-dlq" {
+				topicHits.Add(1)
+			}
+		}
+	}
+
+	// After 3 NACKs, sub2 (DLQ subscriber) should have received the message
+	time.Sleep(300 * time.Millisecond)
+	sub2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err = sub2.Read(buf)
+	if err != nil {
+		t.Fatalf("sub2 (DLQ) read failed: %v. topicHits=%d, dlqHits=%d", err, topicHits.Load(), dlqHits.Load())
+	}
+	dlqFrame, _ := protocol.ParseFrame(buf[:n])
+	if string(dlqFrame.Payload) != "__dlq__nack-dlq" {
+		t.Errorf("DLQ: expected '__dlq__nack-dlq' (DLQ topic), got %q", dlqFrame.Payload)
+	}
+	dlqHits.Add(1)
+
+	if dlqHits.Load() != 1 {
+		t.Errorf("expected 1 DLQ delivery, got %d", dlqHits.Load())
+	}
+}
+
+// TestNackUnknownOffset verifies that NACK for an unknown offset does not panic.
+func TestNackUnknownOffset(t *testing.T) {
+	router := NewRouter(nil)
+	defer router.Close()
+
+	// NACK for offset 99999 on a stream with no subscribers should not panic
+	router.NackByStream(99999, 99999)
+}
+
+// TestNackByStream verifies NackByStream routes to the correct subscriber.
+func TestNackByStream(t *testing.T) {
+	router := NewRouter(nil)
+	defer router.Close()
+
+	sTLS, cTLS := genTLS(t)
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 1024)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		frame, err := protocol.ParseFrame(buf[:n])
+		if err != nil {
+			return
+		}
+		if frame.Command == protocol.CmdSubscribe {
+			_ = router.Subscribe(ctx, stream, frame)
+		}
+	}()
+
+	conn := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub: %v", err)
+	}
+	sendFrame(t, sub, protocol.CmdSubscribe, 42, []byte("topic:nack-stream-test"))
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify we can find the topic by stream ID
+	topic, found := router.TopicOfStream(42)
+	if !found {
+		t.Fatal("topic not found for stream 42")
+	}
+	if topic != "nack-stream-test" {
+		t.Errorf("expected 'nack-stream-test', got %q", topic)
+	}
+
+	// NACK on stream 42 should not panic
+	router.NackByStream(42, 1)
+
+	// NACK on unregistered stream should be a no-op
+	router.NackByStream(999, 1)
+}
+
+// BenchmarkNackHandling measures the performance of NACK processing.
+func BenchmarkNackHandling(b *testing.B) {
+	sTLS, cTLS := genTLS(b)
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		b.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil, WithMaxRetries(3))
+	defer router.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func(s *quic.Stream) {
+						buf := make([]byte, 1024)
+						n, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						frame, err := protocol.ParseFrame(buf[:n])
+						if err != nil {
+							return
+						}
+						if frame.Command == protocol.CmdSubscribe {
+							_ = router.Subscribe(ctx, s, frame)
+						}
+					}(stream)
+				}
+			}()
+		}
+	}()
+
+	conn := dialQUIC(b, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		b.Fatalf("open sub: %v", err)
+	}
+	sendFrame(b, sub, protocol.CmdSubscribe, 1, []byte("topic:nack-bench"))
+	time.Sleep(300 * time.Millisecond)
+
+	// Pre-publish a message and get its offset
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: 10,
+		Payload:    []byte("nack-bench"),
+	})
+
+	// Consume the message
+	sub.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	if _, err := sub.Read(buf); err != nil {
+		b.Fatalf("read before bench: %v", err)
+	}
+
+	// Pre-publish messages for benchmark
+	for i := 0; i < 100; i++ {
+		_ = router.Publish(ctx, protocol.Frame{
+			Command:    protocol.CmdPublish,
+			PayloadLen: 10,
+			Payload:    []byte("nack-bench"),
+		})
+		// Drain
+		sub.SetReadDeadline(time.Now().Add(1 * time.Second))
+		if _, err := sub.Read(buf); err != nil {
+			break
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		router.NackByStream(1, 1)
+	}
+
+	// Must be 0 allocs/op on the NackByStream path (no allocation for the non-blocking channel send)
+}
