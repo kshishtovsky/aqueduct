@@ -1,4 +1,4 @@
-# Explanation: Architecture & Memory Model (v1.3.0)
+# Explanation: Architecture & Memory Model (v1.5.0)
 
 This document explains the architectural principles, Data-Oriented Design (DoD) choices, security primitives, and zero-allocation memory strategies underlying Aqueduct's performance.
 
@@ -78,3 +78,31 @@ MQTT wildcard matching operates directly on byte slices without string conversio
 1. **mTLS 1.3**: Requires valid client certificates verified against trusted CA cert pools (`client_ca_file`). Client Common Name (CN) is extracted for authorization.
 2. **Non-Commutative FNV-1a ACL**: Combines `clientID` and `topic` sequentially (`FNV1a(clientID + ":" + topic)`), preventing XOR commutativity bypasses.
 3. **AES-256-GCM Encrypted AAL & Replay**: Log records are encrypted with 12-byte Nonces (4-byte random session prefix) and length-prefixed headers. Startup replay restores state sequentially before opening the QUIC UDP listener socket.
+
+---
+
+## 6. Direct Mesh Clustering (P2P Federation)
+
+Aqueduct supports forming a cluster of broker instances connected via a direct peer-to-peer QUIC mesh. There is no central coordinator or consensus protocol (no Raft/Paxos). Forwarding is fire-and-forget.
+
+### PeerManager
+
+Each broker maintains outgoing QUIC connections to a static peer list. The PeerManager:
+- Dials each peer address on startup with mTLS 1.3
+- Runs a background reconnect loop with exponential backoff on disconnect
+- Exposes `Forward()` for zero-copy frame forwarding to all connected peers
+
+### MeshForwarded Bit
+
+A single bit in the protocol's Command byte (bit 7, mask `0x80`) marks a frame as already forwarded. Receiving peers check this bit and skip re-forwarding, preventing broadcast storms in multi-hop topologies.
+
+### Zero-Copy Forwarding
+
+The `Forward()` method sets the MeshForwarded bit in-place on the shared buffer (0 heap allocations, 0 allocs/op) and writes the modified frame directly to each peer's QUIC stream.
+
+### Router Integration
+
+When `Router.Publish()` processes a local message:
+1. Delivers to local subscribers via SoA fan-out
+2. Calls `PeerManager.Forward()` to broadcast to all peers
+3. The receiving peer calls `Router.PublishFromPeer()` which dispatches locally only (no re-forwarding)

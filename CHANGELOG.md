@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-07-26
+
+### Added
+- **Direct Mesh Clustering (P2P Federation)**: New `internal/cluster` package with `PeerManager` managing QUIC-based peer connections, auto-reconnect with exponential backoff, and zero-copy frame forwarding between cluster nodes.
+- **Mesh Storm Prevention**: `MeshForwardedBit` in protocol frame headers prevents re-forwarding of already-forwarded frames, eliminating broadcast storms in multi-hop topologies.
+- **Router Peer Integration**: `PeerForwarder` interface, `PublishFromPeer()` for local-only dispatch of peer-originated frames, and `Publish() -> Forward()` path that forwards even without local subscribers.
+- **Zero-Copy In-Place Forwarding**: In-place mutation of the MeshForwarded bit in the shared buffer (`0 allocs/op` on the Forward hot path) eliminates heap allocation formerly caused by stack-to-heap escape through `quic.Stream.Write`.
+- **Cluster Configuration**: Static peer address list via `cluster.peers` in YAML config with `AQUEDUCT_CLUSTER_PEERS` env override.
+- **Cluster Observability**: Prometheus `aqueduct_cluster_peers_active` gauge and `aqueduct_cluster_frames_forwarded_total` counter.
+- **Integration Test Suite**: 2-node and 3-node full mesh forwarding tests, storm protection bit-level unit test, `ForwardRaw` and `ForwardNoBit` edge case tests, and race-condition-free PeerManager lifecycle test.
+- **Data Race Fix**: Peer slice fully built before goroutine spawn in `New()` to prevent concurrent slice append vs iteration.
+
+### Performance
+- 0 allocs/op on `Forward()` hot path (in-place bit mutation), 373 B/op quic-go internal overhead
+- Coverage: 84.9% on `internal/cluster` package (exceeds 75% gate)
+- 0 data races verified via `go test -race ./...`
+
 ## [1.3.0] - 2026-07-26
 
 ### Added
