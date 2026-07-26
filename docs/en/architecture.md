@@ -1,4 +1,4 @@
-# Explanation: Architecture & Memory Model (v1.5.0)
+# Explanation: Architecture & Memory Model (v1.6.0)
 
 This document explains the architectural principles, Data-Oriented Design (DoD) choices, security primitives, and zero-allocation memory strategies underlying Aqueduct's performance.
 
@@ -106,3 +106,79 @@ When `Router.Publish()` processes a local message:
 1. Delivers to local subscribers via SoA fan-out
 2. Calls `PeerManager.Forward()` to broadcast to all peers
 3. The receiving peer calls `Router.PublishFromPeer()` which dispatches locally only (no re-forwarding)
+
+---
+
+## 7. Batch Protocol & Coalesced Writes
+
+### The Problem: OS PPS Limits
+
+QUIC streams provide excellent stream-level isolation, but `quic.Stream.Write()` has significant per-call overhead (syscall boundary, packetization, crypto). Sending one frame per write caps throughput at ∼300k RPS regardless of CPU speed.
+
+### Solution: Smart Batching
+
+Aqueduct v1.6.0 uses two complementary batching strategies:
+
+#### 7.1 Protocol-Level Batching (`CmdPublishBatch`)
+
+A new command `0x04` encodes multiple standard frames as a flat byte array within a single QUIC stream write payload:
+
+```text
++--------------------------+
+| CmdPublishBatch Frame    |
+| +----------------------+ |
+| | Sub-frame 1          | |
+| | [Magic|Cmd|StreamID  | |
+| |  |Len|Payload]       | |
+| +----------------------+ |
+| | Sub-frame 2          | |
+| | ...                  | |
+| +----------------------+ |
+| | Sub-frame N          | |
+| +----------------------+ |
++--------------------------+
+```
+
+Sub-frames are parsed via `unsafe.Slice` with pointer arithmetic — each sub-slice points directly into the parent batch buffer, achieving **zero-copy unpacking**. All OOB checks are performed before any unsafe operation.
+
+#### 7.2 Nested Reference Counting
+
+When a batch buffer arrives at the router:
+
+1. **Parent `MessageRef`** is created wrapping the batch buffer (ref = 1 + frameCount)
+2. **Child `MessageRef`s** are created for each sub-frame via `AcquireChildMessageRef()` — each child stores a `frame []byte` sub-slice pointing into the parent buffer and increments the parent's ref counter
+3. On `Release()`: when a child's ref reaches 0, it calls `parent.Release()`. When parent's ref reaches 0, the batch buffer is returned to `sync.Pool`
+4. All ref operations are `atomic.Int32` — zero locks on the hot path
+
+```go
+type MessageRef struct {
+    buf       *[]byte     // pooled buffer (parent only)
+    frame     []byte      // zero-copy sub-slice (child only)
+    parent    *MessageRef // parent ref (nil for parents)
+    ref       atomic.Int32
+    expiresAt int64
+}
+```
+
+#### 7.3 Coalesced Subscriber Writer
+
+The `runSubscriberWriter` goroutine (one per subscriber) accumulates outgoing frames and flushes them as a batch when:
+
+1. **Size threshold reached**: Accumulated payload exceeds `batch_size` (default 64 KB)
+2. **Micro-timer fires**: A single reusable `time.Timer` is `Reset()` after the first accumulated frame and fires after `flush_interval` (default 50 µs) — ensuring latency is bounded even under low load
+
+Both parameters are configurable via `config.yaml`:
+
+```yaml
+broker:
+  batch_size: 65536
+  flush_interval: 50us
+```
+
+#### 7.4 Benchmarks
+
+| Scenario | Throughput | allocs/op |
+|----------|-----------|-----------|
+| **BatchUnpack** (1000 frames) | 19.9 GB/s | **0** |
+| **BatchPublish** (100 msgs) | 6.67M msg/s, 921 MB/s | **0** |
+| Single vs Batch (per message) | ~150 ns/msg (batch) vs ~920 ns/msg (single) | **0** |
