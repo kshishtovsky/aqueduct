@@ -1,4 +1,4 @@
-# 解释: 架构与内存模型 (v1.3.0)
+# 解释: 架构与内存模型 (v1.5.0)
 
 本文档说明 Aqueduct 的架构设计、面向数据设计 (DoD)、安全机制以及零内存分配策略。
 
@@ -72,3 +72,31 @@ type MessageRef struct {
 1. **mTLS 1.3**: 通过 `client_ca_file` 验证客户端证书。
 2. **非交换 ACL**: 采用 `FNV1a(clientID + ":" + topic)` 组合哈希，规避 XOR 碰撞。
 3. **AES-256-GCM AAL 与重放**: 带长度前缀与 12 字节 Nonce (4 字节随机会话前缀) 的加密日志。在开启 UDP 监听前完成重放状态恢复。
+
+---
+
+## 6. 直接网格集群 (P2P 联邦)
+
+Aqueduct 支持通过直接 P2P QUIC 网格连接多个代理实例形成集群。没有中央协调器或共识协议（无 Raft/Paxos）。消息转发采用 fire-and-forget 模式。
+
+### PeerManager
+
+每个代理维护到静态对等列表的出站 QUIC 连接。PeerManager：
+- 启动时使用 mTLS 1.3 拨号每个对等地址
+- 运行后台重连循环，断连时使用指数退避
+- 暴露 `Forward()` 方法用于零拷贝帧转发到所有已连接对等节点
+
+### MeshForwarded Bit
+
+协议 Command 字节中的一个位（第 7 位，掩码 `0x80`）标记帧已被转发。接收对等节点检查此位并跳过重复转发，防止多跳拓扑中的广播风暴。
+
+### 零拷贝转发
+
+`Forward()` 方法在原地修改共享缓冲区的 MeshForwarded 位（0 堆分配，0 allocs/op），并将修改后的帧直接写入每个对等节点的 QUIC 流。
+
+### 路由器集成
+
+当 `Router.Publish()` 处理本地消息时：
+1. 通过 SoA fan-out 投递到本地订阅者
+2. 调用 `PeerManager.Forward()` 广播到所有对等节点
+3. 接收节点调用 `Router.PublishFromPeer()`，仅本地分发（不重新转发）

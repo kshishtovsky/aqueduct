@@ -1,4 +1,4 @@
-# 教程: Aqueduct 入门指南 (v1.3.0)
+# 教程: Aqueduct 入门指南 (v1.5.0)
 
 本教程指导您如何安装、配置和运行 Aqueduct 消息代理。
 
@@ -60,6 +60,11 @@ broker:
 transport:
   max_buf_size: 65536
   read_buf_size: 1024
+
+cluster:
+  peers:
+    - "192.168.1.10:4242"
+    - "192.168.1.11:4242"
 ```
 
 ---
