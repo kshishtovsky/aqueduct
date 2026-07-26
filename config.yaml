@@ -1,0 +1,24 @@
+# Aqueduct Message Broker Configuration (v1.0.0)
+
+# UDP listen address for QUIC broker
+listen_addr: ":4242"
+
+# HTTP listen address for Prometheus metrics (/metrics) and health checks (/healthz)
+metrics_addr: ":9090"
+
+# TLS Configuration (TLS 1.3 strictly required)
+tls:
+  # Set to true to generate ephemeral self-signed certificates for development
+  generate: true
+  cert_file: ""
+  key_file: ""
+
+# Append-Only Logging (AAL) Configuration
+aal:
+  enabled: false
+  file_path: ""
+
+# Transport & Memory Hardening Limits
+transport:
+  max_buf_size: 65536     # 64 KB maximum buffer limit per stream
+  read_buf_size: 1024     # 1 KB initial read buffer per stream
