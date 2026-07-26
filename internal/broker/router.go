@@ -90,6 +90,22 @@ func WithAALPath(path string, key []byte) RouterOption {
 	}
 }
 
+// PeerForwarder is the interface satisfied by cluster.PeerManager.
+// It is abstracted here to avoid an import cycle.
+type PeerForwarder interface {
+	// Forward sends rawBuf zero-copy to all connected peers.
+	// addForwardedBit=true sets the MeshForwardedBit in the wire frame.
+	Forward(rawBuf []byte, addForwardedBit bool)
+	ActivePeers() int
+}
+
+// WithPeerForwarder plugs a cluster PeerManager into the Router for inter-node forwarding.
+func WithPeerForwarder(f PeerForwarder) RouterOption {
+	return func(r *Router) {
+		r.peerForwarder = f
+	}
+}
+
 // WildcardSub stores a wildcard pattern registration and subscriber index.
 type WildcardSub struct {
 	pattern []byte
@@ -110,12 +126,12 @@ type Router struct {
 	mu sync.RWMutex
 
 	// SoA flat arrays — parallel indices refer to the same subscriber.
-	streamIDs []uint32               // stream ID per subscriber slot
-	streams   []*quic.Stream         // QUIC stream pointer per slot
-	topics    []string               // topic name per slot
-	active    []bool                 // true if subscriber slot is live
-	queues    []chan *MessageRef     // per-subscriber non-blocking ring queue
-	cancels   []context.CancelFunc   // per-subscriber Writer goroutine cancel handle
+	streamIDs []uint32             // stream ID per subscriber slot
+	streams   []*quic.Stream       // QUIC stream pointer per slot
+	topics    []string             // topic name per slot
+	active    []bool               // true if subscriber slot is live
+	queues    []chan *MessageRef   // per-subscriber non-blocking ring queue
+	cancels   []context.CancelFunc // per-subscriber Writer goroutine cancel handle
 
 	// topicIndex maps FNV-1a hash of topic name to slice of indices in flat arrays.
 	topicIndex map[uint64][]int
@@ -131,6 +147,8 @@ type Router struct {
 
 	aalPath string
 	aalKey  []byte
+
+	peerForwarder PeerForwarder
 
 	metrics   RouterMetrics
 	queueSize int
@@ -368,8 +386,10 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 	r.mu.RLock()
 	indices := r.topicIndex[topicHash]
 	hasWildcards := len(r.wildcardSubs) > 0
+	hasPeers := r.peerForwarder != nil && r.peerForwarder.ActivePeers() > 0
 
-	if len(indices) == 0 && !hasWildcards {
+	// Early return only if no local subscribers AND no peers to forward to.
+	if len(indices) == 0 && !hasWildcards && !hasPeers {
 		r.mu.RUnlock()
 		return nil
 	}
@@ -384,10 +404,16 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 	msgRef.SetExpiresAt(expiresAt)
 	msgRef.SetOffset(msgOffset)
 
+	// 1. Forward to peer nodes zero-copy (before local dispatch).
+	//    Must happen before Release so buf is still live.
+	if hasPeers {
+		r.peerForwarder.Forward(*buf, true)
+	}
+
 	var inlineDC [4]int
 	disconnectIndices := inlineDC[:0]
 
-	// 1. Dispatch to exact topic match subscribers
+	// 2. Dispatch to exact topic match subscribers
 	for _, idx := range indices {
 		if idx < len(r.active) && r.active[idx] {
 			q := r.queues[idx]
@@ -395,7 +421,6 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 
 			select {
 			case q <- msgRef:
-				// Successfully enqueued
 			default:
 				topicName := r.topics[idx]
 				dc := r.handleOverflow(idx, topicName, q, msgRef)
@@ -406,7 +431,7 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 		}
 	}
 
-	// 2. Dispatch to matching wildcard subscribers (+ and #)
+	// 3. Dispatch to matching wildcard subscribers (+ and #)
 	if hasWildcards {
 		for _, wSub := range r.wildcardSubs {
 			idx := wSub.idx
@@ -439,6 +464,111 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 		}
 	}
 
+	return nil
+}
+
+// PublishFromPeer routes a frame received from a peer node to local subscribers only.
+// It NEVER re-forwards to peers, preventing mesh broadcast storms.
+func (r *Router) PublishFromPeer(ctx context.Context, frame protocol.Frame) error {
+	metrics.ClusterFramesReceived.Inc()
+	// Strip the MeshForwarded bit to get the real opcode; then publish locally.
+	frame.Command = protocol.OpcodeOf(frame.Command)
+	return r.publishLocal(ctx, frame)
+}
+
+// publishLocal is Publish without peer forwarding — used both by Publish (after
+// forwarding externally) and by PublishFromPeer.
+func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
+	if frame.PayloadLen > maxPayloadSize {
+		return errors.New("payload exceeds maximum frame size")
+	}
+
+	expiresAt, cleanPayload := parseTTL(frame.Payload)
+	topicHash := authz.CombineHashes("topic", cleanPayload)
+
+	r.mu.RLock()
+	counter, exists := r.topicOffsets[topicHash]
+	if !exists {
+		r.mu.RUnlock()
+		r.mu.Lock()
+		counter, exists = r.topicOffsets[topicHash]
+		if !exists {
+			counter = &atomic.Uint64{}
+			r.topicOffsets[topicHash] = counter
+		}
+		r.mu.Unlock()
+		r.mu.RLock()
+	}
+	r.mu.RUnlock()
+
+	msgOffset := counter.Add(1)
+
+	r.mu.RLock()
+	indices := r.topicIndex[topicHash]
+	hasWildcards := len(r.wildcardSubs) > 0
+
+	if len(indices) == 0 && !hasWildcards {
+		r.mu.RUnlock()
+		return nil
+	}
+
+	if r.metrics != nil {
+		r.metrics.OnPublish(string(cleanPayload))
+	}
+
+	buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+	msgRef := AcquireMessageRef(buf)
+	msgRef.SetExpiresAt(expiresAt)
+	msgRef.SetOffset(msgOffset)
+
+	var inlineDC [4]int
+	disconnectIndices := inlineDC[:0]
+
+	for _, idx := range indices {
+		if idx < len(r.active) && r.active[idx] {
+			q := r.queues[idx]
+			msgRef.Retain()
+			select {
+			case q <- msgRef:
+			default:
+				topicName := r.topics[idx]
+				dc := r.handleOverflow(idx, topicName, q, msgRef)
+				if dc >= 0 {
+					disconnectIndices = append(disconnectIndices, dc)
+				}
+			}
+		}
+	}
+
+	if hasWildcards {
+		for _, wSub := range r.wildcardSubs {
+			idx := wSub.idx
+			if idx < len(r.active) && r.active[idx] {
+				if MatchWildcard(wSub.pattern, cleanPayload) {
+					q := r.queues[idx]
+					msgRef.Retain()
+					select {
+					case q <- msgRef:
+					default:
+						topicName := r.topics[idx]
+						dc := r.handleOverflow(idx, topicName, q, msgRef)
+						if dc >= 0 {
+							disconnectIndices = append(disconnectIndices, dc)
+						}
+					}
+				}
+			}
+		}
+	}
+	r.mu.RUnlock()
+
+	msgRef.Release()
+
+	if len(disconnectIndices) > 0 {
+		for _, idx := range disconnectIndices {
+			r.disconnectSubscriber(idx)
+		}
+	}
 	return nil
 }
 
