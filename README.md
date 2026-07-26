@@ -2,11 +2,15 @@
 
 [ English | [Русский](README.ru.md) | [中文](README.zh.md) ]
 
+[![CI](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml/badge.svg)](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/kshishtovsky/aqueduct.svg)](https://pkg.go.dev/github.com/kshishtovsky/aqueduct)
+
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
 > [!IMPORTANT]
 > **Production Ready (v1.0.0)**
-> Aqueduct strictly requires **TLS 1.3** and provides built-in memory hardening against oversized payload DoS attacks, alongside disk-backed Append-Only Logging (AAL).
+> Aqueduct strictly requires **TLS 1.3** and provides built-in memory hardening against oversized payload DoS attacks, alongside disk-backed Append-Only Logging (AAL) and YAML/ENV configuration loading.
 
 ---
 
@@ -17,56 +21,90 @@ Aqueduct is an ultra-high performance, zero-allocation message broker built in G
 - **Structure of Arrays (SoA) Router**: In-memory direct mesh pub/sub routing using flat arrays for L1/L2 CPU cache locality.
 - **Append-Only Logging (AAL)**: Synchronous zero-allocation disk logging (`0 allocs/op`) directly from network buffers into OS page cache.
 - **Memory Hardening**: Strict stream-level OOM protection enforcing `maxBufSize` limits.
-- **Prometheus Metrics**: Built-in HTTP server (`:9090`) serving `/metrics` and `/healthz` endpoints.
+- **Flexible Configuration**: YAML configuration file support with `AQUEDUCT_*` environment variable overrides.
+- **Prometheus & Grafana**: Built-in HTTP server (`:9090`) serving `/metrics` and `/healthz` endpoints, with ready-to-run Docker Compose stack.
 
 ---
 
-## Quick Start
+## 2-Minute Quick Start (Docker Compose)
 
-### Prerequisites
-
-- **Go**: 1.22+ installed
-- **OS**: Linux / macOS
-
-### Running the Broker
-
-Build and run the broker using standard flags:
+Launch Aqueduct broker, Prometheus, and Grafana in seconds:
 
 ```bash
-# Run in development mode (ephemeral self-signed TLS cert)
-go run ./cmd/broker/main.go -addr :4242
+docker compose up -d
+```
 
-# Run in production mode with TLS certificates and Append-Only Logging
+Verify status and metrics:
+- **Broker Health**: `http://localhost:9090/healthz`
+- **Prometheus Metrics**: `http://localhost:9091`
+- **Grafana Dashboard**: `http://localhost:3000` (User: `admin` / Password: `admin`)
+
+Stop the stack:
+```bash
+docker compose down
+```
+
+---
+
+## Local Installation & Usage
+
+### Running via Binary or Go
+
+```bash
+# Run using YAML config
+go run ./cmd/broker/main.go -config config.yaml
+
+# Run using CLI flags override
 go run ./cmd/broker/main.go \
-  -cert /path/to/cert.pem \
-  -key /path/to/key.pem \
-  -aal /path/to/aqueduct.log \
+  -config config.yaml \
   -addr :4242 \
   -metrics-addr :9090
 ```
 
-### CLI Flags
+### Configuration (`config.yaml`)
 
-| Flag | Default | Description |
+```yaml
+listen_addr: ":4242"
+metrics_addr: ":9090"
+
+tls:
+  generate: true
+  cert_file: ""
+  key_file: ""
+
+aal:
+  enabled: false
+  file_path: ""
+
+transport:
+  max_buf_size: 65536
+  read_buf_size: 1024
+```
+
+### Environment Variable Overrides
+
+All values in `config.yaml` can be overridden via environment variables:
+
+| Environment Variable | Overrides | Example |
 | :--- | :--- | :--- |
-| `-addr` | `:4242` | UDP address for QUIC broker listener |
-| `-metrics-addr` | `:9090` | HTTP address for Prometheus metrics and health check |
-| `-cert` | `""` | Path to TLS 1.3 certificate file |
-| `-key` | `""` | Path to TLS 1.3 private key file |
-| `-aal` | `""` | Optional path to Append-Only Log file |
-
-> [!WARNING]
-> If `-cert` and `-key` flags are omitted, Aqueduct generates an ephemeral self-signed TLS certificate for development and logs a warning. Do not use ephemeral certificates in production.
+| `AQUEDUCT_LISTEN_ADDR` | `listen_addr` | `:4242` |
+| `AQUEDUCT_METRICS_ADDR` | `metrics_addr` | `:9090` |
+| `AQUEDUCT_TLS_GENERATE` | `tls.generate` | `false` |
+| `AQUEDUCT_TLS_CERT_FILE` | `tls.cert_file` | `/etc/certs/cert.pem` |
+| `AQUEDUCT_TLS_KEY_FILE` | `tls.key_file` | `/etc/certs/key.pem` |
+| `AQUEDUCT_AAL_ENABLED` | `aal.enabled` | `true` |
+| `AQUEDUCT_AAL_FILE_PATH` | `aal.file_path` | `/var/log/aal.log` |
+| `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
 
 ---
 
-## Architecture & Design Highlights
+## Client Code Examples
 
-Aqueduct is designed around hardware-conscious engineering principles:
+Minimal client examples demonstrating binary frame assembly over QUIC:
 
-1. **Zero-Allocation Hot Path**: Network reads use pooled buffers (`sync.Pool`). Binary frames are parsed directly from buffers without intermediate allocations.
-2. **Cache-Friendly Mesh Routing**: Subscribers are stored in parallel flat slices (`streamIDs`, `streams`, `topics`, `active`), maximizing L1/L2 cache hit rate during batch message distribution.
-3. **Synchronous AAL Write**: Published messages are appended to disk using direct kernel syscalls (`os.File.Write`) from network slices before buffer recycling, ensuring `0 allocs/op`.
+- [Go Client Example](examples/go/main.go) — Native `quic-go` implementation.
+- [Python Client Example](examples/python/client.py) — `aioquic` asynchronous client.
+- [Node.js Buffer Example](examples/nodejs/client.js) — Binary frame packing example.
 
 ---
 

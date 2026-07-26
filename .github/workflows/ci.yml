@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.57.2
+
+      - name: Run Tests with Race Detector and Coverage
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Verify Coverage Threshold (>= 75%)
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total: | awk '{print $3}' | sed 's/%//')
+          echo "Total Statement Coverage: ${COVERAGE}%"
+          if [ $(echo "$COVERAGE < 75.0" | bc -l) -eq 1 ]; then
+            echo "Coverage (${COVERAGE}%) is below 75% threshold!"
+            exit 1
+          fi
+
+      - name: Build Docker Image Check
+        run: |
+          docker build -t aqueduct:ci .
