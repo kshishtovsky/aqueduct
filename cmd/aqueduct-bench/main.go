@@ -86,7 +86,7 @@ func main() {
 				failedReqs.Add(int64(numReqs))
 				return
 			}
-			defer conn.CloseWithError(0, "bench worker done")
+			defer func() { _ = conn.CloseWithError(0, "bench worker done") }()
 
 			stream, err := conn.OpenStreamSync(context.Background())
 			if err != nil {
@@ -100,7 +100,7 @@ func main() {
 
 			for i := 0; i < numReqs; i++ {
 				reqStart := time.Now()
-				stream.SetWriteDeadline(time.Now().Add(*timeout))
+				_ = stream.SetWriteDeadline(time.Now().Add(*timeout))
 
 				buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i+1), payload)
 				_, err := stream.Write(*buf)
