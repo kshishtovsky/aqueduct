@@ -1,9 +1,9 @@
-// Package main implements aqueduct-bench, a high-throughput QUIC load-testing tool for Aqueduct.
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -25,10 +25,11 @@ func main() {
 	payloadSize := flag.Int("size", 128, "Message payload size in bytes")
 	topic := flag.String("topic", "bench", "Topic name for publish benchmark")
 	timeout := flag.Duration("timeout", 5*time.Second, "Request deadline per message")
+	batchSize := flag.Int("batch", 1, "Batch size (1 = single frames)")
 	flag.Parse()
 
-	if *concurrency <= 0 || *totalReqs <= 0 || *payloadSize <= 0 {
-		log.Fatal("Invalid parameters: -c, -n, and -size must be > 0")
+	if *concurrency <= 0 || *totalReqs <= 0 || *payloadSize <= 0 || *batchSize <= 0 {
+		log.Fatal("Invalid parameters: -c, -n, -size, and -batch must be > 0")
 	}
 
 	fmt.Println("=========================================================")
@@ -38,11 +39,12 @@ func main() {
 	fmt.Printf(" Concurrency        : %d workers\n", *concurrency)
 	fmt.Printf(" Total Requests     : %d messages\n", *totalReqs)
 	fmt.Printf(" Payload Size       : %d bytes\n", *payloadSize)
+	fmt.Printf(" Batch Size         : %d\n", *batchSize)
 	fmt.Printf(" Topic              : %s\n", *topic)
 	fmt.Println("---------------------------------------------------------")
 
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // Self-signed cert for dev benchmarking
+		InsecureSkipVerify: true,
 		NextProtos:         []string{"aqueduct-v1"},
 		MinVersion:         tls.VersionTLS13,
 	}
@@ -98,22 +100,73 @@ func main() {
 
 			workerLatencies := make([]time.Duration, 0, numReqs)
 
-			for i := 0; i < numReqs; i++ {
-				reqStart := time.Now()
-				_ = stream.SetWriteDeadline(time.Now().Add(*timeout))
+			if *batchSize <= 1 {
+				for i := 0; i < numReqs; i++ {
+					reqStart := time.Now()
+					_ = stream.SetWriteDeadline(time.Now().Add(*timeout))
 
-				buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i+1), payload)
-				_, err := stream.Write(*buf)
-				protocol.ReleaseBuffer(buf)
+					buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i+1), payload)
+					_, err := stream.Write(*buf)
+					protocol.ReleaseBuffer(buf)
 
-				if err != nil {
-					failedReqs.Add(1)
-					continue
+					if err != nil {
+						failedReqs.Add(1)
+						continue
+					}
+
+					duration := time.Since(reqStart)
+					workerLatencies = append(workerLatencies, duration)
+					completedReqs.Add(1)
+				}
+			} else {
+				frameTotalSize := protocol.HeaderSize + *payloadSize
+				maxBatchPayloadSize := *batchSize * frameTotalSize
+				batchPayloadBuf := make([]byte, 0, maxBatchPayloadSize)
+				msgTimestamps := make([]time.Time, *batchSize)
+				msgCount := 0
+
+				flush := func() {
+					_ = stream.SetWriteDeadline(time.Now().Add(*timeout))
+
+					buf := protocol.SerializeFrame(protocol.CmdPublishBatch, 0, batchPayloadBuf)
+					_, err := stream.Write(*buf)
+					protocol.ReleaseBuffer(buf)
+
+					if err != nil {
+						failedReqs.Add(int64(msgCount))
+					} else {
+						now := time.Now()
+						for j := 0; j < msgCount; j++ {
+							workerLatencies = append(workerLatencies, now.Sub(msgTimestamps[j]))
+						}
+						completedReqs.Add(int64(msgCount))
+					}
+
+					batchPayloadBuf = batchPayloadBuf[:0]
+					msgCount = 0
 				}
 
-				duration := time.Since(reqStart)
-				workerLatencies = append(workerLatencies, duration)
-				completedReqs.Add(1)
+				for i := 0; i < numReqs; i++ {
+					reqStart := time.Now()
+					msgTimestamps[msgCount] = reqStart
+
+					offset := len(batchPayloadBuf)
+					batchPayloadBuf = batchPayloadBuf[:offset+frameTotalSize]
+					batchPayloadBuf[offset] = protocol.MagicByte
+					batchPayloadBuf[offset+1] = byte(protocol.CmdPublish)
+					binary.LittleEndian.PutUint32(batchPayloadBuf[offset+2:offset+6], uint32(i+1))
+					binary.LittleEndian.PutUint32(batchPayloadBuf[offset+6:offset+10], uint32(*payloadSize))
+					copy(batchPayloadBuf[offset+10:], payload)
+					msgCount++
+
+					if msgCount == *batchSize {
+						flush()
+					}
+				}
+
+				if msgCount > 0 {
+					flush()
+				}
 			}
 
 			mu.Lock()
@@ -125,10 +178,10 @@ func main() {
 	wg.Wait()
 	totalTime := time.Since(startTime)
 
-	printReport(completedReqs.Load(), failedReqs.Load(), totalTime, *payloadSize, allLatencies)
+	printReport(completedReqs.Load(), failedReqs.Load(), totalTime, *payloadSize, *batchSize, allLatencies)
 }
 
-func printReport(completed, failed int64, totalTime time.Duration, payloadSize int, latencies []time.Duration) {
+func printReport(completed, failed int64, totalTime time.Duration, payloadSize, batchSize int, latencies []time.Duration) {
 	fmt.Println(" Benchmark Results")
 	fmt.Println("---------------------------------------------------------")
 	fmt.Printf(" Total Time Taken   : %v\n", totalTime)
@@ -143,7 +196,8 @@ func printReport(completed, failed int64, totalTime time.Duration, payloadSize i
 	rps := float64(completed) / totalTime.Seconds()
 	mbPerSec := (float64(completed*int64(protocol.HeaderSize+payloadSize)) / (1024 * 1024)) / totalTime.Seconds()
 
-	fmt.Printf(" Requests / Sec     : %.2f req/s\n", rps)
+	fmt.Printf(" Batch Size         : %d\n", batchSize)
+	fmt.Printf(" Messages / Sec     : %.2f msg/s\n", rps)
 	fmt.Printf(" Throughput         : %.2f MB/s\n", mbPerSec)
 
 	sort.Slice(latencies, func(i, j int) bool {
