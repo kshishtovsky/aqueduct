@@ -22,10 +22,12 @@ import (
 	"github.com/kshishtovsky/aqueduct/internal/aal"
 	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/broker"
+	"github.com/kshishtovsky/aqueduct/internal/cluster"
 	"github.com/kshishtovsky/aqueduct/internal/config"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/kshishtovsky/aqueduct/internal/transport"
+	"github.com/quic-go/quic-go"
 )
 
 func main() {
@@ -128,12 +130,26 @@ func main() {
 
 	routerMetrics := &prometheusMetrics{}
 	policy := broker.ParseBackpressurePolicy(cfg.Broker.BackpressurePolicy)
-	router := broker.NewRouter(
-		routerMetrics,
+	routerOpts := []broker.RouterOption{
 		broker.WithQueueSize(cfg.Broker.QueueSize),
 		broker.WithBackpressurePolicy(policy),
 		broker.WithAALPath(cfg.AAL.FilePath, aalKey),
-	)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize cluster peer federation if peers are configured.
+	var pm *cluster.PeerManager
+	if len(cfg.Cluster.Peers) > 0 {
+		peerTLS := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"aqueduct-mesh"}}
+		peerQUIC := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+		pm = cluster.New(ctx, cfg.Cluster.Peers, peerTLS, peerQUIC)
+		routerOpts = append(routerOpts, broker.WithPeerForwarder(pm))
+		logger.Info("cluster federation enabled", "peers", cfg.Cluster.Peers)
+	}
+
+	router := broker.NewRouter(routerMetrics, routerOpts...)
 	logger.Info("router initialized", "queue_size", cfg.Broker.QueueSize, "backpressure_policy", policy.String())
 
 	opts := []transport.Option{
@@ -166,30 +182,30 @@ func main() {
 	}
 
 	if cfg.AAL.Enabled && cfg.AAL.FilePath != "" {
-		var aalKey []byte
+		var aalKey2 []byte
 		if cfg.AAL.Key != "" {
 			keyBytes, err := base64.StdEncoding.DecodeString(cfg.AAL.Key)
 			if err == nil && len(keyBytes) == 32 {
-				aalKey = keyBytes
+				aalKey2 = keyBytes
 			} else if len(cfg.AAL.Key) == 32 {
-				aalKey = []byte(cfg.AAL.Key)
+				aalKey2 = []byte(cfg.AAL.Key)
 			} else {
 				logger.Error("AAL encryption key must be 32 bytes (base64 encoded or raw)")
 				os.Exit(1)
 			}
 		}
 
-		aalLog, err := aal.OpenEncrypted(cfg.AAL.FilePath, aalKey)
+		aalLog, err := aal.OpenEncrypted(cfg.AAL.FilePath, aalKey2)
 		if err != nil {
 			logger.Error("failed to open AAL file", "path", cfg.AAL.FilePath, "err", err)
 			os.Exit(1)
 		}
-		if len(aalKey) > 0 {
+		if len(aalKey2) > 0 {
 			logger.Info("encrypted append-only logging enabled (AES-256-GCM)", "path", cfg.AAL.FilePath)
 		} else {
 			logger.Info("append-only logging enabled", "path", cfg.AAL.FilePath)
 		}
-		opts = append(opts, transport.WithAAL(aalLog), transport.WithAALReplay(cfg.AAL.FilePath, aalKey))
+		opts = append(opts, transport.WithAAL(aalLog), transport.WithAALReplay(cfg.AAL.FilePath, aalKey2))
 	}
 
 	b := transport.New(opts...)
@@ -203,9 +219,6 @@ func main() {
 		logger.Info("subscribe received", "stream_id", frame.StreamID, "payload_len", frame.PayloadLen)
 		return nil, nil
 	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	if err := b.Listen(ctx, cfg.ListenAddr, tlsConf); err != nil {
 		logger.Error("failed to start listener", "err", err)
@@ -228,6 +241,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	if pm != nil {
+		pm.Close()
+	}
+
 	logger.Info("broker stopped cleanly")
 }
 
@@ -244,7 +261,6 @@ func (m *prometheusMetrics) OnDeliver(topic string) {
 func (m *prometheusMetrics) SetActiveSubscribers(n float64) {
 	metrics.ActiveSubscribers.Set(n)
 }
-
 
 func generateSelfSignedTLS() (*tls.Config, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
