@@ -14,8 +14,16 @@ const (
 	HeaderSize = 10
 	// MeshForwardedBit is set in the Command byte (bit 7) to mark frames that have
 	// already been forwarded by a peer node. Receivers must NOT re-forward such frames,
-	// preventing mesh broadcast storms. The lower 7 bits remain the command opcode.
+	// preventing mesh broadcast storms. The lower 6 bits remain the command opcode.
 	MeshForwardedBit Command = 0x80
+	// HasExtensionsBit is set in the Command byte (bit 6) to mark frames that
+	// carry a TLV extension block between the header and the payload.
+	// When set, the wire format becomes:
+	//   [Magic:1][Cmd:1][StreamID:4][DataLen:4][ExtTotalLen:2][TLV...][Payload: ...]
+	// where DataLen covers everything from offset 10 (ExtTotalLen) to the end of the frame.
+	// Old parsers that mask only MeshForwardedBit (0x80) will skip the frame as
+	// unknown opcode but correctly advance past DataLen bytes, preserving wire alignment.
+	HasExtensionsBit Command = 0x40
 )
 
 const (
@@ -51,10 +59,26 @@ type Frame struct {
 	StreamID   uint32
 	PayloadLen uint32
 	Payload    []byte
+	Extensions []byte // raw TLV block (2-byte ExtTotalLen + entries), nil if none
+}
+
+// DataLen returns the total byte count from offset 10 (after header) to the
+// end of the frame: ExtBlockSize + PayloadLen. This covers the entire wire
+// data segment for both old (no extensions) and new frames.
+func (f Frame) DataLen() uint32 {
+	if len(f.Extensions) > 0 {
+		return uint32(len(f.Extensions)) + f.PayloadLen
+	}
+	return f.PayloadLen
 }
 
 func (f Frame) Size() int {
-	return HeaderSize + int(f.PayloadLen)
+	return HeaderSize + int(f.DataLen())
+}
+
+// HasExtensions reports whether the frame carries a TLV extension block.
+func (f Frame) HasExtensions() bool {
+	return len(f.Extensions) > 0
 }
 
 func ParseFrame(buf []byte) (Frame, error) {
@@ -66,43 +90,70 @@ func ParseFrame(buf []byte) (Frame, error) {
 		return Frame{}, errors.New("invalid magic byte")
 	}
 
-	// Mask off the MeshForwarded bit before opcode validation; preserve it in the Frame.
+	// Preserve the raw command byte; strip both control bits for opcode validation.
 	rawCmd := Command(buf[1])
-	cmd := rawCmd & ^MeshForwardedBit
+	cmd := rawCmd & (^MeshForwardedBit) & (^HasExtensionsBit)
 	if cmd < CmdPublish || cmd > CmdNack {
 		return Frame{}, errors.New("unknown command")
 	}
 
 	streamID := binary.LittleEndian.Uint32(buf[2:6])
-	payloadLen := binary.LittleEndian.Uint32(buf[6:10])
+	dataLen := binary.LittleEndian.Uint32(buf[6:10])
 
-	totalLen := HeaderSize + int(payloadLen)
+	totalLen := HeaderSize + int(dataLen)
 	if len(buf) < totalLen {
-		return Frame{}, errors.New("frame truncated: payload exceeds buffer length")
+		return Frame{}, errors.New("frame truncated: data exceeds buffer length")
+	}
+
+	// Parse extension block if present
+	var extBlock []byte
+	var payloadStart int
+	var payloadLen uint32
+
+	if rawCmd&HasExtensionsBit != 0 {
+		if int(dataLen) < ExtHeaderLen {
+			return Frame{}, errors.New("frame too short for extension header")
+		}
+		extTotal := ExtTotalLen(buf, HeaderSize)
+		if extTotal > MaxExtTotalLen {
+			return Frame{}, errors.New("extension block exceeds max size")
+		}
+		extBlockEnd := HeaderSize + ExtBlockSize(extTotal)
+		if extBlockEnd > HeaderSize+int(dataLen) {
+			return Frame{}, errors.New("extensions exceed declared data length")
+		}
+		// SAFE: bounds verified above.
+		extBlock = unsafe.Slice(&buf[HeaderSize], ExtBlockSize(extTotal))
+		payloadStart = extBlockEnd
+		payloadLen = dataLen - uint32(ExtBlockSize(extTotal))
+	} else {
+		payloadStart = HeaderSize
+		payloadLen = dataLen
 	}
 
 	// Zero-length payloads: return nil slice without calling unsafe.Slice,
-	// which would require buf[HeaderSize] to be a valid address even when
-	// the buffer length equals HeaderSize exactly.
+	// which would require buf[payloadStart] to be a valid address even when
+	// payloadStart equals the buffer length exactly.
 	if payloadLen == 0 {
 		return Frame{
-			Command:    cmd,
+			Command:    rawCmd, // preserve control bits for callers
 			StreamID:   streamID,
 			PayloadLen: 0,
 			Payload:    nil,
+			Extensions: extBlock,
 		}, nil
 	}
 
-	// SAFE: We verified len(buf) >= HeaderSize + int(payloadLen) above.
-	// payloadLen > 0, so &buf[HeaderSize] is within bounds, and the slice
-	// length payloadLen is bounded by the remaining buffer bytes.
-	payload := unsafe.Slice(&buf[HeaderSize], payloadLen)
+	// SAFE: We verified len(buf) >= headerSize + int(dataLen) above,
+	// and payloadStart + payloadLen <= headerSize + dataLen.
+	payload := unsafe.Slice(&buf[payloadStart], payloadLen)
 
 	return Frame{
-		Command:    rawCmd, // preserve MeshForwarded bit for callers
+		Command:    rawCmd, // preserve control bits for callers
 		StreamID:   streamID,
 		PayloadLen: payloadLen,
 		Payload:    payload,
+		Extensions: extBlock,
 	}, nil
 }
 
@@ -116,9 +167,10 @@ func SetForwarded(cmd Command) Command {
 	return cmd | MeshForwardedBit
 }
 
-// OpcodeOf strips the MeshForwarded bit and returns the bare opcode.
+// OpcodeOf strips both control bits (MeshForwarded and HasExtensions) and returns
+// the bare opcode.
 func OpcodeOf(cmd Command) Command {
-	return cmd & ^MeshForwardedBit
+	return cmd & ^MeshForwardedBit & ^HasExtensionsBit
 }
 
 var (
@@ -190,6 +242,43 @@ func SerializeFrame(cmd Command, streamID uint32, payload []byte) *[]byte {
 	return serializeFrameSlab(cmd, streamID, payload)
 }
 
+func serializeFrameWithExtensionsSlab(cmd Command, streamID uint32, extensions []byte, payload []byte) *[]byte {
+	payloadLen := uint32(len(payload))
+	extLen := len(extensions)
+	totalSize := HeaderSize + extLen + int(payloadLen)
+
+	b, err := globalSlab.Acquire(totalSize)
+	if err != nil {
+		b = make([]byte, totalSize)
+	} else {
+		b = b[:totalSize]
+	}
+
+	dataLen := uint32(extLen) + payloadLen
+	b[0] = MagicByte
+	b[1] = uint8(cmd | HasExtensionsBit)
+	binary.LittleEndian.PutUint32(b[2:6], streamID)
+	binary.LittleEndian.PutUint32(b[6:10], dataLen)
+	if extLen > 0 {
+		copy(b[HeaderSize:], extensions)
+	}
+	if payloadLen > 0 {
+		copy(b[HeaderSize+extLen:], payload)
+	}
+
+	bp := bufPtrPool.Get().(*[]byte)
+	*bp = b
+	return bp
+}
+
+// SerializeFrameWithExtensions serializes a frame with a TLV extension block.
+// Sets the HasExtensionsBit in the command byte and writes the extension
+// block between the header and the payload. The extensions parameter should
+// include the 2-byte ExtTotalLen prefix (see BuildExtensions).
+func SerializeFrameWithExtensions(cmd Command, streamID uint32, extensions []byte, payload []byte) *[]byte {
+	return serializeFrameWithExtensionsSlab(cmd, streamID, extensions, payload)
+}
+
 func ReleaseBuffer(bp *[]byte) {
 	if bp == nil {
 		return
@@ -221,7 +310,7 @@ func FrameSize(payloadLen uint32) int {
 }
 
 // ParseBatchFrame extracts the next complete frame slice from buf starting at offset.
-// It returns the frame slice (pointing into the original buf), the next offset, and any error.
+// The returned frame slice includes the header, any extension block, and the payload.
 // SAFE: All bounds checks are performed before returning the sub-slice.
 func ParseBatchFrame(buf []byte, offset int) (frame []byte, nextOffset int, err error) {
 	remaining := buf[offset:]
@@ -236,10 +325,10 @@ func ParseBatchFrame(buf []byte, offset int) (frame []byte, nextOffset int, err 
 	if opcode < CmdPublish || opcode > CmdNack {
 		return nil, offset, errors.New("unknown command in batch frame")
 	}
-	payloadLen := binary.LittleEndian.Uint32(remaining[6:10])
-	totalLen := HeaderSize + int(payloadLen)
+	dataLen := binary.LittleEndian.Uint32(remaining[6:10])
+	totalLen := HeaderSize + int(dataLen)
 	if len(remaining) < totalLen {
-		return nil, offset, errors.New("batch frame truncated: payload exceeds remaining buffer")
+		return nil, offset, errors.New("batch frame truncated: data exceeds remaining buffer")
 	}
 	return buf[offset : offset+totalLen], offset + totalLen, nil
 }
