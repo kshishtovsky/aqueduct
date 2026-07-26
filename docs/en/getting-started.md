@@ -1,118 +1,80 @@
-# Tutorial: Getting Started with Aqueduct
+# Tutorial: Getting Started with Aqueduct (v1.3.0)
 
-This tutorial guides you through setting up and running your first Aqueduct QUIC message broker instance, subscribing to a topic, and publishing binary messages.
+This tutorial guides you through installing, configuring, running, and interacting with the Aqueduct message broker.
+
+---
 
 ## Prerequisites
 
-Before starting, ensure you have:
-- **Go 1.22+** installed on your system
-- A terminal environment (Linux or macOS recommended)
+- **Go 1.22+**
+- **Docker & Docker Compose** (optional)
 
-## Step 1: Clone and Build the Broker
+---
 
-Clone the repository and compile the broker binary:
+## 1. Quick Start with Docker Compose
 
-```bash
-git clone https://github.com/kshishtovsky/aqueduct.git
-cd aqueduct
-go build -o bin/broker ./cmd/broker
-```
-
-## Step 2: Start the Broker in Development Mode
-
-Run the compiled broker binary:
+Run Aqueduct broker along with Prometheus and Grafana:
 
 ```bash
-./bin/broker -addr :4242 -metrics-addr :9090
+docker compose up -d
 ```
 
-You should see output similar to:
+- **Broker Health**: `http://localhost:9090/healthz`
+- **Prometheus UI**: `http://localhost:9091`
+- **Grafana Dashboard**: `http://localhost:3000` (User: `admin`, Password: `admin`)
 
-```text
-2026/07/26 04:42:00 WARN Using ephemeral self-signed certificate. Do not use in production.
-2026/07/26 04:42:00 INFO metrics server started addr=:9090
-2026/07/26 04:42:00 INFO broker listening addr=127.0.0.1:4242
-2026/07/26 04:42:00 INFO broker started addr=127.0.0.1:4242
+---
+
+## 2. Configuration (`config.yaml`)
+
+Create or modify `config.yaml`:
+
+```yaml
+listen_addr: ":4242"
+metrics_addr: ":9090"
+
+tls:
+  generate: true
+  cert_file: ""
+  key_file: ""
+  require_client_cert: false
+  client_ca_file: ""
+
+aal:
+  enabled: true
+  file_path: "/var/log/aqueduct/aal.log"
+  key: "dGhpcyBpcyBhIDMyIGJ5dGUgYWVzLTI1NiBrZXkh" # Base64 32-byte key
+  max_aal_size: 104857600
+
+acl:
+  enabled: true
+  default: "none"
+  rules:
+    - client: "sensor-service"
+      topic: "sensor/#"
+      permission: "publish"
+    - client: "analytics-service"
+      topic: "sensor/+/temp"
+      permission: "subscribe"
+
+broker:
+  queue_size: 1024
+  backpressure_policy: "drop_oldest" # "drop_oldest", "drop_newest", or "disconnect"
+
+transport:
+  max_buf_size: 65536
+  read_buf_size: 1024
 ```
 
-## Step 3: Verify Health Endpoint
+---
 
-Open a second terminal window and test the health check endpoint:
+## 3. Using Message TTL & Wildcards
 
-```bash
-curl http://localhost:9090/healthz
-# Output: OK
-```
+### Wildcard Subscription Examples
+- `sensor/+/temp`: Matches `sensor/room1/temp` and `sensor/room2/temp`.
+- `sensor/#`: Matches all subtopics under `sensor/`.
 
-## Step 4: Publish and Subscribe via Go Client Code
-
-Create a small Go program (`example_client.go`) to connect to Aqueduct over QUIC and send pub/sub frames:
-
-```go
-package main
-
-import (
-	"context"
-	"crypto/tls"
-	"fmt"
-	"log"
-
-	"github.com/kshishtovsky/aqueduct/internal/protocol"
-	"github.com/quic-go/quic-go"
-)
-
-func main() {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // For self-signed dev certificate
-		NextProtos:         []string{"aqueduct-v1"},
-		MinVersion:         tls.VersionTLS13,
-	}
-
-	conn, err := quic.DialAddr(context.Background(), "127.0.0.1:4242", tlsConf, nil)
-	if err != nil {
-		log.Fatalf("failed to connect: %v", err)
-	}
-
-	// 1. Open Stream and Subscribe
-	subStream, err := conn.OpenStreamSync(context.Background())
-	if err != nil {
-		log.Fatalf("failed to open stream: %v", err)
-	}
-
-	subPayload := []byte("topic:orders")
-	subBuf := protocol.SerializeFrame(protocol.CmdSubscribe, 1, subPayload)
-	_, _ = subStream.Write(*subBuf)
-	protocol.ReleaseBuffer(subBuf)
-
-	fmt.Println("Subscribed to topic 'orders'. Waiting for messages...")
-
-	// 2. Open Stream and Publish Message
-	pubStream, err := conn.OpenStreamSync(context.Background())
-	if err != nil {
-		log.Fatalf("failed to open pub stream: %v", err)
-	}
-
-	pubPayload := []byte("orders")
-	pubBuf := protocol.SerializeFrame(protocol.CmdPublish, 2, pubPayload)
-	_, _ = pubStream.Write(*pubBuf)
-	protocol.ReleaseBuffer(pubBuf)
-
-	// 3. Read Message on Subscriber Stream
-	readBuf := make([]byte, 1024)
-	n, err := subStream.Read(readBuf)
-	if err != nil {
-		log.Fatalf("failed to read delivered message: %v", err)
-	}
-
-	frame, err := protocol.ParseFrame(readBuf[:n])
-	if err != nil {
-		log.Fatalf("failed to parse delivered frame: %v", err)
-	}
-
-	fmt.Printf("Received delivered message on topic '%s'\n", string(frame.Payload))
-}
-```
-
-## Next Steps
-
-Now that you have run your first broker and communicated over QUIC, proceed to the [Production Deployment Guide](production-deployment.md) to configure TLS certificates, Append-Only Logging, and Prometheus metrics.
+### Message TTL Payload Format
+To publish a message with a 500ms expiration time:
+- Set payload to: `"ttl:500:sensor/room1/temp"`
+- If the subscriber queue is delayed past 500ms, the message is automatically dropped before network transmission.

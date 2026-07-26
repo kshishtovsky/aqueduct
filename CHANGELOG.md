@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-26
+
+### Added
+- **AAL Replay Startup Restoration**: Replays encrypted AAL log records into the router before opening the QUIC UDP socket listener, ensuring zero state loss on broker restarts.
+- **Zero-Allocation MQTT Wildcards**: Implemented segment-based wildcard topic matching (`+` single-level, `#` multi-level) operating directly on byte slices (`50.41 ns/op`, `0 allocs/op`).
+- **Message TTL & Expiration**: Lazy message expiry in subscriber Writer queues (`ttl:<ms>:<payload>` payload format) with `aqueduct_messages_expired_total` Prometheus counter.
+- **AAL Log Rotation**: Automatic rotation when file size exceeds `max_aal_size`, filtering out expired records into a new log file.
+- **Observability Metrics**: Added `aqueduct_aal_replay_duration_seconds`, `aqueduct_messages_expired_total`, and `aqueduct_aal_rotations_total` metrics.
+
+## [1.2.0] - 2026-07-26
+
+### Added
+- **Async Fan-Out & Ring Queues**: Dedicated non-blocking bounded channels per subscriber with dedicated Writer goroutines writing to QUIC streams.
+- **Slow Consumer Isolation (Backpressure Policies)**: Configurable overflow handling (`drop_oldest`, `drop_newest`, `disconnect`) preventing Head-of-Line blocking.
+- **Atomic Reference Counting (`MessageRef`)**: Thread-safe atomic reference counting (`ref.Add(-1) == 0`) ensuring buffers recycled into `sync.Pool` are never reused prematurely.
+- **Backpressure Observability**: Added `aqueduct_messages_dropped_total` and `aqueduct_slow_consumers_disconnected_total` metrics.
+
+## [1.1.1] - 2026-07-26
+
+### Security
+- **ACL Key Collision Fix**: Replaced XOR key combination with non-commutative sequential FNV-1a composite hashing (`CombineHashes`, `CombineHashStrings`) with delimiter bytes (`0 allocs/op`, `< 5 ns/op`).
+- **AES-GCM Nonce Safety**: Added 4-byte random session prefix (`crypto/rand`) to 12-byte Nonce composition to prevent IV reuse across broker restarts.
+- **mTLS Client CA Verification**: Added `client_ca_file` configuration and `AQUEDUCT_TLS_CLIENT_CA_FILE` env override for custom Client CA certificate pools.
+- **Unaligned Pointer Parsing Fix**: Replaced direct pointer casting with `binary.LittleEndian` to prevent `SIGBUS` alignment faults on ARM/RISC-V architectures.
+
+## [1.1.0] - 2026-07-26
+
+### Added
+- **Transport Authentication (mTLS)**: Mutual TLS support (`require_client_cert: true`) extracting Client Common Name (CN) from TLS 1.3 peer certificates.
+- **Encrypted Append-Only Log (AAL)**: AES-256-GCM log encryption for disk persistence with zero heap allocations on hot path.
+- **Zero-Allocation ACL Engine**: Structure of Arrays bitmask authorization matrix for fast client-topic permission validation.
+
 ## [1.0.0] - 2026-07-26
 
 ### Added
