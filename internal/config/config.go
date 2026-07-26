@@ -20,6 +20,14 @@ type Config struct {
 	Broker      BrokerConfig    `yaml:"broker"`
 	Transport   TransportConfig `yaml:"transport"`
 	Cluster     ClusterConfig   `yaml:"cluster"`
+	Tracing     TracingConfig   `yaml:"tracing"`
+}
+
+// TracingConfig defines OpenTelemetry tracing settings.
+type TracingConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	ServiceName string `yaml:"service_name"`
+	Endpoint    string `yaml:"endpoint"`
 }
 
 // ClusterConfig holds peer addresses for Direct Mesh Federation.
@@ -126,6 +134,11 @@ func Default() *Config {
 		Transport: TransportConfig{
 			MaxBufSize:  64 * 1024,
 			ReadBufSize: 1024,
+		},
+		Tracing: TracingConfig{
+			Enabled:     false,
+			ServiceName: "aqueduct-broker",
+			Endpoint:    "localhost:4317",
 		},
 	}
 }
@@ -235,6 +248,15 @@ func applyEnvOverrides(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Transport.ReadBufSize = n
 		}
+	}
+	if v := os.Getenv("AQUEDUCT_TRACING_ENABLED"); v != "" {
+		cfg.Tracing.Enabled = parseBool(v, cfg.Tracing.Enabled)
+	}
+	if v := os.Getenv("AQUEDUCT_TRACING_SERVICE_NAME"); v != "" {
+		cfg.Tracing.ServiceName = v
+	}
+	if v := os.Getenv("AQUEDUCT_TRACING_ENDPOINT"); v != "" {
+		cfg.Tracing.Endpoint = v
 	}
 }
 

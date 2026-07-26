@@ -46,6 +46,12 @@ broker:
     default_publish_rate: 0    # default publish rate limit (msg/s), 0 = unlimited
     default_burst_size: 1000   # default burst size
 
+# OpenTelemetry Distributed Tracing (experimental, v1.8.0)
+tracing:
+  enabled: false          # Set to true to enable OTLP export
+  service_name: "aqueduct-broker" # Service name for trace identification
+  endpoint: "localhost:4317"      # OTLP gRPC endpoint
+
 # Transport & Memory Hardening Limits
 transport:
   max_buf_size: 65536     # 64 KB maximum buffer limit per stream
