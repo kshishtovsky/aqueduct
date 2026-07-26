@@ -134,6 +134,8 @@ func main() {
 		broker.WithQueueSize(cfg.Broker.QueueSize),
 		broker.WithBackpressurePolicy(policy),
 		broker.WithAALPath(cfg.AAL.FilePath, aalKey),
+		broker.WithBatchSize(cfg.Broker.BatchSize),
+		broker.WithFlushInterval(cfg.Broker.FlushInterval),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

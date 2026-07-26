@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -59,10 +60,13 @@ type ACLConfig struct {
 	Rules   []ACLRuleConfig `yaml:"rules"`
 }
 
-// BrokerConfig defines async queue size and backpressure isolation policies.
+// BrokerConfig defines async queue size, backpressure isolation policies,
+// and coalesced write batching configuration.
 type BrokerConfig struct {
-	QueueSize          int    `yaml:"queue_size"`
-	BackpressurePolicy string `yaml:"backpressure_policy"` // "drop_oldest", "drop_newest", "disconnect"
+	QueueSize          int           `yaml:"queue_size"`
+	BackpressurePolicy string        `yaml:"backpressure_policy"` // "drop_oldest", "drop_newest", "disconnect"
+	BatchSize          int           `yaml:"batch_size"`          // coalesced write threshold in bytes (default 64KB)
+	FlushInterval      time.Duration `yaml:"flush_interval"`      // micro-timer flush interval (default 50µs)
 }
 
 // TransportConfig defines internal buffer limits.
@@ -96,6 +100,8 @@ func Default() *Config {
 		Broker: BrokerConfig{
 			QueueSize:          1024,
 			BackpressurePolicy: "drop_oldest",
+			BatchSize:          64 * 1024,             // 64 KB
+			FlushInterval:      50 * time.Microsecond, // 50 µs
 		},
 		Transport: TransportConfig{
 			MaxBufSize:  64 * 1024,
@@ -174,6 +180,16 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_BROKER_BACKPRESSURE_POLICY"); v != "" {
 		cfg.Broker.BackpressurePolicy = v
+	}
+	if v := os.Getenv("AQUEDUCT_BROKER_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Broker.BatchSize = n
+		}
+	}
+	if v := os.Getenv("AQUEDUCT_BROKER_FLUSH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.Broker.FlushInterval = d
+		}
 	}
 	if v := os.Getenv("AQUEDUCT_TRANSPORT_MAX_BUF_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

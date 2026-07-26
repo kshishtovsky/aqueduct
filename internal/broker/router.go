@@ -20,6 +20,12 @@ import (
 const defaultQueueSize = 1024
 const maxPayloadSize = 1 << 20 // 1 MB max payload per message
 
+// Default batch configuration for coalesced writes.
+const (
+	defaultBatchSize     = 64 * 1024             // 64 KB
+	defaultFlushInterval = 50 * time.Microsecond // 50 µs
+)
+
 var (
 	errTopicRequired = errors.New("subscribe payload must contain a topic")
 	errTopicEmpty    = errors.New("topic cannot be empty")
@@ -106,6 +112,26 @@ func WithPeerForwarder(f PeerForwarder) RouterOption {
 	}
 }
 
+// WithBatchSize sets the coalesced write batch size in bytes for subscriber writers.
+// Must be > 0. Default: 64 KB.
+func WithBatchSize(n int) RouterOption {
+	return func(r *Router) {
+		if n > 0 {
+			r.batchSize = n
+		}
+	}
+}
+
+// WithFlushInterval sets the maximum time to wait before flushing accumulated messages.
+// Must be > 0. Default: 50 µs.
+func WithFlushInterval(d time.Duration) RouterOption {
+	return func(r *Router) {
+		if d > 0 {
+			r.flushInterval = d
+		}
+	}
+}
+
 // WildcardSub stores a wildcard pattern registration and subscriber index.
 type WildcardSub struct {
 	pattern []byte
@@ -150,9 +176,11 @@ type Router struct {
 
 	peerForwarder PeerForwarder
 
-	metrics   RouterMetrics
-	queueSize int
-	policy    BackpressurePolicy
+	metrics       RouterMetrics
+	queueSize     int
+	policy        BackpressurePolicy
+	batchSize     int
+	flushInterval time.Duration
 
 	wg sync.WaitGroup
 }
@@ -166,6 +194,8 @@ func NewRouter(m RouterMetrics, opts ...RouterOption) *Router {
 		metrics:        m,
 		queueSize:      defaultQueueSize,
 		policy:         PolicyDropOldest,
+		batchSize:      defaultBatchSize,
+		flushInterval:  defaultFlushInterval,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -307,16 +337,92 @@ func (r *Router) runBackfillWorker(ctx context.Context, topic, consumerID string
 	})
 }
 
+// batchAccumulator coalesces small messages into larger writes for QUIC efficiency.
+// It accumulates frames until either the buffer reaches maxSize or the flush timer fires.
+// Timer lifecycle: stopped after flush, Reset() on first message arrival.
+// All operations are zero-allocation after initial construction.
+type batchAccumulator struct {
+	maxSize int
+	buf     []byte
+	msgRefs []*MessageRef // pending MessageRefs, released atomically on flush
+	timer   *time.Timer
+}
+
+func newBatchAccumulator(maxSize int, flushInterval time.Duration) *batchAccumulator {
+	acc := &batchAccumulator{
+		maxSize: maxSize,
+		buf:     make([]byte, 0, maxSize),
+		msgRefs: make([]*MessageRef, 0, 32),
+		timer:   time.NewTimer(flushInterval),
+	}
+	// Stop timer immediately; it will be Reset() on first message.
+	if !acc.timer.Stop() {
+		<-acc.timer.C
+	}
+	return acc
+}
+
+// flush writes all accumulated messages to the stream and releases their refs.
+// On write error, it releases all pending refs and returns the error.
+// After flush, the accumulator is ready for reuse (zero allocation reset).
+func (acc *batchAccumulator) flush(stream *quic.Stream) error {
+	if len(acc.buf) == 0 {
+		return nil
+	}
+
+	buf := acc.buf
+	refs := acc.msgRefs
+
+	// Reset accumulator slices for reuse (zero allocation).
+	acc.buf = acc.buf[:0]
+	acc.msgRefs = acc.msgRefs[:0]
+
+	if _, err := stream.Write(buf); err != nil {
+		for _, m := range refs {
+			m.Release()
+		}
+		return err
+	}
+	for _, m := range refs {
+		m.Release()
+	}
+	return nil
+}
+
 // runSubscriberWriter drains the subscriber's queue, checks TTL expiration lazily,
-// writes frames to the QUIC stream, and releases MessageRef reference counts upon completion.
+// coalesces small messages into batched writes, and releases MessageRef counts upon delivery.
+//
+// Coalescing logic:
+//   - Accumulates frames into a local buffer (up to r.batchSize bytes).
+//   - Starts a micro-timer (r.flushInterval) on the first accumulated frame.
+//   - Flushes (single stream.Write) when buffer reaches batchSize or timer fires.
+//   - This reduces syscall overhead and allows QUIC to pack multiple messages
+//     into one UDP datagram.
 func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, topic string, q chan *MessageRef) {
+	acc := newBatchAccumulator(r.batchSize, r.flushInterval)
+	defer func() {
+		_ = acc.flush(stream)
+		if !acc.timer.Stop() {
+			select {
+			case <-acc.timer.C:
+			default:
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			r.drainQueue(q)
 			return
+		case <-acc.timer.C:
+			if err := acc.flush(stream); err != nil {
+				r.drainQueue(q)
+				return
+			}
 		case msgRef, ok := <-q:
 			if !ok {
+				_ = acc.flush(stream)
 				return
 			}
 			nowNano := time.Now().UnixNano()
@@ -327,17 +433,39 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 			}
 
 			buf := msgRef.Buf()
-			if len(buf) > 0 {
-				if _, err := stream.Write(buf); err != nil {
+			if len(buf) == 0 {
+				msgRef.Release()
+				continue
+			}
+
+			// If adding this frame would exceed batch size, flush first
+			if len(acc.buf) > 0 && len(acc.buf)+len(buf) > acc.maxSize {
+				if err := acc.flush(stream); err != nil {
 					msgRef.Release()
 					r.drainQueue(q)
 					return
 				}
-				if r.metrics != nil {
-					r.metrics.OnDeliver(topic)
+			}
+
+			firstMsg := len(acc.buf) == 0
+			acc.buf = append(acc.buf, buf...)
+			acc.msgRefs = append(acc.msgRefs, msgRef)
+
+			if firstMsg {
+				acc.timer.Reset(r.flushInterval)
+			}
+
+			// Full batch: flush immediately (sends with current accumulated messages)
+			if len(acc.buf) >= acc.maxSize {
+				if err := acc.flush(stream); err != nil {
+					r.drainQueue(q)
+					return
 				}
 			}
-			msgRef.Release()
+
+			if r.metrics != nil {
+				r.metrics.OnDeliver(topic)
+			}
 		}
 	}
 }
@@ -610,6 +738,88 @@ func (r *Router) handleOverflow(idx int, topic string, q chan *MessageRef, msgRe
 		msgRef.Release()
 		return -1
 	}
+}
+
+// PublishBatch unpacks a CmdPublishBatch frame and publishes each sub-message individually.
+// Uses nested reference counting: creates a parent MessageRef for the batch buffer,
+// then child MessageRefs for each sub-frame pointing into the parent's buffer (zero-copy).
+//
+// Each sub-frame is a standard frame (Magic, Cmd, StreamID, Len, Payload) whose Payload
+// contains the topic for routing. Sub-frames are NOT copied — they are zero-copy sub-slices
+// of the parent batch buffer.
+func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
+	if frame.PayloadLen > maxPayloadSize {
+		return errors.New("batch payload exceeds maximum frame size")
+	}
+
+	// Serialize the batch frame into a pooled buffer (parent buffer for all sub-frames).
+	batchBuf := protocol.SerializeFrame(protocol.CmdPublishBatch, 0, frame.Payload)
+	batchMsgRef := AcquireMessageRef(batchBuf)
+
+	hasPeers := r.peerForwarder != nil && r.peerForwarder.ActivePeers() > 0
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Parse batch: iterate through sub-frames, find subscribers, and dispatch.
+	_ = protocol.ParseBatch(frame.Payload, func(subFrame []byte) error {
+		sub, subErr := protocol.ParseFrame(subFrame)
+		if subErr != nil {
+			return nil // skip malformed sub-frames
+		}
+		_, subTopic := parseTTL(sub.Payload)
+		subTopicHash := authz.CombineHashes("topic", subTopic)
+
+		subIndices := r.topicIndex[subTopicHash]
+		subHasWildcards := false
+		for _, wSub := range r.wildcardSubs {
+			if MatchWildcard(wSub.pattern, subTopic) {
+				subHasWildcards = true
+				break
+			}
+		}
+		if len(subIndices) == 0 && !subHasWildcards {
+			return nil
+		}
+
+		// Create a child MessageRef pointing into the parent batch buffer
+		child := AcquireChildMessageRef(batchMsgRef, subFrame, 0, 0)
+
+		for _, idx := range subIndices {
+			if idx < len(r.active) && r.active[idx] {
+				q := r.queues[idx]
+				child.Retain()
+				select {
+				case q <- child:
+				default:
+					child.Release()
+				}
+			}
+		}
+		for _, wSub := range r.wildcardSubs {
+			idx := wSub.idx
+			if idx < len(r.active) && r.active[idx] {
+				if MatchWildcard(wSub.pattern, subTopic) {
+					q := r.queues[idx]
+					child.Retain()
+					select {
+					case q <- child:
+					default:
+						child.Release()
+					}
+				}
+			}
+		}
+		child.Release()
+		return nil
+	})
+
+	if hasPeers {
+		r.peerForwarder.Forward(*batchBuf, true)
+	}
+
+	batchMsgRef.Release()
+	return nil
 }
 
 // disconnectSubscriber closes the QUIC stream and cancels the Writer goroutine for a slow consumer.
