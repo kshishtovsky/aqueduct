@@ -167,12 +167,21 @@ type nackKey struct {
 	offset    uint64
 }
 
+// ConsumerGroup manages lock-free atomic round-robin dispatch among competing consumers.
+type ConsumerGroup struct {
+	groupID string
+	topic   string
+	counter atomic.Uint64
+	members atomic.Pointer[[]int] // RCU snapshot of active subscriber slot indices
+}
+
 // SubscriptionSpec holds parsed parameters from a Subscribe command.
 type SubscriptionSpec struct {
 	Topic           string
 	IsDurable       bool
 	ConsumerID      string
 	RequestedOffset uint64
+	GroupID         string
 }
 
 // Router implements In-Memory Direct Mesh Routing using Structure of Arrays (SoA).
@@ -194,6 +203,12 @@ type Router struct {
 
 	// topicIndex maps FNV-1a hash of topic name to slice of indices in flat arrays.
 	topicIndex map[uint64][]int
+
+	// subGroups stores GroupID per subscriber slot ("" if individual subscriber).
+	subGroups []string
+
+	// groups maps FNV-1a hash of topic name to slice of ConsumerGroup instances.
+	groups map[uint64][]*ConsumerGroup
 
 	// wildcardSubs holds wildcard topic patterns (+ and #).
 	wildcardSubs []WildcardSub
@@ -262,6 +277,7 @@ func NewRouter(m RouterMetrics, opts ...RouterOption) *Router {
 		topicIndex:     make(map[uint64][]int),
 		topicOffsets:   make(map[uint64]*atomic.Uint64),
 		durableOffsets: make(map[uint64]uint64),
+		groups:         make(map[uint64][]*ConsumerGroup),
 		nackCounters:   make(map[nackKey]int8),
 		metrics:        m,
 		queueSize:      defaultQueueSize,
@@ -332,7 +348,37 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	r.subMus = append(r.subMus, subMu)
 	r.nackChs = append(r.nackChs, nackCh)
 	r.cancels = append(r.cancels, cancel)
-	r.topicIndex[topicHash] = append(r.topicIndex[topicHash], idx)
+	r.subGroups = append(r.subGroups, spec.GroupID)
+
+	if spec.GroupID != "" {
+		var cg *ConsumerGroup
+		for _, g := range r.groups[topicHash] {
+			if g.groupID == spec.GroupID {
+				cg = g
+				break
+			}
+		}
+		if cg == nil {
+			cg = &ConsumerGroup{
+				groupID: spec.GroupID,
+				topic:   spec.Topic,
+			}
+			r.groups[topicHash] = append(r.groups[topicHash], cg)
+		}
+		r.rebuildGroupMembersLocked(cg)
+
+		groupDurableKey := authz.CombineHashStrings(spec.GroupID, spec.Topic)
+		if spec.IsDurable || spec.RequestedOffset > 0 {
+			if spec.RequestedOffset == 0 {
+				spec.RequestedOffset = r.durableOffsets[groupDurableKey]
+			} else {
+				r.durableOffsets[groupDurableKey] = spec.RequestedOffset
+			}
+			metrics.ConsumerOffset.WithLabelValues(spec.GroupID, spec.Topic).Set(float64(r.durableOffsets[groupDurableKey]))
+		}
+	} else {
+		r.topicIndex[topicHash] = append(r.topicIndex[topicHash], idx)
+	}
 
 	if IsWildcardTopic(spec.Topic) {
 		r.wildcardSubs = append(r.wildcardSubs, WildcardSub{
@@ -341,7 +387,7 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 		})
 	}
 
-	if spec.IsDurable {
+	if spec.IsDurable && spec.GroupID == "" {
 		durableKey := authz.CombineHashStrings(spec.ConsumerID, spec.Topic)
 		r.durableOffsets[durableKey] = spec.RequestedOffset
 		metrics.DurableSubscribersActive.Inc()
@@ -402,14 +448,45 @@ func (r *Router) NackByStream(streamID uint32, offset uint64) {
 	r.mu.RUnlock()
 }
 
-// AckOffset updates the acknowledged consumer offset for a durable subscriber.
+// rebuildGroupMembersLocked updates the active subscriber index snapshot for a ConsumerGroup.
+// Must be called with r.mu held.
+func (r *Router) rebuildGroupMembersLocked(cg *ConsumerGroup) {
+	var members []int
+	for i, groupID := range r.subGroups {
+		if groupID == cg.groupID && i < len(r.active) && r.active[i] && r.topics[i] == cg.topic {
+			members = append(members, i)
+		}
+	}
+	cg.members.Store(&members)
+}
+
+// AckOffset updates the acknowledged consumer offset for a durable subscriber or consumer group.
 func (r *Router) AckOffset(consumerID, topic string, offset uint64) {
 	durableKey := authz.CombineHashStrings(consumerID, topic)
 	r.mu.Lock()
 	r.durableOffsets[durableKey] = offset
+	for i, groupID := range r.subGroups {
+		if groupID != "" && r.topics[i] == topic {
+			groupKey := authz.CombineHashStrings(groupID, topic)
+			if groupID == consumerID || (r.active[i] && r.subGroups[i] == consumerID) {
+				r.durableOffsets[groupKey] = offset
+				metrics.ConsumerOffset.WithLabelValues(groupID, topic).Set(float64(offset))
+			}
+		}
+	}
 	r.mu.Unlock()
 
 	metrics.ConsumerOffset.WithLabelValues(consumerID, topic).Set(float64(offset))
+}
+
+// GetGroupOffset returns the acknowledged offset for a consumer group on topic.
+func (r *Router) GetGroupOffset(groupID, topic string) uint64 {
+	return r.GetConsumerOffset(groupID, topic)
+}
+
+// SetGroupOffset explicitly sets the group offset for groupID on topic.
+func (r *Router) SetGroupOffset(groupID, topic string, offset uint64) {
+	r.AckOffset(groupID, topic, offset)
 }
 
 // GetTopicOffset returns the current monotonic offset for topic.
@@ -828,9 +905,10 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 	indices := r.topicIndex[topicHash]
 	hasWildcards := len(r.wildcardSubs) > 0
 	hasPeers := r.peerForwarder != nil && r.peerForwarder.ActivePeers() > 0
+	hasGroups := len(r.groups[topicHash]) > 0
 
-	// Early return only if no local subscribers AND no peers to forward to.
-	if len(indices) == 0 && !hasWildcards && !hasPeers {
+	// Early return only if no local subscribers, no groups, AND no peers to forward to.
+	if len(indices) == 0 && !hasWildcards && !hasPeers && !hasGroups {
 		r.mu.RUnlock()
 		return nil
 	}
@@ -880,6 +958,26 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 				if MatchWildcard(wSub.pattern, cleanPayload) {
 					msgRef.Retain()
 					dc := r.enqueueToSubscriber(idx, msgRef, pLevel)
+					if dc >= 0 {
+						disconnectIndices = append(disconnectIndices, dc)
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Dispatch to Consumer Groups (Lock-Free Atomic Round-Robin per group)
+	if hasGroups {
+		for _, g := range r.groups[topicHash] {
+			membersPtr := g.members.Load()
+			if membersPtr != nil && len(*membersPtr) > 0 {
+				members := *membersPtr
+				n := uint64(len(members))
+				val := g.counter.Add(1)
+				chosenIdx := members[(val-1)%n]
+				if chosenIdx < len(r.active) && r.active[chosenIdx] {
+					msgRef.Retain()
+					dc := r.enqueueToSubscriber(chosenIdx, msgRef, pLevel)
 					if dc >= 0 {
 						disconnectIndices = append(disconnectIndices, dc)
 					}
@@ -955,8 +1053,9 @@ func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
 	r.mu.RLock()
 	indices := r.topicIndex[topicHash]
 	hasWildcards := len(r.wildcardSubs) > 0
+	hasGroups := len(r.groups[topicHash]) > 0
 
-	if len(indices) == 0 && !hasWildcards {
+	if len(indices) == 0 && !hasWildcards && !hasGroups {
 		r.mu.RUnlock()
 		return nil
 	}
@@ -995,6 +1094,25 @@ func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
 				if MatchWildcard(wSub.pattern, cleanPayload) {
 					msgRef.Retain()
 					dc := r.enqueueToSubscriber(idx, msgRef, pLevel)
+					if dc >= 0 {
+						disconnectIndices = append(disconnectIndices, dc)
+					}
+				}
+			}
+		}
+	}
+
+	if hasGroups {
+		for _, g := range r.groups[topicHash] {
+			membersPtr := g.members.Load()
+			if membersPtr != nil && len(*membersPtr) > 0 {
+				members := *membersPtr
+				n := uint64(len(members))
+				val := g.counter.Add(1)
+				chosenIdx := members[(val-1)%n]
+				if chosenIdx < len(r.active) && r.active[chosenIdx] {
+					msgRef.Retain()
+					dc := r.enqueueToSubscriber(chosenIdx, msgRef, pLevel)
 					if dc >= 0 {
 						disconnectIndices = append(disconnectIndices, dc)
 					}
@@ -1103,7 +1221,8 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 				break
 			}
 		}
-		if len(subIndices) == 0 && !subHasWildcards {
+		subHasGroups := len(r.groups[subTopicHash]) > 0
+		if len(subIndices) == 0 && !subHasWildcards && !subHasGroups {
 			return nil
 		}
 
@@ -1133,6 +1252,24 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 					dc := r.enqueueToSubscriber(idx, child, pLevel)
 					if dc >= 0 {
 						disconnectIndices = append(disconnectIndices, dc)
+					}
+				}
+			}
+		}
+		if subHasGroups {
+			for _, g := range r.groups[subTopicHash] {
+				membersPtr := g.members.Load()
+				if membersPtr != nil && len(*membersPtr) > 0 {
+					members := *membersPtr
+					n := uint64(len(members))
+					val := g.counter.Add(1)
+					chosenIdx := members[(val-1)%n]
+					if chosenIdx < len(r.active) && r.active[chosenIdx] {
+						child.Retain()
+						dc := r.enqueueToSubscriber(chosenIdx, child, pLevel)
+						if dc >= 0 {
+							disconnectIndices = append(disconnectIndices, dc)
+						}
 					}
 				}
 			}
@@ -1185,6 +1322,16 @@ func (r *Router) disconnectSubscriber(idx int) {
 		if stream := r.streams[idx]; stream != nil {
 			_ = stream.Close()
 		}
+		if idx < len(r.subGroups) && r.subGroups[idx] != "" {
+			groupID := r.subGroups[idx]
+			topic := r.topics[idx]
+			topicHash := authz.CombineHashStrings("topic", topic)
+			for _, cg := range r.groups[topicHash] {
+				if cg.groupID == groupID {
+					r.rebuildGroupMembersLocked(cg)
+				}
+			}
+		}
 		if r.metrics != nil {
 			r.metrics.SetActiveSubscribers(float64(r.countActiveLocked()))
 		}
@@ -1201,6 +1348,16 @@ func (r *Router) Unsubscribe(streamID uint32) {
 			r.active[i] = false
 			if cancel := r.cancels[i]; cancel != nil {
 				cancel()
+			}
+			if i < len(r.subGroups) && r.subGroups[i] != "" {
+				groupID := r.subGroups[i]
+				topic := r.topics[i]
+				topicHash := authz.CombineHashStrings("topic", topic)
+				for _, cg := range r.groups[topicHash] {
+					if cg.groupID == groupID {
+						r.rebuildGroupMembersLocked(cg)
+					}
+				}
 			}
 		}
 	}
@@ -1245,26 +1402,41 @@ func parseSubscriptionPayload(payload []byte) (SubscriptionSpec, error) {
 		return SubscriptionSpec{}, errTopicEmpty
 	}
 
+	spec := SubscriptionSpec{}
+
+	if idx := strings.Index(raw, ":group:"); idx != -1 {
+		rest := raw[idx+7:]
+		groupID := rest
+		endIdx := strings.IndexByte(rest, ':')
+		if endIdx != -1 {
+			groupID = rest[:endIdx]
+			raw = raw[:idx] + rest[endIdx:]
+		} else {
+			raw = raw[:idx]
+		}
+		spec.GroupID = groupID
+	}
+
 	parts := strings.Split(raw, ":durable:")
 	if len(parts) == 1 {
-		return SubscriptionSpec{Topic: parts[0]}, nil
+		spec.Topic = parts[0]
+		return spec, nil
 	}
 
-	topic := parts[0]
+	spec.Topic = parts[0]
 	durParts := strings.Split(parts[1], ":")
 	if len(durParts) < 2 {
-		return SubscriptionSpec{Topic: topic, IsDurable: true, ConsumerID: parts[1]}, nil
+		spec.IsDurable = true
+		spec.ConsumerID = parts[1]
+		return spec, nil
 	}
 
-	consumerID := durParts[0]
+	spec.ConsumerID = durParts[0]
 	offset, _ := strconv.ParseUint(durParts[1], 10, 64)
+	spec.IsDurable = true
+	spec.RequestedOffset = offset
 
-	return SubscriptionSpec{
-		Topic:           topic,
-		IsDurable:       true,
-		ConsumerID:      consumerID,
-		RequestedOffset: offset,
-	}, nil
+	return spec, nil
 }
 
 func extractTopic(payload []byte) (string, error) {

@@ -2222,3 +2222,256 @@ func BenchmarkPriorityPublish(b *testing.B) {
 		}
 	}
 }
+
+func TestCompetingConsumers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	topic := "orders"
+	groupID := "workers"
+	numWorkers := 3
+	numMessages := 3000
+
+	queues := make([]*[4]chan *MessageRef, numWorkers)
+	subMus := make([]*sync.RWMutex, numWorkers)
+
+	router.mu.Lock()
+	for i := 0; i < numWorkers; i++ {
+		subQueues := &[4]chan *MessageRef{}
+		subMu := &sync.RWMutex{}
+		queues[i] = subQueues
+		subMus[i] = subMu
+
+		router.streamIDs = append(router.streamIDs, uint32(i+1))
+		router.streams = append(router.streams, nil)
+		router.topics = append(router.topics, topic)
+		router.active = append(router.active, true)
+		router.queues = append(router.queues, subQueues)
+		router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+		router.subMus = append(router.subMus, subMu)
+		router.nackChs = append(router.nackChs, make(chan uint64, 8))
+		router.cancels = append(router.cancels, func() {})
+		router.subGroups = append(router.subGroups, groupID)
+
+		topicHash := authz.CombineHashStrings("topic", topic)
+		var cg *ConsumerGroup
+		for _, g := range router.groups[topicHash] {
+			if g.groupID == groupID {
+				cg = g
+				break
+			}
+		}
+		if cg == nil {
+			cg = &ConsumerGroup{groupID: groupID, topic: topic}
+			router.groups[topicHash] = append(router.groups[topicHash], cg)
+		}
+		router.rebuildGroupMembersLocked(cg)
+	}
+	router.mu.Unlock()
+
+	counts := make([]int, numWorkers)
+
+	payload := []byte(topic)
+	frame := protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(payload)),
+		Payload:    payload,
+	}
+
+	for i := 0; i < numMessages; i++ {
+		err := router.Publish(ctx, frame)
+		if err != nil {
+			t.Fatalf("publish error: %v", err)
+		}
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		subMu := subMus[i]
+		subQueues := queues[i]
+		for {
+			msgRef, _ := router.fetchNextMessage(subMu, subQueues)
+			if msgRef == nil {
+				break
+			}
+			counts[i]++
+			msgRef.Release()
+		}
+	}
+
+	totalReceived := 0
+	for i, c := range counts {
+		totalReceived += c
+		t.Logf("Worker %d received %d messages", i, c)
+		if c < 950 || c > 1050 {
+			t.Errorf("Worker %d expected ~1000 messages, got %d", i, c)
+		}
+	}
+
+	if totalReceived != numMessages {
+		t.Fatalf("Expected total %d messages received, got %d", numMessages, totalReceived)
+	}
+}
+
+func TestGroupRebalancingAndDurable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	topic := "orders"
+	groupID := "workers"
+
+	qA := &[4]chan *MessageRef{}
+	muA := &sync.RWMutex{}
+	qB := &[4]chan *MessageRef{}
+	muB := &sync.RWMutex{}
+
+	router.mu.Lock()
+	router.streamIDs = append(router.streamIDs, 1)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, topic)
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, qA)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, muA)
+	router.nackChs = append(router.nackChs, make(chan uint64, 8))
+	router.cancels = append(router.cancels, func() {})
+	router.subGroups = append(router.subGroups, groupID)
+
+	router.streamIDs = append(router.streamIDs, 2)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, topic)
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, qB)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, muB)
+	router.nackChs = append(router.nackChs, make(chan uint64, 8))
+	router.cancels = append(router.cancels, func() {})
+	router.subGroups = append(router.subGroups, groupID)
+
+	topicHash := authz.CombineHashStrings("topic", topic)
+	cg := &ConsumerGroup{groupID: groupID, topic: topic}
+	router.groups[topicHash] = append(router.groups[topicHash], cg)
+	router.rebuildGroupMembersLocked(cg)
+	router.mu.Unlock()
+
+	payload := []byte(topic)
+	frame := protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(payload)),
+		Payload:    payload,
+	}
+
+	for i := 0; i < 10; i++ {
+		_ = router.Publish(ctx, frame)
+	}
+
+	router.AckOffset(groupID, topic, 10)
+	if got := router.GetGroupOffset(groupID, topic); got != 10 {
+		t.Fatalf("Expected group offset 10, got %d", got)
+	}
+
+	router.Unsubscribe(1)
+
+	for i := 0; i < 5; i++ {
+		_ = router.Publish(ctx, frame)
+	}
+
+	workerBMsgs := 0
+	for {
+		msgRef, _ := router.fetchNextMessage(muB, qB)
+		if msgRef == nil {
+			break
+		}
+		workerBMsgs++
+		msgRef.Release()
+	}
+
+	if workerBMsgs != 10 {
+		t.Fatalf("Worker B expected 10 total messages (5 initial + 5 failover), got %d", workerBMsgs)
+	}
+
+	router.AckOffset(groupID, topic, 15)
+
+	qA2 := &[4]chan *MessageRef{}
+	muA2 := &sync.RWMutex{}
+	router.mu.Lock()
+	router.streamIDs = append(router.streamIDs, 3)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, topic)
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, qA2)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, muA2)
+	router.nackChs = append(router.nackChs, make(chan uint64, 8))
+	router.cancels = append(router.cancels, func() {})
+	router.subGroups = append(router.subGroups, groupID)
+	router.rebuildGroupMembersLocked(cg)
+	router.mu.Unlock()
+
+	if got := router.GetGroupOffset(groupID, topic); got != 15 {
+		t.Fatalf("Expected group offset 15 after Worker A reconnect, got %d", got)
+	}
+}
+
+func BenchmarkGroupRouting(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	topic := "bench-group"
+	groupID := "workers"
+	numWorkers := 10
+
+	router.mu.Lock()
+	for i := 0; i < numWorkers; i++ {
+		subQueues := &[4]chan *MessageRef{}
+		subMu := &sync.RWMutex{}
+		router.streamIDs = append(router.streamIDs, uint32(i+1))
+		router.streams = append(router.streams, nil)
+		router.topics = append(router.topics, topic)
+		router.active = append(router.active, true)
+		router.queues = append(router.queues, subQueues)
+		router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+		router.subMus = append(router.subMus, subMu)
+		router.nackChs = append(router.nackChs, make(chan uint64, 8))
+		router.cancels = append(router.cancels, func() {})
+		router.subGroups = append(router.subGroups, groupID)
+
+		topicHash := authz.CombineHashStrings("topic", topic)
+		var cg *ConsumerGroup
+		for _, g := range router.groups[topicHash] {
+			if g.groupID == groupID {
+				cg = g
+				break
+			}
+		}
+		if cg == nil {
+			cg = &ConsumerGroup{groupID: groupID, topic: topic}
+			router.groups[topicHash] = append(router.groups[topicHash], cg)
+		}
+		router.rebuildGroupMembersLocked(cg)
+	}
+	router.mu.Unlock()
+
+	payload := []byte(topic)
+	frame := protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(payload)),
+		Payload:    payload,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = router.Publish(ctx, frame)
+	}
+}
+

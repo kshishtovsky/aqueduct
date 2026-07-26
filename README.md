@@ -21,13 +21,14 @@
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
 > [!IMPORTANT]
-> **Production Ready (v1.12.0)**
-> Aqueduct features **gRPC Control Plane (Admin API)** for **lock-free RCU Hot-Reload** of Quotas and ACL rules, **Hard Real-Time Lazy Priority Queues (QoS)**, **Per-Priority TTL**, **Strict Prioritization**, **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **zero-allocation ZSTD payload compression**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching**, **coalesced subscriber writes**, **NACK-based redelivery** and **Dead Letter Queues**.
+> **Production Ready (v1.13.0)**
+> Aqueduct features **Consumer Groups & Lock-Free Atomic Round-Robin Routing**, **gRPC Control Plane (Admin API)** for **lock-free RCU Hot-Reload** of Quotas and ACL rules, **Hard Real-Time Lazy Priority Queues (QoS)**, **Per-Priority TTL**, **Strict Prioritization**, **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **zero-allocation ZSTD payload compression**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching**, **coalesced subscriber writes**, **NACK-based redelivery** and **Dead Letter Queues**.
 
 ---
 
 ## Features
 
+- **Consumer Groups & Atomic Round-Robin Routing**: Competing consumers join named groups (e.g. `topic:orders:group:payment-workers`). Messages published to a topic are load-balanced across active group workers via **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`). Group Durable Offsets persist and recover at the group level across worker failovers.
 - **Dynamic Control Plane (gRPC Admin API)**: Dedicated gRPC Admin server (`:9091`) with mTLS role validation (`admin-*` CN) for lock-free RCU Hot-Reload of client rate quotas and ACL authorization rules without restarting or lock contention.
 - **QUIC Transport Layer**: Multiplexed QUIC connection handling with 0-RTT connection establishment, stream isolation, and amplification protection.
 - **Zero-Copy Binary Protocol**: Flat 10-byte binary header parser (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) with optional TLV extension region using zero-allocation pointer arithmetic.
