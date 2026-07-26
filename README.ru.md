@@ -81,9 +81,21 @@ transport:
 
 ---
 
-## Примеры клиентского кода
+## Нагрузочное тестирование (`aqueduct-bench`)
 
-Примеры клиентских скриптов:
+Инструмент нагрузочного тестирования расположен в `cmd/aqueduct-bench`.
+
+```bash
+# Сборка утилиты тестирования
+go build -o bin/aqueduct-bench ./cmd/aqueduct-bench
+
+# Запуск теста (10 воркеров, 100,000 запросов, 128 байт payload)
+./bin/aqueduct-bench -addr 127.0.0.1:4242 -c 10 -n 100000 -size 128 -topic bench
+```
+
+---
+
+## Примеры клиентского кода
 
 - [Пример на Go](examples/go/main.go) — Клиент на `quic-go`.
 - [Пример на Python](examples/python/client.py) — Асинхронный клиент на `aioquic`.
