@@ -57,7 +57,7 @@ Within each Consumer Group registered on a topic, messages are load-balanced acr
 - **MeshForwarded Flag (Bit 7, `0x80`)**: Set when a frame is forwarded from another cluster broker node. Prevents re-forwarding loops in mesh topology.
 - **HasExtensions Flag (Bit 6, `0x40`)**: Set when the frame contains a TLV Extension block immediately following the 10-byte header.
 
----
+When `Command & 0x40 != 0`, the payload region begins with a 2-byte `ExtTotalLen` followed by packed TLV entries `[Type: 1B][Length: 1B][Value: N Bytes]`:
 
 ## 3. TLV Extension Block Format
 
