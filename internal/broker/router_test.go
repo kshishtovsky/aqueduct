@@ -946,6 +946,167 @@ func BenchmarkRouterPublishWithWildcards(b *testing.B) {
 	}
 }
 
+// mockPeerForwarder records calls for cluster mesh forwarding tests.
+type mockPeerForwarder struct {
+	forwardCalls atomic.Int32
+	active       atomic.Int32
+}
+
+func (m *mockPeerForwarder) Forward(rawBuf []byte, addForwardedBit bool) {
+	m.forwardCalls.Add(1)
+}
+
+func (m *mockPeerForwarder) ActivePeers() int {
+	return int(m.active.Load())
+}
+
+// TestRouterPublishFromPeer verifies that a mesh-forwarded frame is delivered to local subscribers
+// but does NOT trigger peer re-forwarding (storm protection at the router level).
+func TestRouterPublishFromPeer(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+	mpf := &mockPeerForwarder{}
+	mpf.active.Store(2)
+
+	router := NewRouter(nil, WithPeerForwarder(mpf))
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 1024)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		frame, err := protocol.ParseFrame(buf[:n])
+		if err != nil {
+			return
+		}
+		_ = router.Subscribe(ctx, stream, frame)
+	}()
+
+	conn := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub: %v", err)
+	}
+	sendFrame(t, sub, protocol.CmdSubscribe, 1, []byte("topic:peer-topic"))
+	time.Sleep(300 * time.Millisecond)
+
+	// Simulate a MeshForwarded frame received from a peer node.
+	forwardedPayload := []byte("peer-topic")
+	forwardedFrame := protocol.Frame{
+		Command:    protocol.SetForwarded(protocol.CmdPublish),
+		StreamID:   0,
+		PayloadLen: uint32(len(forwardedPayload)),
+		Payload:    forwardedPayload,
+	}
+
+	if err := router.PublishFromPeer(ctx, forwardedFrame); err != nil {
+		t.Fatalf("PublishFromPeer: %v", err)
+	}
+
+	// Verify local subscriber received the message
+	sub.SetReadDeadline(time.Now().Add(2 * time.Second))
+	readBuf := make([]byte, 1024)
+	n, err := sub.Read(readBuf)
+	if err != nil {
+		t.Fatalf("sub read: %v", err)
+	}
+	f, _ := protocol.ParseFrame(readBuf[:n])
+	if string(f.Payload) != "peer-topic" {
+		t.Errorf("expected 'peer-topic', got %q", f.Payload)
+	}
+
+	// Verify MeshForwarded bit is stripped before delivery
+	if protocol.IsForwarded(f.Command) {
+		t.Error("expected MeshForwarded bit to be stripped before local delivery")
+	}
+
+	// Storm protection: PeerForwarder.Forward must NOT have been called
+	if calls := mpf.forwardCalls.Load(); calls != 0 {
+		t.Errorf("expected 0 peer forward calls from PublishFromPeer, got %d", calls)
+	}
+}
+
+// TestRouterPublishWithPeerForwarder verifies that Publish() forwards to peers when
+// there are active peer connections. We subscribe a local sub first to prevent the
+// early return (no subscribers) before peer forwarding is reached.
+func TestRouterPublishWithPeerForwarder(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+	mpf := &mockPeerForwarder{}
+	mpf.active.Store(2)
+
+	router := NewRouter(nil, WithPeerForwarder(mpf))
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 10 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 1024)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		frame, err := protocol.ParseFrame(buf[:n])
+		if err != nil {
+			return
+		}
+		_ = router.Subscribe(ctx, stream, frame)
+	}()
+
+	conn := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub: %v", err)
+	}
+	sendFrame(t, sub, protocol.CmdSubscribe, 1, []byte("topic:forward-test"))
+	time.Sleep(300 * time.Millisecond)
+
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: 12,
+		Payload:    []byte("forward-test"),
+	})
+
+	// Verify Forward was called for peers
+	if calls := mpf.forwardCalls.Load(); calls == 0 {
+		t.Error("expected Publish to call Forward for active peers")
+	}
+}
+
 // TestDurableSubscriptionsReconnect tests durable subscriber reconnection and AAL backfill replay.
 func TestDurableSubscriptionsReconnect(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "durable_aal.log")
