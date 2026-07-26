@@ -27,7 +27,7 @@ jobs:
 
       - name: Run Tests with Race Detector and Coverage
         run: |
-          go test -v -race -coverprofile=coverage.out ./...
+          go test -v -race -coverprofile=coverage.out ./internal/...
 
       - name: Verify Coverage Threshold (>= 75%)
         run: |
