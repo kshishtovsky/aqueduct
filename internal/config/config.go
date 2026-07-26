@@ -60,6 +60,19 @@ type ACLConfig struct {
 	Rules   []ACLRuleConfig `yaml:"rules"`
 }
 
+// QuotasConfig defines per-tenant rate limiting parameters.
+type QuotasConfig struct {
+	DefaultPublishRate int                    `yaml:"default_publish_rate"` // default rate limit per tenant (msg/s), 0 = unlimited
+	DefaultBurstSize   int                    `yaml:"default_burst_size"`   // default burst size per tenant
+	PerClient          map[string]ClientQuota `yaml:"per_client"`           // per-client overrides
+}
+
+// ClientQuota defines rate limit for a specific client.
+type ClientQuota struct {
+	Rate  int `yaml:"rate"`
+	Burst int `yaml:"burst"`
+}
+
 // BrokerConfig defines async queue size, backpressure isolation policies,
 // and coalesced write batching configuration.
 type BrokerConfig struct {
@@ -68,6 +81,7 @@ type BrokerConfig struct {
 	BatchSize          int           `yaml:"batch_size"`          // coalesced write threshold in bytes (default 64KB)
 	FlushInterval      time.Duration `yaml:"flush_interval"`      // micro-timer flush interval (default 50µs)
 	MaxRetries         int           `yaml:"max_retries"`         // max NACK retries before DLQ (default 3)
+	Quotas             QuotasConfig  `yaml:"quotas"`
 }
 
 // TransportConfig defines internal buffer limits.
@@ -104,6 +118,10 @@ func Default() *Config {
 			BatchSize:          64 * 1024,             // 64 KB
 			FlushInterval:      50 * time.Microsecond, // 50 µs
 			MaxRetries:         3,                     // 3 NACK retries before DLQ
+			Quotas: QuotasConfig{
+				DefaultPublishRate: 0,
+				DefaultBurstSize:   1000,
+			},
 		},
 		Transport: TransportConfig{
 			MaxBufSize:  64 * 1024,
@@ -196,6 +214,16 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_BROKER_MAX_RETRIES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Broker.MaxRetries = n
+		}
+	}
+	if v := os.Getenv("AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Broker.Quotas.DefaultPublishRate = n
+		}
+	}
+	if v := os.Getenv("AQUEDUCT_BROKER_DEFAULT_BURST_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Broker.Quotas.DefaultBurstSize = n
 		}
 	}
 	if v := os.Getenv("AQUEDUCT_TRANSPORT_MAX_BUF_SIZE"); v != "" {

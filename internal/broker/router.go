@@ -14,6 +14,7 @@ import (
 	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
+	"github.com/kshishtovsky/aqueduct/internal/quotas"
 	"github.com/quic-go/quic-go"
 )
 
@@ -69,6 +70,7 @@ type RouterMetrics interface {
 	OnPublish(topic string)
 	OnDeliver(topic string)
 	SetActiveSubscribers(n float64)
+	OnRateLimited(clientID string)
 }
 
 // RouterOption configures the Router.
@@ -188,9 +190,10 @@ type Router struct {
 	nackCounters map[nackKey]int8
 	nackMu       sync.Mutex
 
-	maxRetries int
-	aalPath    string
-	aalKey     []byte
+	maxRetries   int
+	quotaManager *quotas.Manager
+	aalPath      string
+	aalKey       []byte
 
 	peerForwarder PeerForwarder
 
@@ -210,6 +213,12 @@ func WithMaxRetries(n int) RouterOption {
 		if n > 0 {
 			r.maxRetries = n
 		}
+	}
+}
+
+func WithQuotas(qm *quotas.Manager) RouterOption {
+	return func(r *Router) {
+		r.quotaManager = qm
 	}
 }
 
@@ -608,8 +617,19 @@ func (r *Router) drainQueue(q chan *MessageRef) {
 // Publish non-blockingly dispatches a message to all matching subscriber queues (exact & wildcard).
 // Operates with 0 heap allocations and nano-second publisher latency.
 func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
+	return r.publishWithClientID(ctx, frame, "")
+}
+
+func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, clientID string) error {
 	if frame.PayloadLen > maxPayloadSize {
 		return errors.New("payload exceeds maximum frame size")
+	}
+
+	if r.quotaManager != nil && !r.quotaManager.TryAcquire(clientID) {
+		if r.metrics != nil {
+			r.metrics.OnRateLimited(clientID)
+		}
+		return nil
 	}
 
 	expiresAt, cleanPayload := parseTTL(frame.Payload)
