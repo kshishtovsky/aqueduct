@@ -178,7 +178,7 @@ func main() {
 		} else {
 			logger.Info("append-only logging enabled", "path", cfg.AAL.FilePath)
 		}
-		opts = append(opts, transport.WithAAL(aalLog))
+		opts = append(opts, transport.WithAAL(aalLog), transport.WithAALReplay(cfg.AAL.FilePath, aalKey))
 	}
 
 	b := transport.New(opts...)
