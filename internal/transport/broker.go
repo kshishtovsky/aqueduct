@@ -11,7 +11,9 @@ import (
 	"sync/atomic"
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
+	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/broker"
+	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/quic-go/quic-go"
 )
@@ -24,6 +26,7 @@ const (
 var (
 	errOversizedPayload = errors.New("payload length exceeds maxBufSize")
 	errBufferExceeded   = errors.New("unread buffer exceeds maxBufSize")
+	errUnauthorized     = errors.New("authorization denied")
 )
 
 // Handler processes a parsed frame and returns an optional response payload.
@@ -38,6 +41,7 @@ type Broker struct {
 	handlers map[protocol.Command]Handler
 	router   *broker.Router
 	aal      *aal.Log
+	authz    *authz.Engine
 
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
@@ -77,6 +81,11 @@ func WithRouter(r *broker.Router) Option {
 // WithAAL enables Append-Only Logging for CmdPublish frames.
 func WithAAL(l *aal.Log) Option {
 	return func(b *Broker) { b.aal = l }
+}
+
+// WithAuthz enables the zero-allocation ACL authorization engine.
+func WithAuthz(e *authz.Engine) Option {
+	return func(b *Broker) { b.authz = e }
 }
 
 // New creates a Broker with the given options. Call Listen to start accepting.
@@ -162,6 +171,20 @@ func runAcceptLoop(b *Broker, jig context.Context, ln *quic.Listener) {
 
 // runHandleConn processes all streams on a single QUIC connection.
 func runHandleConn(b *Broker, jig context.Context, conn *quic.Conn) {
+	cs := conn.ConnectionState()
+	clientIDStr := "anonymous"
+	if len(cs.TLS.PeerCertificates) > 0 {
+		if cn := cs.TLS.PeerCertificates[0].Subject.CommonName; cn != "" {
+			clientIDStr = cn
+		}
+	}
+	clientIDHash := authz.HashString(clientIDStr)
+
+	go func() {
+		<-jig.Done()
+		_ = conn.CloseWithError(0, "broker shutdown")
+	}()
+
 	for {
 		stream, err := conn.AcceptStream(jig)
 		if err != nil {
@@ -175,17 +198,18 @@ func runHandleConn(b *Broker, jig context.Context, conn *quic.Conn) {
 		b.wg.Add(1)
 		go func() {
 			defer b.wg.Done()
-			b.processStream(jig, conn, stream)
+			b.processStream(jig, conn, stream, clientIDStr, clientIDHash)
 		}()
 	}
 }
 
 // processStream reads frames from a single QUIC stream and dispatches them.
-func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *quic.Stream) {
+func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *quic.Stream, clientIDStr string, clientIDHash uint64) {
 	streamID := stream.StreamID()
 	span := b.logger.With(
 		"stream_id", streamID,
 		"remote", conn.RemoteAddr(),
+		"client_id", clientIDStr,
 	)
 
 	// Ensure cleanup on stream close.
@@ -203,8 +227,13 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 	for {
 		if off == cap(buf) {
 			var err error
-			off, err = b.dispatchFrames(jig, span, buf[:off], off, stream)
+			off, err = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr, clientIDHash)
 			if err != nil {
+				if errors.Is(err, errUnauthorized) {
+					stream.CancelRead(401)
+					stream.CancelWrite(401)
+					return
+				}
 				span.Warn("oversized payload or memory limit exceeded", "err", err)
 				stream.CancelRead(1)
 				stream.CancelWrite(1)
@@ -231,8 +260,13 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 		if n > 0 {
 			off += n
 			var dispatchErr error
-			off, dispatchErr = b.dispatchFrames(jig, span, buf[:off], off, stream)
+			off, dispatchErr = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr, clientIDHash)
 			if dispatchErr != nil {
+				if errors.Is(dispatchErr, errUnauthorized) {
+					stream.CancelRead(401)
+					stream.CancelWrite(401)
+					return
+				}
 				span.Warn("oversized payload or memory limit exceeded", "err", dispatchErr)
 				stream.CancelRead(1)
 				stream.CancelWrite(1)
@@ -255,7 +289,7 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 // dispatchFrames splits buf[:off] into complete frames and invokes handlers
 // or the built-in router. Returns the new offset after consuming all complete
 // frames (preserving any trailing partial frame bytes for the next read).
-func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []byte, off int, stream *quic.Stream) (int, error) {
+func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []byte, off int, stream *quic.Stream, clientIDStr string, clientIDHash uint64) (int, error) {
 	consumed := 0
 	for consumed < off {
 		remaining := off - consumed
@@ -281,6 +315,24 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 		if err != nil {
 			logger.Warn("frame parse error", "err", err)
 			return 0, err
+		}
+
+		// Authorization check
+		if b.authz != nil {
+			var requiredPerm authz.Permission
+			switch frame.Command {
+			case protocol.CmdPublish:
+				requiredPerm = authz.PermPublish
+			case protocol.CmdSubscribe:
+				requiredPerm = authz.PermSubscribe
+			}
+			if requiredPerm != authz.PermNone {
+				topicBytes := extractTopicBytes(frame.Payload)
+				if !b.authz.Allowed(clientIDHash, topicBytes, requiredPerm) {
+					metrics.AuthzDenied.WithLabelValues(clientIDStr, string(topicBytes)).Inc()
+					return 0, errUnauthorized
+				}
+			}
 		}
 
 		// Append-Only Logging for CmdPublish
@@ -318,7 +370,10 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 		resp, err := h(jig, frame)
 		if err != nil {
 			logger.Warn("handler error", "cmd", frame.Command, "err", err)
+			consumed += totalLen
+			continue
 		}
+
 		if resp != nil {
 			b.sendResponse(stream, frame.StreamID, resp)
 		}
@@ -326,12 +381,10 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 		consumed += totalLen
 	}
 
-	// Move unconsumed bytes to the front of the buffer.
 	n := copy(buf, buf[consumed:off])
 	return n, nil
 }
 
-// sendResponse writes a response frame back to the stream.
 func (b *Broker) sendResponse(stream *quic.Stream, streamID uint32, payload []byte) {
 	if stream == nil {
 		return
@@ -341,6 +394,27 @@ func (b *Broker) sendResponse(stream *quic.Stream, streamID uint32, payload []by
 	if _, err := stream.Write(*buf); err != nil {
 		b.logger.Warn("send response error", "stream_id", streamID, "err", err)
 	}
+}
+
+func extractTopicBytes(payload []byte) []byte {
+	if len(payload) >= 6 && string(payload[:6]) == "topic:" {
+		return payload[6:]
+	}
+	return payload
+}
+
+// Close initiates a graceful shutdown of the Broker.
+func (b *Broker) Close() error {
+	if b.stopped.Swap(true) {
+		return nil
+	}
+	if b.cancel != nil {
+		b.cancel()
+	}
+	if b.listener != nil {
+		return b.listener.Close()
+	}
+	return nil
 }
 
 // Shutdown gracefully drains active connections and goroutines.
@@ -378,6 +452,7 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 		b.logger.Info("shutdown complete")
 	case <-ctx.Done():
 		b.logger.Warn("shutdown forced", "err", ctx.Err())
+		return ctx.Err()
 	}
 
 	return closeErr
