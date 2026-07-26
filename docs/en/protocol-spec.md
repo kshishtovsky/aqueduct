@@ -1,4 +1,4 @@
-# Reference: Binary Protocol Specification (v1.5.0)
+# Reference: Binary Protocol Specification (v1.6.0)
 
 This document provides the formal technical specification for Aqueduct's zero-copy binary wire protocol.
 
@@ -39,6 +39,7 @@ Aqueduct uses a flat 10-byte binary header followed by an arbitrary payload byte
 | `0x01` | `CmdPublish` | Publish message to topic | `[ttl:<ms>:]<topic_name>` or raw message |
 | `0x02` | `CmdSubscribe` | Subscribe QUIC stream to topic | `topic:<topic_name>` (supports `+` and `#` wildcards) |
 | `0x03` | `CmdUnsubscribe`| Unsubscribe stream from topic | `topic:<topic_name>` |
+| `0x04` | `CmdPublishBatch` | Publish batch of sub-frames atomically | Flat array of standard frames `[Magic][Cmd][StreamID][Len][Payload]...` |
 
 ### MeshForwarded Bit (Bit 7)
 

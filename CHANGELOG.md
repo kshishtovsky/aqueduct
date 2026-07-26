@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-07-26
+
+### Added
+- **Zero-Copy Protocol Batching (`CmdPublishBatch`)**: New `0x04` command opcode for batch-publishing multiple frames in a single QUIC stream write. Zero-copy batch unpacking via `unsafe.Slice` with pointer arithmetic — sub-frames point directly into the parent batch buffer with no copying.
+- **Nested Reference Counting**: `MessageRef` now supports a parent-child hierarchy. Child refs share the parent batch buffer's lifetime via cascading `Release()` (child → parent → pool return). All ref operations are `atomic.Int32`, zero locks on hot path.
+- **Coalesced Subscriber Writer**: `runSubscriberWriter` now accumulates outgoing frames and flushes them as a batch (configurable 64 KB threshold or 50 µs micro-timer, whichever comes first). Zero allocations after initial construction.
+- **Configurable Batch Settings**: `batch_size` and `flush_interval` in config (`config.yaml`) with env overrides `AQUEDUCT_BROKER_BATCH_SIZE` and `AQUEDUCT_BROKER_FLUSH_INTERVAL`.
+- **Router Batch Dispatch**: `Router.PublishBatch()` iterates batch sub-frames, resolves topic for each, creates child `MessageRef`s, and dispatches to local subscribers.
+- **Transport Batch Dispatch**: `dispatchFrames` handles `CmdPublishBatch` with full authz and AAL logging support.
+
+### Performance
+- `BenchmarkBatchUnpack` (1000 frames): **0 allocs/op**, ~19.9 GB/s throughput, ~3700 ns/op (3.7 ns/frame)
+- `BenchmarkBatchPublish` (100 msg): **0 allocs/op**, ~921 MB/s, **6.67M msg/s** (22x above 300k RPS target)
+- `BenchmarkPublishSingleVsBatch`: batch coalescing achieves ~150 ns/msg vs ~920 ns/msg for individual writes
+
+### Security
+- Fuzz test `FuzzParseBatch` (2.3M execs in 10s): 0 crashes, 0 panics
+- Strict OOB validation in `ParseBatchFrame` before any unsafe slice operation
+
 ## [1.5.0] - 2026-07-26
 
 ### Added
