@@ -43,6 +43,12 @@
       "skillPath": "skills/golang-security/SKILL.md",
       "computedHash": "ec7a8da21c7ca213783cc1631c3496c841209ba92fdf8155c1c9e45dfee38c94"
     },
+    "security-best-practices": {
+      "source": "openai/skills",
+      "sourceType": "github",
+      "skillPath": "skills/.curated/security-best-practices/SKILL.md",
+      "computedHash": "c27616fb4e27999605b90b261dc729784420c8d77bd1a98748384ffaa5b35704"
+    },
     "security-review": {
       "source": "getsentry/skills",
       "sourceType": "github",

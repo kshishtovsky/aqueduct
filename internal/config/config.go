@@ -25,6 +25,7 @@ type TLSConfig struct {
 	CertFile          string `yaml:"cert_file"`
 	KeyFile           string `yaml:"key_file"`
 	RequireClientCert bool   `yaml:"require_client_cert"`
+	ClientCAFile      string `yaml:"client_ca_file"`
 }
 
 // AALConfig defines Append-Only Logging and encryption settings.
@@ -119,6 +120,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_TLS_REQUIRE_CLIENT_CERT"); v != "" {
 		cfg.TLS.RequireClientCert = parseBool(v, cfg.TLS.RequireClientCert)
+	}
+	if v := os.Getenv("AQUEDUCT_TLS_CLIENT_CA_FILE"); v != "" {
+		cfg.TLS.ClientCAFile = v
 	}
 	if v := os.Getenv("AQUEDUCT_AAL_ENABLED"); v != "" {
 		cfg.AAL.Enabled = parseBool(v, cfg.AAL.Enabled)
