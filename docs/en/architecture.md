@@ -1,4 +1,4 @@
-# Explanation: Architecture & Memory Model (v1.8.0)
+# Explanation: Architecture & Memory Model (v1.11.0)
 
 This document explains the architectural principles, Data-Oriented Design (DoD) choices, security primitives, and zero-allocation memory strategies underlying Aqueduct's performance.
 
@@ -15,11 +15,11 @@ Aqueduct uses **QUIC** (`quic-go`), offering:
 
 ---
 
-## 2. Structure of Arrays (SoA) Router & Async Fan-Out
+## 2. Structure of Arrays (SoA) Router & Lazy Priority Queues (QoS)
 
 Standard Go implementations store subscribers using maps of pointers: `map[string][]*Subscriber`. This pattern degrades CPU L1/L2 cache performance due to pointer chasing across scattered heap allocations.
 
-Aqueduct implements **Structure of Arrays (SoA)** paired with per-subscriber non-blocking channels and dedicated Writer goroutines:
+Aqueduct implements **Structure of Arrays (SoA)** paired with lazy per-priority ring queues and dedicated Writer goroutines:
 
 ```go
 type Router struct {
@@ -30,17 +30,22 @@ type Router struct {
     streams   []*quic.Stream         // QUIC stream pointers
     topics    []string               // Topic names
     active    []bool                 // Active subscriber flags
-    queues    []chan *MessageRef     // Bounded ring queues per subscriber
+    queues    []*[4]chan *MessageRef // Lazy priority ring queues pointer (0=Highest .. 3=Low)
+    subMus    []*sync.RWMutex        // Per-subscriber RWMutex for lazy queue pool init/cleanup
     cancels   []context.CancelFunc   // Writer goroutine cancellation handles
 
     topicIndex   map[uint64][]int    // FNV-1a topic hash -> parallel slice indices
     wildcardSubs []WildcardSub       // MQTT wildcard patterns (+ and #)
+    queuePool    sync.Pool           // Global pool of chan *MessageRef (queueSize)
 }
 ```
 
-### Cache Locality & Async Fan-Out Benefit
+### Lazy Queue Allocation & Strict Prioritization
 
-During publish operations, the broker iterates sequentially over contiguous memory slices (`queues[idx]`). It pushes pointers non-blockingly into bounded subscriber ring queues in nanoseconds. Dedicated Writer goroutines drain each queue independently, completely isolating slow consumers from publishers.
+1. **Lazy Initialization:** Upon subscription, `queues[idx]` contains a pointer `*[4]chan *MessageRef` with all 4 entries `nil`. When a message of priority `P` is published, `enqueueToSubscriber` lazily acquires a channel from `r.queuePool` (`0 allocs/op`) under `subMus[idx]`.
+2. **Strict Priority Sending:** Dedicated Writer goroutines call `fetchNextMessage`, which polls queues in strict priority order `0 -> 1 -> 2 -> 3`. High priority critical alerts bypass lower priority traffic.
+3. **Per-Priority TTL & Expiration:** Expiration timestamp `expiresAt` is calculated upon enqueueing (using `priority_ttls[P]` if set). On dequeueing, `msgRef.IsExpired(nowNano)` lazily drops expired messages before writing to QUIC streams.
+4. **Memory Recycling:** When `len(q) == 0` upon dequeueing, `cleanupEmptyQueue` returns the channel to `r.queuePool` and resets `queues[idx][P] = nil`. Single-priority subscribers consume memory for 1 queue only.
 
 ---
 

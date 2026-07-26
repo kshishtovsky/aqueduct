@@ -1,4 +1,4 @@
-# 教程: Aqueduct 入门指南 (v1.8.0)
+# 教程: Aqueduct 入门指南 (v1.11.0)
 
 本教程指导您如何安装、配置和运行 Aqueduct 消息代理。
 
@@ -59,6 +59,11 @@ broker:
   batch_size: 65536
   flush_interval: 50us
   max_retries: 3
+  priority_ttls:
+    - "500ms"  # 优先级 0 (最高/紧急)
+    - "5s"     # 优先级 1 (高)
+    - "0"      # 优先级 2 (普通)
+    - "0"      # 优先级 3 (低)
   quotas:
     default_publish_rate: 0
     default_burst_size: 1000
@@ -75,16 +80,19 @@ cluster:
 
 ---
 
-## 3. 使用消息 TTL 与通配符
+## 3. QoS 优先级队列、按优先级 TTL 与通配符
+
+### 优先级 TLV 扩展 (`ExtPriority = 0x03`)
+- 支持 `0`（最高/紧急）到 `3`（最低）共 4 个优先级。
+- 紧急消息（优先级 0）在订阅者 Writer 队列中优先发送，超越普通消息。
+
+### 按优先级 TTL (Per-Priority TTL)
+- 通过 `config.yaml` 中的 `priority_ttls` 数组配置。
+- 堆积超过指定 TTL 的旧消息在出队时被自动延迟丢弃 (`0 allocs/op`)。
 
 ### 通配符示例
 - `sensor/+/temp`: 匹配 `sensor/room1/temp` 和 `sensor/room2/temp`。
 - `sensor/#`: 匹配 `sensor/` 下的所有主题。
-
-### 消息 TTL 格式
-发送 TTL 为 500 毫秒的消息:
-- 消息载荷设置为: `"ttl:500:sensor/room1/temp"`
-- 如果队列中的延迟超过 500 毫秒，消息在网络发送前自动丢弃。
 
 ---
 
