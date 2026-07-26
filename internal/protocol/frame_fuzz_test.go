@@ -36,8 +36,49 @@ func FuzzParseFrame(f *testing.F) {
 		if frame.PayloadLen > 0 && len(frame.Payload) != int(frame.PayloadLen) {
 			t.Errorf("Payload length mismatch: PayloadLen=%d, len(Payload)=%d", frame.PayloadLen, len(frame.Payload))
 		}
-		if frame.Command < CmdPublish || frame.Command > CmdAck {
+		if frame.Command < CmdPublish || frame.Command > CmdPublishBatch {
 			t.Errorf("invalid command: %d", frame.Command)
+		}
+	})
+}
+
+func FuzzParseBatch(f *testing.F) {
+	f.Add([]byte{})
+	f.Add(make([]byte, HeaderSize))
+	f.Add(make([]byte, 256))
+
+	// Build a valid batch of 3 frames
+	f1 := SerializeFrame(CmdPublish, 1, []byte("msg1"))
+	f2 := SerializeFrame(CmdPublish, 2, []byte("msg2"))
+	f3 := SerializeFrame(CmdPublish, 3, []byte("msg3"))
+	batch := make([]byte, 0, len(*f1)+len(*f2)+len(*f3))
+	batch = append(batch, *f1...)
+	batch = append(batch, *f2...)
+	batch = append(batch, *f3...)
+	ReleaseBuffer(f1)
+	ReleaseBuffer(f2)
+	ReleaseBuffer(f3)
+	f.Add(batch)
+	f.Add(batch[:HeaderSize+5]) // truncated
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// ParseBatch must NEVER panic regardless of input.
+		frameCount := 0
+		err := ParseBatch(data, func(frame []byte) error {
+			if len(frame) < HeaderSize {
+				t.Errorf("frame slice shorter than header: %d", len(frame))
+			}
+			if frame[0] != MagicByte {
+				t.Errorf("invalid magic byte in frame %d", frameCount)
+			}
+			frameCount++
+			return nil
+		})
+		if err != nil {
+			return // expected for random data
+		}
+		if frameCount == 0 && len(data) > 0 {
+			t.Errorf("ParseBatch returned nil error but parsed 0 frames for %d bytes", len(data))
 		}
 	})
 }
