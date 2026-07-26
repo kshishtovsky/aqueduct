@@ -138,6 +138,10 @@ transport:
 | `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` | `broker.quotas.default_publish_rate` | `100` |
 | `AQUEDUCT_BROKER_DEFAULT_BURST_SIZE` | `broker.quotas.default_burst_size` | `1000` |
 | `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_ENABLED` | `cluster.discovery.enabled` | `true` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_HOST` | `cluster.discovery.host` | `aqueduct-headless.default.svc.cluster.local` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_PORT` | `cluster.discovery.port` | `4242` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL` | `cluster.discovery.interval` | `10s` |
 
 ---
 
@@ -147,6 +151,71 @@ transport:
 - **参考**: [二进制协议规范](docs/zh/protocol-spec.md)
 - **解释**: [架构与内存模型](docs/zh/architecture.md)
 - **指南**: [生产部署与安全](docs/zh/production-deployment.md)
+
+---
+
+## Kubernetes 部署 (Helm)
+
+一条命令部署 3 节点 Aqueduct 集群，启用 DNS 对等发现：
+
+```bash
+helm install aqueduct ./deploy/helm/aqueduct \
+  --namespace aqueduct --create-namespace
+```
+
+### 对等发现工作原理
+
+在 Kubernetes 上部署时，Aqueduct 通过 Headless Service 使用 **DNS 对等发现**：
+
+1. 每个 Pod 获得稳定的 DNS 名称：`aqueduct-0.aqueduct-headless.aqueduct.svc.cluster.local`
+2. Headless Service 返回所有就绪 Pod 的 **A 记录**
+3. 后台协程每 10 秒轮询 DNS（可配置）
+4. 新 Pod（扩容）自动连接，终止的 Pod（缩容）自动移除
+5. 使用 RCU（Read-Copy-Update）原子交换 — 消息转发热路径零锁
+
+### 为什么选择 DNS 而非 K8s API（client-go）
+
+| 方面 | DNS 解析 | client-go |
+| :--- | :--- | :--- |
+| 二进制大小影响 | 0 MB（标准库） | ~40 MB |
+| 外部依赖 | 无 | REST 客户端、protobuf、informers |
+| 动态更新 | 自动（Headless Service） | Watch + label selector |
+| 静态二进制哲学 | 是 | 否 |
+
+### 配置
+
+```yaml
+cluster:
+  discovery:
+    enabled: true
+    type: "dns"
+    host: "aqueduct-headless.aqueduct.svc.cluster.local"
+    port: "4242"
+    interval: "10s"
+```
+
+### 扩缩容
+
+```bash
+# 扩容到 5 个副本
+helm upgrade aqueduct ./deploy/helm/aqueduct --set replicaCount=5
+
+# 缩容到 2 个副本
+helm upgrade aqueduct ./deploy/helm/aqueduct --set replicaCount=2
+```
+
+DNS 发现自动协调 P2P mesh — 无需手动配置。
+
+### 原始 K8s 清单
+
+对于不使用 Helm 的部署，原始清单位于 `deploy/k8s/`：
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/configmap.yaml
+kubectl apply -f deploy/k8s/services.yaml
+kubectl apply -f deploy/k8s/statefulset.yaml
+```
 
 ---
 

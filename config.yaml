@@ -1,4 +1,4 @@
-# Aqueduct Message Broker Configuration (v1.8.0)
+# Aqueduct Message Broker Configuration (v1.9.0)
 
 # UDP listen address for QUIC broker
 listen_addr: ":4242"
@@ -46,6 +46,16 @@ broker:
   quotas:
     default_publish_rate: 0    # default publish rate limit (msg/s), 0 = unlimited
     default_burst_size: 1000   # default burst size
+
+# Cluster Peer Federation & DNS Discovery
+cluster:
+  peers: []                     # Static peer addresses e.g. ["node-b:4242", "node-c:4242"]
+  discovery:
+    enabled: false              # Enable DNS-based peer discovery (Kubernetes Headless Service)
+    type: "dns"                 # Discovery type: "dns" (only option for MVP)
+    host: ""                    # Headless service FQDN e.g. "aqueduct-headless.default.svc.cluster.local"
+    port: "4242"                # Port suffix for resolved IPs (default: extracted from listen_addr)
+    interval: "10s"             # DNS polling interval
 
 # OpenTelemetry Distributed Tracing (experimental, v1.8.0)
 tracing:

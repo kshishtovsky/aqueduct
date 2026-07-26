@@ -38,9 +38,19 @@ type TracingConfig struct {
 	Endpoint    string `yaml:"endpoint"`
 }
 
-// ClusterConfig holds peer addresses for Direct Mesh Federation.
+// ClusterConfig holds peer addresses and discovery settings for Direct Mesh Federation.
 type ClusterConfig struct {
-	Peers []string `yaml:"peers"` // Peer addresses e.g. ["node-b:4242", "node-c:4242"]
+	Peers     []string        `yaml:"peers"`     // Static peer addresses e.g. ["node-b:4242", "node-c:4242"]
+	Discovery DiscoveryConfig `yaml:"discovery"` // Dynamic peer discovery settings
+}
+
+// DiscoveryConfig defines DNS-based peer discovery for Kubernetes deployments.
+type DiscoveryConfig struct {
+	Enabled  bool   `yaml:"enabled"`  // enable DNS-based peer discovery
+	Type     string `yaml:"type"`     // discovery type: "dns" (only option for MVP)
+	Host     string `yaml:"host"`     // headless service FQDN e.g. "aqueduct-headless.default.svc.cluster.local"
+	Port     string `yaml:"port"`     // port suffix e.g. "4242" (default: extracted from listen_addr)
+	Interval string `yaml:"interval"` // polling interval e.g. "10s" (default: 10s)
 }
 
 // TLSConfig defines TLS certificate and mTLS settings.
@@ -308,6 +318,18 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_TRACING_ENDPOINT"); v != "" {
 		cfg.Tracing.Endpoint = v
+	}
+	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_ENABLED"); v != "" {
+		cfg.Cluster.Discovery.Enabled = parseBool(v, cfg.Cluster.Discovery.Enabled)
+	}
+	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_HOST"); v != "" {
+		cfg.Cluster.Discovery.Host = v
+	}
+	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_PORT"); v != "" {
+		cfg.Cluster.Discovery.Port = v
+	}
+	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL"); v != "" {
+		cfg.Cluster.Discovery.Interval = v
 	}
 }
 
