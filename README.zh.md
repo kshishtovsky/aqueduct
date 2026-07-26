@@ -9,7 +9,7 @@
 Aqueduct 是一个基于 **QUIC**（通过 `quic-go`）使用 Go 语言构建的超高性能、零内存分配消息代理。专为极低延迟（< 1.5 微秒）、零拷贝二进制解析和面向数据设计（DoD）而设计。
 
 > [!IMPORTANT]
-> **生产就绪 (v1.7.0)**
+> **生产就绪 (v1.8.0)**
 > Aqueduct 支持 **mTLS 1.3 传输身份验证**、**零分配 ACL 授权**、**AES-256-GCM 加密日志 (AAL)** 与 **启动状态恢复 (Replay)**、**异步 Fan-Out 与慢消费者隔离**、**消息 TTL**、**MQTT 通配符主题路由**、**直连网状集群 (P2P Federation)**、**零拷贝协议批处理**、**订阅者写合并**、**NACK 重投** 和 **死信队列 (DLQ)**。
 
 ---
@@ -49,6 +49,88 @@ docker compose up -d
 ```bash
 docker compose down
 ```
+
+## 本地安装和使用
+
+### 通过二进制或 Go 运行
+
+```bash
+# 使用 YAML 配置运行
+go run ./cmd/broker/main.go -config config.yaml
+
+# 使用 CLI 参数覆盖运行
+go run ./cmd/broker/main.go \
+  -config config.yaml \
+  -addr :4242 \
+  -metrics-addr :9090
+```
+
+### 配置 (`config.yaml`)
+
+```yaml
+listen_addr: ":4242"
+metrics_addr: ":9090"
+
+tls:
+  generate: true
+  cert_file: ""
+  key_file: ""
+  require_client_cert: false
+  client_ca_file: ""
+
+aal:
+  enabled: false
+  file_path: ""
+  key: "" # Base64 编码的 32 字节 AES-256-GCM 密钥
+  max_aal_size: 104857600 # 100 MB
+
+acl:
+  enabled: false
+  default: "none"
+  rules:
+    - client: "service-a"
+      topic: "orders"
+      permission: "publish"
+
+broker:
+  queue_size: 1024
+  backpressure_policy: "drop_oldest"
+  batch_size: 65536
+  flush_interval: "50us"
+  max_retries: 3
+  quotas:
+    default_publish_rate: 0
+    default_burst_size: 1000
+
+transport:
+  max_buf_size: 65536
+  read_buf_size: 1024
+```
+
+### 环境变量覆盖
+
+| 环境变量 | 覆盖项 | 示例 |
+| :--- | :--- | :--- |
+| `AQUEDUCT_LISTEN_ADDR` | `listen_addr` | `:4242` |
+| `AQUEDUCT_METRICS_ADDR` | `metrics_addr` | `:9090` |
+| `AQUEDUCT_TLS_GENERATE` | `tls.generate` | `false` |
+| `AQUEDUCT_TLS_CERT_FILE` | `tls.cert_file` | `/etc/certs/cert.pem` |
+| `AQUEDUCT_TLS_KEY_FILE` | `tls.key_file` | `/etc/certs/key.pem` |
+| `AQUEDUCT_TLS_REQUIRE_CLIENT_CERT` | `tls.require_client_cert` | `true` |
+| `AQUEDUCT_TLS_CLIENT_CA_FILE` | `tls.client_ca_file` | `/etc/certs/ca.pem` |
+| `AQUEDUCT_AAL_ENABLED` | `aal.enabled` | `true` |
+| `AQUEDUCT_AAL_FILE_PATH` | `aal.file_path` | `/var/log/aal.log` |
+| `AQUEDUCT_AAL_KEY` | `aal.key` | `base64_encoded_key` |
+| `AQUEDUCT_AAL_MAX_SIZE` | `aal.max_aal_size` | `104857600` |
+| `AQUEDUCT_ACL_ENABLED` | `acl.enabled` | `true` |
+| `AQUEDUCT_BROKER_QUEUE_SIZE` | `broker.queue_size` | `2048` |
+| `AQUEDUCT_BROKER_BACKPRESSURE_POLICY` | `broker.backpressure_policy` | `drop_oldest` |
+| `AQUEDUCT_BROKER_BATCH_SIZE` | `broker.batch_size` | `65536` |
+| `AQUEDUCT_BROKER_FLUSH_INTERVAL` | `broker.flush_interval` | `50us` |
+| `AQUEDUCT_BROKER_MAX_RETRIES` | `broker.max_retries` | `3` |
+| `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` | `broker.quotas.default_publish_rate` | `100` |
+| `AQUEDUCT_BROKER_DEFAULT_BURST_SIZE` | `broker.quotas.default_burst_size` | `1000` |
+| `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
 
 ---
 

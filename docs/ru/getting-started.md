@@ -1,4 +1,4 @@
-# Руководство: Быстрый старт с Aqueduct (v1.5.0)
+# Руководство: Быстрый старт с Aqueduct (v1.8.0)
 
 Это пошаговое руководство поможет вам установить, настроить и запустить мессендж-брокер Aqueduct.
 
@@ -6,7 +6,7 @@
 
 ## Требования
 
-- **Go 1.22+**
+- **Go 1.23+**
 - **Docker & Docker Compose** (опционально)
 
 ---
@@ -56,6 +56,12 @@ acl:
 broker:
   queue_size: 1024
   backpressure_policy: "drop_oldest" # "drop_oldest", "drop_newest" или "disconnect"
+  batch_size: 65536
+  flush_interval: 50us
+  max_retries: 3
+  quotas:
+    default_publish_rate: 0
+    default_burst_size: 1000
 
 transport:
   max_buf_size: 65536
@@ -79,3 +85,9 @@ cluster:
 Публикация сообщения с TTL 500 мс:
 - Укажите payload: `"ttl:500:sensor/room1/temp"`
 - Сообщение дропается при задержке в очереди свыше 500 мс.
+
+---
+
+## 4. NACK и Dead Letter Queue (DLQ)
+
+Подписчики могут отправить NACK (Negative Acknowledgement) для сообщения по смещению с помощью команды `CmdNack` (0x05). Брокер автоматически выполняет повторную доставку (до `max_retries`), после чего сообщение направляется в очередь недоставленных сообщений `__dlq__<topic>`.

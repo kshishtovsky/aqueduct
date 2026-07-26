@@ -1,4 +1,4 @@
-# Explanation: Architecture & Memory Model (v1.6.0)
+# Explanation: Architecture & Memory Model (v1.8.0)
 
 This document explains the architectural principles, Data-Oriented Design (DoD) choices, security primitives, and zero-allocation memory strategies underlying Aqueduct's performance.
 
@@ -50,9 +50,12 @@ To recycle message frame buffers safely into `sync.Pool` without data races or m
 
 ```go
 type MessageRef struct {
-    buf       *[]byte
+    buf       *[]byte    // pooled buffer (parent only)
+    frame     []byte     // zero-copy sub-slice of parent buffer (for batch children)
     ref       atomic.Int32
-    expiresAt int64 // unix nano timestamp, 0 = no expiry
+    expiresAt int64      // unix nano timestamp, 0 = no expiry
+    offset    uint64     // topic offset
+    parent    *MessageRef // parent ref (nil for parents)
 }
 ```
 
@@ -60,6 +63,7 @@ type MessageRef struct {
 - For each target subscriber queue, `Retain()` increments `ref`.
 - Publisher and Writer goroutines call `Release()` after dispatching or writing to network sockets.
 - When `ref.Add(-1) == 0`, the buffer is returned to `protocol.ReleaseBuffer` and `MessageRef` to `msgRefPool` (**`0 allocs/op`**).
+- **Nested Reference Counting (v1.6.0)**: Batch messages use a parent-child `MessageRef` hierarchy. A parent wraps the batch buffer with `ref = 1 + frameCount`. Each child is created via `AcquireChildMessageRef()` with a `frame []byte` sub-slice pointing into the parent buffer. On `Release()`, when a child's ref reaches 0 it calls `parent.Release()`. The parent's `buf` lifecycle is managed via `protocol.ReleaseBuffer`.
 
 ---
 
@@ -182,3 +186,113 @@ broker:
 | **BatchUnpack** (1000 frames) | 19.9 GB/s | **0** |
 | **BatchPublish** (100 msgs) | 6.67M msg/s, 921 MB/s | **0** |
 | Single vs Batch (per message) | ~150 ns/msg (batch) vs ~920 ns/msg (single) | **0** |
+
+---
+
+## 8. NACK-Based Redelivery & Dead Letter Queues
+
+Aqueduct v1.7.0 introduces negative acknowledgment (NACK) for reliable message delivery:
+
+### NACK Protocol (`CmdNack`)
+
+- **Opcode**: `0x05` (`CmdNack`)
+- **Payload**: 8-byte uint64 message offset (little-endian)
+- On receipt, the broker looks up the original message by offset and schedules redelivery
+
+### Automatic Redelivery
+
+- Each message has a retry counter tracked internally
+- Default `max_retries`: 3
+- After each NACK, the message is re-queued to the subscriber's channel
+- After `max_retries` exceeded: the message is routed to the Dead Letter Queue
+
+### Per-Subscriber Frame Cache
+
+- Bounded FIFO cache (256 entries) per subscriber
+- Stores offset → topic mappings for O(1) redelivery lookup
+- Prevents memory exhaustion from malicious rapid NACKs
+
+### Dead Letter Queue
+
+- After `max_retries` exhausted, a poison pill is routed to `__dlq__<original_topic>`
+- DLQ subscribers use standard subscribe semantics on the `__dlq__` topic pattern
+
+### Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `aqueduct_messages_nacked_total` | Counter | Total NACKed messages |
+| `aqueduct_messages_dead_lettered_total` | Counter | Total messages routed to DLQ |
+
+### Lock-Free Path
+
+- `NackByStream` routes NACKs via a buffered channel — zero locks on the hot path
+- The per-subscriber channel decouples NACK receipt from redelivery processing
+
+---
+
+## 9. Slab Allocator
+
+Aqueduct v1.8.0 replaces `sync.Pool` for `*[]byte` frame buffers on the hot path with a high-performance slab allocator:
+
+### Design
+
+- **Pre-allocated arenas**: 64 MB contiguous memory regions per size class
+- **Size Classes**: 128B, 256B, 512B, 2KB, 8KB, 32KB
+- **Lock-Free Free-List**: Treiber stack (atomic CAS) for allocation and deallocation
+- **Zero GC Pressure**: Arena memory is never scanned by the Go garbage collector
+
+### Performance
+
+| Metric | Value |
+|--------|-------|
+| Allocation latency | ~15 ns/op (uncontended) |
+| Allocations per op | 0 (pre-allocated) |
+| GC impact | None (arena memory invisible to GC) |
+
+### Integration
+
+- `slab.Allocate(size) → *[]byte` replaces `pool.Get().(*[]byte)`
+- `slab.Deallocate(buf)` replaces `pool.Put(buf)`
+- Fallback to heap allocation for sizes exceeding 32 KB
+
+---
+
+## 10. Per-Tenant Rate Limiting (Token Bucket)
+
+Aqueduct v1.8.0 adds lock-free per-tenant rate limiting using a Token Bucket algorithm:
+
+### Design
+
+- **Lock-Free Token Bucket**: Atomic operations for token consumption and refill
+- **Background Refill**: Dedicated goroutine with a 100ms ticker refills all buckets
+- **Per-Tenant Isolation**: Each client has an independent token bucket
+
+### Performance
+
+| Metric | Value |
+|--------|-------|
+| Uncontended check | 2.1 ns/op |
+| Allocations per op | 0 |
+
+### Configuration
+
+```yaml
+broker:
+  quotas:
+    default_publish_rate: 1000  # messages per second
+    default_burst_size: 100     # burst capacity
+```
+
+Environment variable overrides:
+
+| Variable | Default |
+|----------|---------|
+| `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` | 1000 |
+| `AQUEDUCT_BROKER_DEFAULT_BURST_SIZE` | 100 |
+
+### Integration
+
+- Checked in `Router.Publish()` before message dispatch
+- If rate limited, the message is dropped and the counter is incremented
+- Metrics: `aqueduct_messages_rate_limited_total` (counter)

@@ -12,7 +12,7 @@ Aqueduct uses a flat 10-byte binary header followed by an arbitrary payload byte
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Magic (0x41)  | Command (1B)  |         Stream ID (4B)        |
+| Magic (0x1F)  | Command (1B)  |         Stream ID (4B)        |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 | Stream ID cntd|        Payload Length (4B)                    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -24,7 +24,7 @@ Aqueduct uses a flat 10-byte binary header followed by an arbitrary payload byte
 
 | Offset | Field | Type | Description |
 | :--- | :--- | :--- | :--- |
-| `0` | `Magic` | `uint8` | Protocol identifier. Must be `0x41` ('A'). |
+| `0` | `Magic` | `uint8` | Protocol identifier. Must be `0x1F` (unit separator). |
 | `1` | `Command` | `uint8` | Command opcode (see Command Table below). |
 | `2-5` | `StreamID` | `uint32` | QUIC stream identifier (Little-Endian). |
 | `6-9` | `PayloadLen`| `uint32` | Length $N$ of `Payload Data` in bytes (Little-Endian). |
