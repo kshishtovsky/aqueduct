@@ -1,12 +1,12 @@
-# 参考: 二进制协议规范 (v1.11.0)
+# 参考: 二进制协议规范 (v1.13.0)
 
-本文档提供 Aqueduct 零拷贝二进制线缆协议的技术规范。
+本规范为 Aqueduct Zero-Copy 二进制网络协议的正式技术文档。
 
 ---
 
-## 1. 帧线缆格式
+## 1. 帧网络格式 (Frame Wire Format)
 
-协议使用 10 字节二进制首部，后跟可选 TLV 扩展块和载荷，采用 **Little-Endian** 字节序:
+Aqueduct 使用 10 字节扁平二进制标头，后跟可选 TLV 扩展块与有效载荷字节数组。所有整数均使用 **Little-Endian (小端)** 编码。
 
 ```text
  0                   1                   2                   3
@@ -22,28 +22,35 @@
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-### 首部字段
+### 标头字段
 
 | 偏移 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `0` | `Magic` | `uint8` | 协议魔数 `0x1F` (unit separator)。 |
-| `1` | `Command` | `uint8` | 命令操作码 + 控制位 (第 7 位: MeshForwarded, 第 6 位: HasExtensions)。 |
-| `2-5` | `StreamID` | `uint32` | QUIC 流 ID (Little-Endian)。 |
-| `6-9` | `PayloadLen`| `uint32` | 数据长度 (覆盖 ExtBlock 和 Payload)。 |
+| `0` | `Magic` | `uint8` | 协议标识符。必须为 `0x1F` (Unit Separator)。 |
+| `1` | `Command` | `uint8` | 命令操作码 + 控制位 (Bit 7: MeshForwarded, Bit 6: HasExtensions)。 |
+| `2-5` | `StreamID` | `uint32` | QUIC 流标识符 (Little-Endian)。 |
+| `6-9` | `PayloadLen`| `uint32` | 覆盖 ExtBlock (若 Bit 6 置位) 与 Payload 的数据长度 (Little-Endian)。 |
 | `10..` | `ExtBlock` | `[]byte` | 可选 TLV 扩展块 (当 Command & `0x40` != 0 时存在)。 |
-| `10+Ext..`| `Payload` | `[]byte` | 载荷数据。 |
+| `10+Ext..`| `Payload` | `[]byte` | 原始有效载荷内容。 |
 
 ---
 
 ## 2. 命令操作码与控制位
 
-| 操作码 | 名称 | 说明 | Payload 格式 |
+| 操作码 | 名称 | 说明 | 有效载荷格式 |
 | :--- | :--- | :--- | :--- |
-| `0x01` | `CmdPublish` | 发布消息到主题 | `[ttl:<ms>:]<topic_name>` 或数据 |
-| `0x02` | `CmdSubscribe` | 订阅主题 | `topic:<topic_name>` (支持 `+` 与 `#`) |
-| `0x03` | `CmdUnsubscribe`| 取消订阅 | `topic:<topic_name>` |
-| `0x04` | `CmdPublishBatch` | 批量发布子帧 | 标准帧的扁平数组 `[Magic][Cmd][StreamID][Len][Payload]...` |
-| `0x05` | `CmdNack` | 按消息偏移进行否定确认 | `[offset: 8]` — 8 字节小端 uint64 消息偏移 |
+| `0x01` | `CmdPublish` | 向主题发布消息 | `[ttl:<ms>:]<topic_name>` 或消息体 |
+| `0x02` | `CmdSubscribe` | 订阅主题或 Consumer Group | `topic:<name>[:group:<group_id>][:durable:<client_id>:<offset>]` |
+| `0x03` | `CmdUnsubscribe`| 取消主题订阅 | `topic:<topic_name>` |
+| `0x04` | `CmdPublishBatch` | 原子批量发布子帧 | 标准帧扁平数组 `[Magic][Cmd][StreamID][Len][Payload]...` |
+| `0x05` | `CmdNack` | 按消息偏移量否认确认 | `[offset: 8]` — 8 字节 uint64 Little-Endian 消息偏移量 |
+
+### Consumer Groups 订阅载荷格式 (`v1.13.0`)
+竞争消费者通过在 `CmdSubscribe` 有效载荷中附带 `:group:<group_id>` 加入消费组：
+- **普通消费组订阅**: `topic:orders:group:payment-workers`
+- **持久化消费组订阅**: `topic:orders:group:payment-workers:durable:worker1:0`
+
+每个 Consumer Group 内的消息通过 **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`) 在活跃 Worker 之间实现负载均衡。Group Durable Offset 会在收到 `CmdAck` 时由 Broker 自动同步更新。
 
 ### 控制位（第 6 位与第 7 位）
 

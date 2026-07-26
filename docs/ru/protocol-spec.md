@@ -1,4 +1,4 @@
-# Справочник: Спецификация бинарного протокола (v1.11.0)
+# Справочник: Спецификация бинарного протокола (v1.13.0)
 
 Формальная спецификация zero-copy бинарного сетевого протокола Aqueduct.
 
@@ -40,10 +40,17 @@
 | Код | Название | Описание | Формат Payload |
 | :--- | :--- | :--- | :--- |
 | `0x01` | `CmdPublish` | Публикация сообщения в топик | `[ttl:<ms>:]<topic_name>` или данные |
-| `0x02` | `CmdSubscribe` | Подписка стрима на топик | `topic:<topic_name>` (поддерживаются `+` и `#`) |
+| `0x02` | `CmdSubscribe` | Подписка стрима на топик или Consumer Group | `topic:<name>[:group:<group_id>][:durable:<client_id>:<offset>]` |
 | `0x03` | `CmdUnsubscribe`| Отмена подписки | `topic:<topic_name>` |
 | `0x04` | `CmdPublishBatch` | Пакетная публикация под-фреймов | Плоский массив стандартных фреймов `[Magic][Cmd][StreamID][Len][Payload]...` |
 | `0x05` | `CmdNack` | Отрицательное подтверждение по смещению сообщения | `[offset: 8]` — 8 байт uint64 Little-Endian offset сообщения |
+
+### Синтаксис подписки Consumer Groups (`v1.13.0`)
+Конкурирующие подписчики объединяются в группу, указывая `:group:<group_id>` в полезной нагрузке `CmdSubscribe`:
+- **Обычная подписка в группу**: `topic:orders:group:payment-workers`
+- **Durable-подписка группы**: `topic:orders:group:payment-workers:durable:worker1:0`
+
+Сообщения в топике балансируются между воркерами группы через **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`). Групповые Durable Offset'ы синхронизируются на уровне всей группы при получении `CmdAck`.
 
 ### Управляющие биты (Биты 6 и 7)
 
