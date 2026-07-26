@@ -91,6 +91,32 @@ transport:
 	}
 }
 
+func TestConfigBatchDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Broker.BatchSize != 64*1024 {
+		t.Errorf("expected default BatchSize 65536, got %d", cfg.Broker.BatchSize)
+	}
+	if cfg.Broker.FlushInterval != 50*1000 { // 50µs in nanoseconds
+		t.Errorf("expected default FlushInterval 50µs, got %v", cfg.Broker.FlushInterval)
+	}
+}
+
+func TestConfigBatchEnvOverrides(t *testing.T) {
+	t.Setenv("AQUEDUCT_BROKER_BATCH_SIZE", "131072")
+	t.Setenv("AQUEDUCT_BROKER_FLUSH_INTERVAL", "100us")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.Broker.BatchSize != 131072 {
+		t.Errorf("expected BatchSize 131072, got %d", cfg.Broker.BatchSize)
+	}
+	if cfg.Broker.FlushInterval != 100*1000 { // 100µs
+		t.Errorf("expected FlushInterval 100µs, got %v", cfg.Broker.FlushInterval)
+	}
+}
+
 func TestConfigEnvOverrides(t *testing.T) {
 	t.Setenv("AQUEDUCT_LISTEN_ADDR", ":6262")
 	t.Setenv("AQUEDUCT_METRICS_ADDR", ":9292")
