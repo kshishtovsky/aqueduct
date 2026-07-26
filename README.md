@@ -9,8 +9,8 @@
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
 > [!IMPORTANT]
-> **Production Ready (v1.6.0)**
-> Aqueduct features **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **message TTL**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching** and **coalesced subscriber writes**.
+> **Production Ready (v1.7.0)**
+> Aqueduct features **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **message TTL**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching**, **coalesced subscriber writes**, **NACK-based redelivery** and **Dead Letter Queues**.
 
 ---
 
@@ -31,6 +31,7 @@ Aqueduct is an ultra-high performance, zero-allocation message broker built in G
 - **AAL Replay on Startup**: Restores state before opening the QUIC UDP listener socket, preventing message loss on restart.
 - **AAL File Rotation**: Automatic log compaction when file size exceeds `max_aal_size`.
 - **mTLS & Zero-Allocation ACL**: Dual-side TLS 1.3 authentication and non-commutative FNV-1a composite hash matrix permission engine.
+- **NACK-Based Redelivery & Dead Letter Queues**: `CmdNack` (0x05) opcode with automatic redelivery (up to `max_retries`), bounded per-subscriber frame cache (256 entries FIFO), and poison pill routing to `__dlq__<topic>`.
 - **Prometheus Observability**: Comprehensive metrics (`/metrics`) and ready-to-run Docker Compose stack with Grafana dashboard.
 
 ---
@@ -102,6 +103,7 @@ broker:
   backpressure_policy: "drop_oldest"
   batch_size: 65536
   flush_interval: "50us"
+  max_retries: 3
 
 transport:
   max_buf_size: 65536
@@ -128,6 +130,7 @@ transport:
 | `AQUEDUCT_BROKER_BACKPRESSURE_POLICY` | `broker.backpressure_policy` | `drop_oldest` |
 | `AQUEDUCT_BROKER_BATCH_SIZE` | `broker.batch_size` | `65536` |
 | `AQUEDUCT_BROKER_FLUSH_INTERVAL` | `broker.flush_interval` | `50us` |
+| `AQUEDUCT_BROKER_MAX_RETRIES` | `broker.max_retries` | `3` |
 | `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
 
 ---
