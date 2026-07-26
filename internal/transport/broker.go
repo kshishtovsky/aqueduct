@@ -276,6 +276,11 @@ func runHandleConn(b *Broker, jig context.Context, conn *quic.Conn) {
 			if jig.Err() != nil || errors.Is(err, quic.ErrServerClosed) {
 				return
 			}
+			var appErr *quic.ApplicationError
+			if errors.As(err, &appErr) && appErr.ErrorCode == 0 {
+				b.logger.Debug("client disconnected", "remote", conn.RemoteAddr())
+				return
+			}
 			b.logger.Warn("accept stream error", "remote", conn.RemoteAddr(), "err", err)
 			return
 		}
@@ -489,7 +494,7 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 				continue
 			}
 
-			switch frame.Command {
+			switch protocol.OpcodeOf(frame.Command) {
 			case protocol.CmdSubscribe:
 				if err := b.router.Subscribe(jig, stream, frame); err != nil {
 					logger.Warn("subscribe error", "err", err)
