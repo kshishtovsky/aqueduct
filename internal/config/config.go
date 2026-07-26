@@ -31,9 +31,10 @@ type TLSConfig struct {
 
 // AALConfig defines Append-Only Logging and encryption settings.
 type AALConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	FilePath string `yaml:"file_path"`
-	Key      string `yaml:"key"` // base64 encoded 32-byte key for AES-256-GCM
+	Enabled     bool   `yaml:"enabled"`
+	FilePath    string `yaml:"file_path"`
+	Key         string `yaml:"key"` // base64 encoded 32-byte key for AES-256-GCM
+	MaxFileSize int64  `yaml:"max_aal_size"`
 }
 
 // ACLRuleConfig defines a single client permission rule.
@@ -72,9 +73,10 @@ func Default() *Config {
 			RequireClientCert: false,
 		},
 		AAL: AALConfig{
-			Enabled:  false,
-			FilePath: "",
-			Key:      "",
+			Enabled:     false,
+			FilePath:    "",
+			Key:         "",
+			MaxFileSize: 100 * 1024 * 1024, // 100 MB
 		},
 		ACL: ACLConfig{
 			Enabled: false,
@@ -143,6 +145,11 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_AAL_KEY"); v != "" {
 		cfg.AAL.Key = v
+	}
+	if v := os.Getenv("AQUEDUCT_AAL_MAX_SIZE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			cfg.AAL.MaxFileSize = n
+		}
 	}
 	if v := os.Getenv("AQUEDUCT_ACL_ENABLED"); v != "" {
 		cfg.ACL.Enabled = parseBool(v, cfg.ACL.Enabled)
