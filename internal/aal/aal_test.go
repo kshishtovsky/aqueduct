@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/kshishtovsky/aqueduct/internal/protocol"
 )
 
 func TestAALUnencrypted(t *testing.T) {
@@ -27,8 +29,8 @@ func TestAALUnencrypted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
-	if !bytes.Equal(content, data) {
-		t.Errorf("read %q != expected %q", string(content), string(data))
+	if !bytes.Equal(content[4:], data) {
+		t.Errorf("read %q != expected %q", string(content[4:]), string(data))
 	}
 }
 
@@ -69,6 +71,53 @@ func TestAALEncrypted(t *testing.T) {
 	}
 }
 
+func TestAALReplayAndRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_replay.log")
+	key := []byte("01234567890123456789012345678901")
+
+	l, err := OpenEncrypted(path, key)
+	if err != nil {
+		t.Fatalf("OpenEncrypted failed: %v", err)
+	}
+
+	// Write 100 frames
+	for i := 0; i < 100; i++ {
+		buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i), []byte("test-payload"))
+		if err := l.WriteFrame(*buf); err != nil {
+			t.Fatalf("WriteFrame failed: %v", err)
+		}
+		protocol.ReleaseBuffer(buf)
+	}
+	_ = l.Sync()
+
+	// Replay frames
+	replayedCount := 0
+	readRecords, err := Replay(path, key, func(frameBytes []byte) error {
+		frame, parseErr := protocol.ParseFrame(frameBytes)
+		if parseErr != nil {
+			t.Fatalf("ParseFrame error during replay: %v", parseErr)
+		}
+		if frame.Command == protocol.CmdPublish && string(frame.Payload) == "test-payload" {
+			replayedCount++
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("Replay failed: %v", err)
+	}
+	if readRecords != 100 || replayedCount != 100 {
+		t.Errorf("expected 100 replayed frames, got %d (readRecords=%d)", replayedCount, readRecords)
+	}
+
+	// Test rotation
+	if err := l.Rotate(10, key); err != nil {
+		t.Fatalf("Rotate failed: %v", err)
+	}
+	_ = l.Close()
+}
+
 func TestAALInvalidKeySize(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_badkey.log")
@@ -103,6 +152,9 @@ func TestNilLogOperations(t *testing.T) {
 	}
 	if err := nilLog.Close(); err != nil {
 		t.Errorf("nil log Close expected nil, got %v", err)
+	}
+	if err := nilLog.Rotate(100, nil); err != nil {
+		t.Errorf("nil log Rotate expected nil, got %v", err)
 	}
 }
 

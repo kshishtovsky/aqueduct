@@ -58,6 +58,28 @@ var (
 			Help: "Total number of slow consumers disconnected due to queue overflow",
 		},
 	)
+
+	AALReplayDuration = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "aqueduct_aal_replay_duration_seconds",
+			Help: "Duration of AAL log replay on startup in seconds",
+		},
+	)
+
+	MessagesExpired = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_expired_total",
+			Help: "Total number of messages dropped due to TTL expiry",
+		},
+		[]string{"topic"},
+	)
+
+	AALRotations = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "aqueduct_aal_rotations_total",
+			Help: "Total number of AAL log rotations performed",
+		},
+	)
 )
 
 func init() {
@@ -68,4 +90,7 @@ func init() {
 	prometheus.MustRegister(AuthzDenied)
 	prometheus.MustRegister(MessagesDropped)
 	prometheus.MustRegister(SlowConsumersDisconnected)
+	prometheus.MustRegister(AALReplayDuration)
+	prometheus.MustRegister(MessagesExpired)
+	prometheus.MustRegister(AALRotations)
 }

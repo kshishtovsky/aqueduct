@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
 	"github.com/kshishtovsky/aqueduct/internal/authz"
@@ -42,8 +43,10 @@ type Broker struct {
 	listener *quic.Listener
 	handlers map[protocol.Command]Handler
 	router   *broker.Router
-	aal      *aal.Log
-	authz    *authz.Engine
+	aal     *aal.Log
+	authz   *authz.Engine
+	aalPath string
+	aalKey  []byte
 
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
@@ -85,6 +88,14 @@ func WithAAL(l *aal.Log) Option {
 	return func(b *Broker) { b.aal = l }
 }
 
+// WithAALReplay enables startup state restoration from an AAL log file.
+func WithAALReplay(path string, key []byte) Option {
+	return func(b *Broker) {
+		b.aalPath = path
+		b.aalKey = key
+	}
+}
+
 // WithAuthz enables the zero-allocation ACL authorization engine.
 func WithAuthz(e *authz.Engine) Option {
 	return func(b *Broker) { b.authz = e }
@@ -104,6 +115,32 @@ func New(opts ...Option) *Broker {
 	return b
 }
 
+// ReplayAAL replays all historical CmdPublish frames from AAL into the router before socket bind.
+func (b *Broker) ReplayAAL(ctx context.Context, path string, key []byte) (int, error) {
+	if path == "" {
+		return 0, nil
+	}
+	t0 := time.Now()
+	defer func() {
+		metrics.AALReplayDuration.Set(time.Since(t0).Seconds())
+	}()
+
+	count, err := aal.Replay(path, key, func(frameBytes []byte) error {
+		frame, parseErr := protocol.ParseFrame(frameBytes)
+		if parseErr != nil {
+			return parseErr
+		}
+		if frame.Command == protocol.CmdPublish && b.router != nil {
+			return b.router.Publish(ctx, frame)
+		}
+		return nil
+	})
+	if count > 0 {
+		b.logger.Info("AAL replay completed", "records_replayed", count)
+	}
+	return count, err
+}
+
 // Handle registers a handler for the given command. Must be called before Listen.
 func (b *Broker) Handle(cmd protocol.Command, h Handler) {
 	b.handlers[cmd] = h
@@ -112,6 +149,12 @@ func (b *Broker) Handle(cmd protocol.Command, h Handler) {
 // Listen starts the QUIC listener on the given UDP address with 0-RTT support.
 // tlsConf must contain a valid certificate and set NextProtos.
 func (b *Broker) Listen(ctx context.Context, addr string, tlsConf *tls.Config) error {
+	if b.aalPath != "" {
+		if _, err := b.ReplayAAL(ctx, b.aalPath, b.aalKey); err != nil {
+			b.logger.Warn("AAL replay encountered error", "err", err)
+		}
+	}
+
 	quicConf := &quic.Config{
 		Allow0RTT:          true,
 		MaxIdleTimeout:     defaultMaxIdleTimeout,
