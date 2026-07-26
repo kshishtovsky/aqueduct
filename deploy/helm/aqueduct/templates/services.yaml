@@ -1,0 +1,43 @@
+{{- if .Values.headlessService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aqueduct.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aqueduct.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "aqueduct.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: quic
+      port: {{ .Values.service.quicPort }}
+      targetPort: quic
+      protocol: UDP
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aqueduct.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aqueduct.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "aqueduct.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: quic
+      port: {{ .Values.service.quicPort }}
+      targetPort: quic
+      protocol: UDP
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP

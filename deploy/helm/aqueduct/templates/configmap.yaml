@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aqueduct.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aqueduct.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    listen_addr: {{ .Values.config.listenAddr | quote }}
+    metrics_addr: {{ .Values.config.metricsAddr | quote }}
+
+    tls:
+      generate: {{ .Values.config.tls.generate }}
+      require_client_cert: {{ .Values.config.tls.requireClientCert }}
+
+    aal:
+      enabled: false
+
+    acl:
+      enabled: false
+      default: "none"
+
+    broker:
+      queue_size: {{ .Values.config.broker.queueSize }}
+      backpressure_policy: {{ .Values.config.broker.backpressurePolicy | quote }}
+      batch_size: {{ .Values.config.broker.batchSize }}
+      flush_interval: {{ .Values.config.broker.flushInterval | quote }}
+      max_retries: {{ .Values.config.broker.maxRetries }}
+      priority_ttls: ["500ms", "5s", "0", "0"]
+      quotas:
+        default_publish_rate: 0
+        default_burst_size: 1000
+
+    cluster:
+      peers: {{ .Values.config.cluster.peers | toJson }}
+      discovery:
+        enabled: {{ .Values.config.cluster.discovery.enabled }}
+        type: {{ .Values.config.cluster.discovery.type | quote }}
+        {{- if .Values.config.cluster.discovery.host }}
+        host: {{ .Values.config.cluster.discovery.host | quote }}
+        {{- else }}
+        host: {{ include "aqueduct.headlessFQDN" . | quote }}
+        {{- end }}
+        port: {{ .Values.config.cluster.discovery.port | quote }}
+        interval: {{ .Values.config.cluster.discovery.interval | quote }}
+
+    transport:
+      max_buf_size: 65536
+      read_buf_size: 1024
+
+    tracing:
+      enabled: {{ .Values.config.tracing.enabled }}
+      service_name: {{ .Values.config.tracing.serviceName | quote }}
+      endpoint: {{ .Values.config.tracing.endpoint | quote }}

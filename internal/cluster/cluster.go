@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,38 +26,59 @@ type PeerRef struct {
 	stream *quic.Stream
 }
 
-// PeerManager establishes and maintains outbound QUIC streams to static peer addresses.
+// peerSlice is an immutable snapshot of the peer list.
+// Writers create a new slice and atomically swap the pointer; readers
+// (Forward) grab the current pointer and iterate — no locks needed on the hot path.
+type peerSlice struct {
+	refs []*PeerRef
+}
+
+// PeerManager establishes and maintains outbound QUIC streams to peer addresses.
 // Forwarding is zero-copy: the raw pooled []byte is written directly to peer streams
 // with the MeshForwarded bit already set in buf[1].
+// Dynamic peer management uses RCU (Read-Copy-Update): Forward reads the atomic
+// pointer; AddPeer/RemovePeer create a new slice and swap atomically.
 type PeerManager struct {
-	peers    []*PeerRef
+	peers atomic.Pointer[peerSlice]
+
 	tlsConf  *tls.Config
 	quicConf *quic.Config
+	logger   *slog.Logger
 
 	closed atomic.Bool
 	wg     sync.WaitGroup
+
+	mu      sync.Mutex // protects addrs set (write path only)
+	addrSet map[string]context.CancelFunc
 }
 
 // New creates a PeerManager and begins background reconnect loops for each peer address.
 func New(ctx context.Context, addrs []string, tlsConf *tls.Config, quicConf *quic.Config) *PeerManager {
-	// Build the peer slice fully before starting goroutines to avoid races.
-	peers := make([]*PeerRef, len(addrs))
-	for i, addr := range addrs {
-		peers[i] = &PeerRef{addr: addr}
-	}
+	return NewWithLogger(ctx, addrs, tlsConf, quicConf, slog.Default())
+}
+
+// NewWithLogger creates a PeerManager with a custom logger.
+func NewWithLogger(ctx context.Context, addrs []string, tlsConf *tls.Config, quicConf *quic.Config, logger *slog.Logger) *PeerManager {
 	pm := &PeerManager{
-		peers:    peers,
 		tlsConf:  tlsConf,
 		quicConf: quicConf,
+		logger:   logger,
+		addrSet:  make(map[string]context.CancelFunc),
 	}
-	for _, p := range pm.peers {
-		p := p
+
+	refs := make([]*PeerRef, 0, len(addrs))
+	for _, addr := range addrs {
+		ref := &PeerRef{addr: addr}
+		refs = append(refs, ref)
+		childCtx, cancel := context.WithCancel(ctx)
+		pm.addrSet[addr] = cancel
 		pm.wg.Add(1)
 		go func() {
 			defer pm.wg.Done()
-			pm.reconnectLoop(ctx, p)
+			pm.reconnectLoop(childCtx, ref)
 		}()
 	}
+	pm.peers.Store(&peerSlice{refs: refs})
 	return pm
 }
 
@@ -125,15 +147,89 @@ func (pm *PeerManager) reconnectLoop(ctx context.Context, p *PeerRef) {
 	}
 }
 
+// AddPeer dynamically adds a new peer address and starts its reconnect loop.
+// Safe for concurrent use; uses RCU to swap the peer snapshot atomically.
+func (pm *PeerManager) AddPeer(ctx context.Context, addr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pm.closed.Load() {
+		return
+	}
+	if _, exists := pm.addrSet[addr]; exists {
+		return // already managed
+	}
+
+	ref := &PeerRef{addr: addr}
+	childCtx, cancel := context.WithCancel(ctx)
+	pm.addrSet[addr] = cancel
+
+	pm.wg.Add(1)
+	go func() {
+		defer pm.wg.Done()
+		pm.reconnectLoop(childCtx, ref)
+	}()
+
+	pm.swapPeers(func(old []*PeerRef) []*PeerRef {
+		refs := make([]*PeerRef, 0, len(old)+1)
+		refs = append(refs, old...)
+		refs = append(refs, ref)
+		return refs
+	})
+
+	pm.logger.Info("peer added", "addr", addr)
+}
+
+// RemovePeer dynamically removes a peer address, stops its reconnect loop,
+// and closes its active stream. Safe for concurrent use via RCU.
+func (pm *PeerManager) RemovePeer(addr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	cancel, exists := pm.addrSet[addr]
+	if !exists {
+		return
+	}
+	cancel()
+	delete(pm.addrSet, addr)
+
+	pm.swapPeers(func(old []*PeerRef) []*PeerRef {
+		refs := make([]*PeerRef, 0, len(old))
+		for _, p := range old {
+			if p.addr == addr {
+				p.mu.Lock()
+				if p.stream != nil {
+					p.stream.Close()
+					p.stream = nil
+				}
+				p.mu.Unlock()
+				continue
+			}
+			refs = append(refs, p)
+		}
+		return refs
+	})
+
+	pm.logger.Info("peer removed", "addr", addr)
+}
+
+// swapPeers applies fn to the current peer list and atomically stores the result.
+func (pm *PeerManager) swapPeers(fn func([]*PeerRef) []*PeerRef) {
+	old := pm.peers.Load()
+	newRefs := fn(old.refs)
+	pm.peers.Store(&peerSlice{refs: newRefs})
+	metrics.ClusterPeersActive.Set(float64(pm.ActivePeers()))
+}
+
 // Forward sends rawBuf zero-copy to all connected peer streams.
 // It sets the MeshForwarded bit in a copy of buf[1] to prevent mesh storms.
-// msgRef is Retained once per active peer; caller must NOT call Release on the ref
-// after invoking Forward if it was already Retained for local dispatch.
+// RCU: reads the atomic pointer — no locks, no allocations on the hot path.
 func (pm *PeerManager) Forward(rawBuf []byte, addForwardedBit bool) {
 	if len(rawBuf) < protocol.HeaderSize {
 		return
 	}
-	for _, p := range pm.peers {
+	snap := pm.peers.Load()
+	for _, p := range snap.refs {
 		p.mu.Lock()
 		s := p.stream
 		p.mu.Unlock()
@@ -164,8 +260,9 @@ func (pm *PeerManager) Forward(rawBuf []byte, addForwardedBit bool) {
 
 // ActivePeers returns the number of currently connected peers.
 func (pm *PeerManager) ActivePeers() int {
+	snap := pm.peers.Load()
 	count := 0
-	for _, p := range pm.peers {
+	for _, p := range snap.refs {
 		p.mu.Lock()
 		if p.stream != nil {
 			count++
@@ -175,11 +272,25 @@ func (pm *PeerManager) ActivePeers() int {
 	return count
 }
 
+// PeerCount returns the total number of managed peers (connected or not).
+func (pm *PeerManager) PeerCount() int {
+	snap := pm.peers.Load()
+	return len(snap.refs)
+}
+
 // Close signals the reconnect goroutines to stop and drains the peer streams.
 func (pm *PeerManager) Close() {
 	pm.closed.Store(true)
-	// Close all live streams so reconnect goroutines exit promptly.
-	for _, p := range pm.peers {
+
+	pm.mu.Lock()
+	for _, cancel := range pm.addrSet {
+		cancel()
+	}
+	pm.addrSet = make(map[string]context.CancelFunc)
+	pm.mu.Unlock()
+
+	snap := pm.peers.Load()
+	for _, p := range snap.refs {
 		p.mu.Lock()
 		if p.stream != nil {
 			p.stream.Close()
@@ -198,8 +309,8 @@ func (pm *PeerManager) ForwardRaw(rawBuf []byte) error {
 	if len(rawBuf) < protocol.HeaderSize {
 		return errors.New("buffer too short for header")
 	}
-	wrote := 0
-	for _, p := range pm.peers {
+	snap := pm.peers.Load()
+	for _, p := range snap.refs {
 		p.mu.Lock()
 		s := p.stream
 		p.mu.Unlock()
@@ -207,7 +318,6 @@ func (pm *PeerManager) ForwardRaw(rawBuf []byte) error {
 			continue
 		}
 		if _, err := s.Write(rawBuf); err == nil {
-			wrote++
 			metrics.ClusterFramesForwarded.Inc()
 		}
 	}

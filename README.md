@@ -152,6 +152,10 @@ transport:
 | `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` | `broker.quotas.default_publish_rate` | `100` |
 | `AQUEDUCT_BROKER_DEFAULT_BURST_SIZE` | `broker.quotas.default_burst_size` | `1000` |
 | `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_ENABLED` | `cluster.discovery.enabled` | `true` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_HOST` | `cluster.discovery.host` | `aqueduct-headless.default.svc.cluster.local` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_PORT` | `cluster.discovery.port` | `4242` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL` | `cluster.discovery.interval` | `10s` |
 
 ---
 
@@ -175,6 +179,77 @@ go run ./cmd/aqueduct-bench/main.go \
 - **Reference**: [Binary Protocol Specification](docs/en/protocol-spec.md)
 - **Explanation**: [Architecture & Memory Model](docs/en/architecture.md)
 - **How-to Guide**: [Production Deployment & Security](docs/en/production-deployment.md)
+
+---
+
+## Kubernetes Deployment (Helm)
+
+Deploy a 3-node Aqueduct cluster with DNS-based peer discovery in one command:
+
+```bash
+helm install aqueduct ./deploy/helm/aqueduct \
+  --namespace aqueduct --create-namespace
+```
+
+### How Peer Discovery Works
+
+When deployed on Kubernetes, Aqueduct uses **DNS-based peer discovery** via the Headless Service:
+
+1. Each pod gets a stable DNS name: `aqueduct-0.aqueduct-headless.aqueduct.svc.cluster.local`
+2. The Headless Service returns **A records** for all ready pods
+3. A background goroutine polls DNS every 10 seconds (configurable)
+4. New pods (scale-up) are automatically connected; terminated pods (scale-down) are removed
+5. Uses RCU (Read-Copy-Update) atomic swap — zero locks on the message forwarding hot path
+
+```
+aqueduct-0 ←→ aqueduct-1 ←→ aqueduct-2
+     ↕              ↕              ↕
+   clients       clients       clients
+```
+
+### Why DNS over K8s API (client-go)
+
+| Aspect | DNS Resolution | client-go |
+| :--- | :--- | :--- |
+| Binary size impact | 0 MB (stdlib) | ~40 MB |
+| External dependencies | None | REST client, protobuf, informers |
+| Dynamic updates | Automatic (Headless Service) | Watch + label selector |
+| Static binary philosophy | Yes | No |
+
+### Configuration
+
+```yaml
+cluster:
+  discovery:
+    enabled: true
+    type: "dns"
+    host: "aqueduct-headless.aqueduct.svc.cluster.local"
+    port: "4242"
+    interval: "10s"
+```
+
+### Scaling
+
+```bash
+# Scale to 5 replicas
+helm upgrade aqueduct ./deploy/helm/aqueduct --set replicaCount=5
+
+# Scale down to 2 replicas
+helm upgrade aqueduct ./deploy/helm/aqueduct --set replicaCount=2
+```
+
+DNS discovery automatically reconciles the peer mesh — no manual configuration needed.
+
+### Raw K8s Manifests
+
+For non-Helm deployments, raw manifests are in `deploy/k8s/`:
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/configmap.yaml
+kubectl apply -f deploy/k8s/services.yaml
+kubectl apply -f deploy/k8s/statefulset.yaml
+```
 
 ---
 

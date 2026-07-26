@@ -1,4 +1,4 @@
-# Руководство: Быстрый старт с Aqueduct (v1.11.0)
+# Руководство: Быстрый старт с Aqueduct (v1.14.0)
 
 Это пошаговое руководство поможет вам установить, настроить и запустить мессендж-брокер Aqueduct.
 
@@ -8,6 +8,7 @@
 
 - **Go 1.23+**
 - **Docker & Docker Compose** (опционально)
+- **Kubernetes 1.28+** с `kubectl` и `helm` (опционально, для K8s развёртывания)
 
 ---
 
@@ -23,7 +24,40 @@ docker compose up -d
 
 ---
 
-## 2. Конфигурация (`config.yaml`)
+## 2. Быстрый старт в Kubernetes (v1.14.0)
+
+Развёртывание 3-репликового кластера с DNS-обнаружением пиров:
+
+```bash
+helm install aqueduct deploy/helm/aqueduct \
+  --set replicaCount=3 \
+  --set config.cluster.discovery.enabled=true \
+  --set config.cluster.discovery.host="aqueduct-headless.default.svc.cluster.local" \
+  --set config.cluster.discovery.port=4242
+```
+
+Проверка кластера:
+
+```bash
+kubectl get pods -l app.kubernetes.io/name=aqueduct
+kubectl logs statefulset/aqueduct --tail=10 -f
+```
+
+Масштабирование:
+
+```bash
+kubectl scale statefulset aqueduct --replicas=5
+```
+
+Raw-манифесты (без Helm):
+
+```bash
+kubectl apply -f deploy/k8s/
+```
+
+---
+
+## 3. Конфигурация (`config.yaml`)
 
 ```yaml
 listen_addr: ":4242"
@@ -80,7 +114,7 @@ cluster:
 
 ---
 
-## 3. Очереди приоритетов (QoS), Per-Priority TTL и Wildcards
+## 4. Очереди приоритетов (QoS), Per-Priority TTL и Wildcards
 
 ### TLV Расширение приоритета (`ExtPriority = 0x03`)
 - Поддерживается 4 уровня приоритета (`0` Наивысший до `3` Низший).
@@ -96,6 +130,6 @@ cluster:
 
 ---
 
-## 4. NACK и Dead Letter Queue (DLQ)
+## 5. NACK и Dead Letter Queue (DLQ)
 
 Подписчики могут отправить NACK (Negative Acknowledgement) для сообщения по смещению с помощью команды `CmdNack` (0x05). Брокер автоматически выполняет повторную доставку (до `max_retries`), после чего сообщение направляется в очередь недоставленных сообщений `__dlq__<topic>`.

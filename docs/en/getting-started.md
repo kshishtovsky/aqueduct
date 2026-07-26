@@ -1,4 +1,4 @@
-# Tutorial: Getting Started with Aqueduct (v1.11.0)
+# Tutorial: Getting Started with Aqueduct (v1.14.0)
 
 This tutorial guides you through installing, configuring, running, and interacting with the Aqueduct message broker.
 
@@ -8,6 +8,7 @@ This tutorial guides you through installing, configuring, running, and interacti
 
 - **Go 1.23+**
 - **Docker & Docker Compose** (optional)
+- **Kubernetes 1.28+** with `kubectl` and `helm` (optional, for K8s deployment)
 
 ---
 
@@ -25,7 +26,40 @@ docker compose up -d
 
 ---
 
-## 2. Configuration (`config.yaml`)
+## 2. Kubernetes Quick Start (v1.14.0)
+
+Deploy a 3-replica cluster with DNS-based peer discovery:
+
+```bash
+helm install aqueduct deploy/helm/aqueduct \
+  --set replicaCount=3 \
+  --set config.cluster.discovery.enabled=true \
+  --set config.cluster.discovery.host="aqueduct-headless.default.svc.cluster.local" \
+  --set config.cluster.discovery.port=4242
+```
+
+Verify the cluster is running:
+
+```bash
+kubectl get pods -l app.kubernetes.io/name=aqueduct
+kubectl logs statefulset/aqueduct --tail=10 -f
+```
+
+Scale up dynamically:
+
+```bash
+kubectl scale statefulset aqueduct --replicas=5
+```
+
+For raw manifests (without Helm):
+
+```bash
+kubectl apply -f deploy/k8s/
+```
+
+---
+
+## 3. Configuration (`config.yaml`)
 
 Create or modify `config.yaml`:
 
@@ -84,7 +118,7 @@ cluster:
 
 ---
 
-## 3. Using QoS Priority Queues, Per-Priority TTL & Wildcards
+## 4. Using QoS Priority Queues, Per-Priority TTL & Wildcards
 
 ### Priority TLV Extension (`ExtPriority = 0x03`)
 - Priority levels range from `0` (Highest/Critical) to `3` (Low/Bulk).
@@ -100,6 +134,6 @@ cluster:
 
 ---
 
-## 4. NACK & Dead Letter Queue (DLQ)
+## 5. NACK & Dead Letter Queue (DLQ)
 
 Subscribers can NACK (Negative Acknowledgement) a message by offset using the `CmdNack` (0x05) opcode. The broker automatically redelivers the message (up to `max_retries`), after which the message is routed to the dead letter queue topic `__dlq__<topic>`.

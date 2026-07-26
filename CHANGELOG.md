@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-07-26
+
+### Added
+- **DNS-Based Peer Discovery**: New `internal/cluster/discovery.go` module polling Headless Service DNS records via `net.LookupHost` (stdlib, 0 additional binary dependencies). Automatic peer addition/removal on DNS record changes with normalized IP diffing. Supports Kubernetes StatefulSet pod discovery patterns.
+- **Dynamic Peer Management (RCU)**: `PeerManager` refactored to use `atomic.Pointer[peerSlice]` for lock-free reads on the hot path (`Forward()`, `PeerCount()`). New `AddPeer(ctx, addr)`, `RemovePeer(addr)`, and `swapPeers(fn)` methods for runtime peer topology changes. Write-path mutex only protects `addrSet` map.
+- **Kubernetes Helm Chart**: New `deploy/helm/aqueduct/` chart with configurable `replicaCount`, `resources`, `persistence`, and `cluster.discovery.*` values. Supports StatefulSet deployment with Headless Service for DNS-based peer discovery.
+- **Kubernetes Raw Manifests**: New `deploy/k8s/` directory with `namespace.yaml`, `configmap.yaml`, `services.yaml` (Headless + Client), and `statefulset.yaml` (with volumeClaimTemplates and health probes).
+- **Injectable Resolver Interface**: `Resolver` interface with `DefaultResolver` wrapper enables DNS mocking in tests without external dependencies.
+
+### Performance & Security
+- `go test -race ./...`: **0 data races** across all packages
+- `TestDiscoveryInitialResolution`: 3 IPs → 3 peers with correct ports, 0 allocs
+- `TestDiscoveryNewPeerAdded` / `TestDiscoveryPeerRemoved`: Dynamic add/remove verified
+- `TestDiscoveryDNSError`: Graceful error handling, peer set preserved
+- `TestDiscoveryNormalizeIPv6`: IPv6 normalization + link-local filtering
+- `TestDiscoveryPollingLoop`: Background ticker triggers re-resolution
+- `TestDiscoveryNoOpWhenSameIPs`: Stable DNS = zero churn
+- Statement coverage: **86.8%** (`internal/cluster`), **100%** on discovery key functions
+
 ## [1.13.0] - 2026-07-26
 
 ### Added
