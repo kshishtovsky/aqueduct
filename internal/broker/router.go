@@ -3,6 +3,7 @@ package broker
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"strconv"
 	"strings"
@@ -190,14 +191,14 @@ type Router struct {
 	mu sync.RWMutex
 
 	// SoA flat arrays — parallel indices refer to the same subscriber.
-	streamIDs []uint32              // stream ID per subscriber slot
-	streams   []*quic.Stream        // QUIC stream pointer per slot
-	topics    []string              // topic name per slot
+	streamIDs []uint32               // stream ID per subscriber slot
+	streams   []*quic.Stream         // QUIC stream pointer per slot
+	topics    []string               // topic name per slot
 	active    []bool                 // true if subscriber slot is live
 	queues    []*[4]chan *MessageRef // per-subscriber 4 priority ring queues pointer (lazy allocated)
 	notifyChs []chan struct{}        // per-subscriber notification handle
-	subMus    []*sync.RWMutex       // per-subscriber RWMutex for lazy queue pool init/cleanup
-	cancels   []context.CancelFunc  // per-subscriber Writer goroutine cancel handle
+	subMus    []*sync.RWMutex        // per-subscriber RWMutex for lazy queue pool init/cleanup
+	cancels   []context.CancelFunc   // per-subscriber Writer goroutine cancel handle
 
 	queuePool sync.Pool // pool of chan *MessageRef of size queueSize
 
@@ -412,7 +413,7 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.runSubscriberWriter(subCtx, stream, spec.Topic, subMu, subQueues, notifyCh, nackCh)
+		r.runSubscriberWriter(subCtx, stream, spec.Topic, spec.GroupID, subMu, subQueues, notifyCh, nackCh)
 	}()
 
 	return nil
@@ -705,7 +706,9 @@ func (r *Router) drainSubscriberQueues(subMu *sync.RWMutex, subQueues *[4]chan *
 
 // runSubscriberWriter drains the subscriber's priority queues, checks TTL expiration lazily,
 // coalesces small messages into batched writes, and releases MessageRef counts upon delivery.
-func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, topic string, subMu *sync.RWMutex, subQueues *[4]chan *MessageRef, notifyCh chan struct{}, nackCh chan uint64) {
+// For consumer group subscribers (groupID != ""), appends 8-byte offset to each frame payload
+// so the subscriber can NACK the correct message.
+func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, topic string, groupID string, subMu *sync.RWMutex, subQueues *[4]chan *MessageRef, notifyCh chan struct{}, nackCh chan uint64) {
 	acc := newBatchAccumulator(r.batchSize, r.flushInterval)
 	defer func() {
 		_ = acc.flush(stream)
@@ -752,10 +755,19 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 		metrics.MessagesNacked.WithLabelValues(topicName).Inc()
 
 		if int(count) < r.maxRetries {
+			// Attach original offset as TLV extension so the retry delivery
+			// preserves it for NACK counter convergence.
+			retryExt := make([]byte, protocol.ExtHeaderLen+protocol.ExtEntryHeader+8)
+			protocol.SetExtTotalLen(retryExt, 0, protocol.ExtEntryHeader+8)
+			retryExt[protocol.ExtHeaderLen] = byte(protocol.ExtRetryOffset)
+			retryExt[protocol.ExtHeaderLen+1] = 8
+			binary.LittleEndian.PutUint64(retryExt[protocol.ExtHeaderLen+2:], nackOffset)
+
 			_ = r.Publish(ctx, protocol.Frame{
 				Command:    protocol.CmdPublish,
 				PayloadLen: uint32(len(topicName)),
 				Payload:    []byte(topicName),
+				Extensions: retryExt,
 			})
 			return
 		}
@@ -790,7 +802,31 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 				continue
 			}
 
-			storeFrame(msgRef.Offset(), topic)
+			// Determine delivery offset: for NACK retry messages, use the original
+			// offset from ExtRetryOffset TLV so the NACK counter converges to max_retries.
+			deliveryOffset := msgRef.Offset()
+			if len(buf) >= protocol.HeaderSize && (protocol.Command(buf[1])&protocol.HasExtensionsBit != 0) {
+				if origVal, ok := protocol.FindExtension(buf[protocol.HeaderSize:], protocol.ExtRetryOffset); ok && len(origVal) >= 8 {
+					deliveryOffset = binary.LittleEndian.Uint64(origVal)
+				}
+			}
+
+			storeFrame(deliveryOffset, topic)
+
+			// For consumer group subscribers, append 8-byte offset to payload so
+			// the subscriber can NACK by the correct offset.
+			if groupID != "" && len(buf) >= protocol.HeaderSize {
+				offset := deliveryOffset
+				dataLen := binary.LittleEndian.Uint32(buf[6:10])
+				oldTotal := protocol.HeaderSize + int(dataLen)
+				if len(buf) >= oldTotal {
+					newBuf := make([]byte, oldTotal+8)
+					copy(newBuf, buf[:oldTotal])
+					binary.LittleEndian.PutUint32(newBuf[6:10], dataLen+8)
+					binary.LittleEndian.PutUint64(newBuf[oldTotal:], offset)
+					buf = newBuf
+				}
+			}
 
 			if len(acc.buf) > 0 && len(acc.buf)+len(buf) > acc.maxSize {
 				if err := acc.flush(stream); err != nil {
@@ -831,6 +867,24 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 		case <-notifyCh:
 		}
 	}
+}
+
+// nextTopicOffset returns the next monotonic offset for a topic, creating the counter if needed.
+// Thread-safe: uses r.mu internally, no lock held on return.
+func (r *Router) nextTopicOffset(topicHash uint64) uint64 {
+	r.mu.RLock()
+	counter, exists := r.topicOffsets[topicHash]
+	r.mu.RUnlock()
+	if !exists {
+		r.mu.Lock()
+		counter, exists = r.topicOffsets[topicHash]
+		if !exists {
+			counter = &atomic.Uint64{}
+			r.topicOffsets[topicHash] = counter
+		}
+		r.mu.Unlock()
+	}
+	return counter.Add(1)
 }
 
 // Publish non-blockingly dispatches a message to all matching subscriber queues (exact & wildcard).
@@ -883,23 +937,7 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 	}
 
 	topicHash := authz.CombineHashes("topic", cleanPayload)
-
-	r.mu.RLock()
-	counter, exists := r.topicOffsets[topicHash]
-	if !exists {
-		r.mu.RUnlock()
-		r.mu.Lock()
-		counter, exists = r.topicOffsets[topicHash]
-		if !exists {
-			counter = &atomic.Uint64{}
-			r.topicOffsets[topicHash] = counter
-		}
-		r.mu.Unlock()
-		r.mu.RLock()
-	}
-	r.mu.RUnlock()
-
-	msgOffset := counter.Add(1)
+	msgOffset := r.nextTopicOffset(topicHash)
 
 	r.mu.RLock()
 	indices := r.topicIndex[topicHash]
@@ -1032,23 +1070,7 @@ func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
 	}
 
 	topicHash := authz.CombineHashes("topic", cleanPayload)
-
-	r.mu.RLock()
-	counter, exists := r.topicOffsets[topicHash]
-	if !exists {
-		r.mu.RUnlock()
-		r.mu.Lock()
-		counter, exists = r.topicOffsets[topicHash]
-		if !exists {
-			counter = &atomic.Uint64{}
-			r.topicOffsets[topicHash] = counter
-		}
-		r.mu.Unlock()
-		r.mu.RLock()
-	}
-	r.mu.RUnlock()
-
-	msgOffset := counter.Add(1)
+	msgOffset := r.nextTopicOffset(topicHash)
 
 	r.mu.RLock()
 	indices := r.topicIndex[topicHash]
@@ -1200,11 +1222,10 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 
 	hasPeers := r.peerForwarder != nil && r.peerForwarder.ActivePeers() > 0
 
-	r.mu.RLock()
 	var inlineDC [4]int
 	disconnectIndices := inlineDC[:0]
 
-	// Parse batch: iterate through sub-frames, find subscribers, and dispatch.
+	// Parse batch: iterate through sub-frames, assign topic offsets, find subscribers, and dispatch.
 	_ = protocol.ParseBatch(frame.Payload, func(subFrame []byte) error {
 		sub, subErr := protocol.ParseFrame(subFrame)
 		if subErr != nil {
@@ -1212,6 +1233,11 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 		}
 		_, subTopic := parseTTL(sub.Payload)
 		subTopicHash := authz.CombineHashes("topic", subTopic)
+
+		// Assign monotonic topic offset for this sub-frame (shared with non-batch Publish).
+		msgOffset := r.nextTopicOffset(subTopicHash)
+
+		r.mu.RLock()
 
 		subIndices := r.topicIndex[subTopicHash]
 		subHasWildcards := false
@@ -1223,6 +1249,7 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 		}
 		subHasGroups := len(r.groups[subTopicHash]) > 0
 		if len(subIndices) == 0 && !subHasWildcards && !subHasGroups {
+			r.mu.RUnlock()
 			return nil
 		}
 
@@ -1233,7 +1260,7 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 			}
 		}
 
-		child := AcquireChildMessageRef(batchMsgRef, subFrame, 0, 0)
+		child := AcquireChildMessageRef(batchMsgRef, subFrame, msgOffset, 0)
 
 		for _, idx := range subIndices {
 			if idx < len(r.active) && r.active[idx] {
@@ -1275,9 +1302,10 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 			}
 		}
 		child.Release()
+
+		r.mu.RUnlock()
 		return nil
 	})
-	r.mu.RUnlock()
 
 	if len(disconnectIndices) > 0 {
 		for _, idx := range disconnectIndices {
