@@ -22,6 +22,7 @@ const (
 	CmdUnsubscribe
 	CmdAck
 	CmdPublishBatch
+	CmdNack
 )
 
 var bufPool = sync.Pool{
@@ -56,7 +57,7 @@ func ParseFrame(buf []byte) (Frame, error) {
 	// Mask off the MeshForwarded bit before opcode validation; preserve it in the Frame.
 	rawCmd := Command(buf[1])
 	cmd := rawCmd & ^MeshForwardedBit
-	if cmd < CmdPublish || cmd > CmdPublishBatch {
+	if cmd < CmdPublish || cmd > CmdNack {
 		return Frame{}, errors.New("unknown command")
 	}
 
@@ -173,7 +174,7 @@ func ParseBatchFrame(buf []byte, offset int) (frame []byte, nextOffset int, err 
 	}
 	cmd := Command(remaining[1])
 	opcode := OpcodeOf(cmd)
-	if opcode < CmdPublish || opcode > CmdAck {
+	if opcode < CmdPublish || opcode > CmdNack {
 		return nil, offset, errors.New("unknown command in batch frame")
 	}
 	payloadLen := binary.LittleEndian.Uint32(remaining[6:10])
