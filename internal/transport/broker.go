@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -401,6 +403,14 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 				}
 				consumed += totalLen
 				continue
+			case protocol.CmdAck:
+				if consumerID, topic, offset, err := parseAckPayload(frame.Payload); err == nil {
+					b.router.AckOffset(consumerID, topic, offset)
+				} else {
+					logger.Warn("ack payload error", "err", err)
+				}
+				consumed += totalLen
+				continue
 			}
 		}
 
@@ -500,4 +510,16 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 	}
 
 	return closeErr
+}
+
+func parseAckPayload(payload []byte) (consumerID, topic string, offset uint64, err error) {
+	str := string(payload)
+	parts := strings.Split(str, ":")
+	if len(parts) >= 6 && parts[0] == "topic" && parts[2] == "consumer" && parts[4] == "offset" {
+		topic = parts[1]
+		consumerID = parts[3]
+		offset, err = strconv.ParseUint(parts[5], 10, 64)
+		return consumerID, topic, offset, err
+	}
+	return "", "", 0, errors.New("invalid ack payload format")
 }
