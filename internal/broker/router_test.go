@@ -12,11 +12,13 @@ import (
 	"math/big"
 	"net"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
+	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/compress"
 	"github.com/kshishtovsky/aqueduct/internal/mem"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
@@ -1994,4 +1996,229 @@ func BenchmarkNackHandling(b *testing.B) {
 	}
 
 	// Must be 0 allocs/op on the NackByStream path (no allocation for the non-blocking channel send)
+}
+
+func TestStarvationPrevention(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil, WithQueueSize(20000))
+	defer router.Close()
+
+	subQueues := &[4]chan *MessageRef{}
+	subMu := &sync.RWMutex{}
+
+	router.mu.Lock()
+	router.streamIDs = append(router.streamIDs, 1)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, "starvation-test")
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, subQueues)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, subMu)
+	router.cancels = append(router.cancels, func() {})
+	topicHash := authz.CombineHashStrings("topic", "starvation-test")
+	router.topicIndex[topicHash] = []int{0}
+	router.mu.Unlock()
+
+	extP3 := protocol.BuildPriorityExtension(protocol.PriorityLow)
+	extP0 := protocol.BuildPriorityExtension(protocol.PriorityHighest)
+	defer protocol.ReleaseExtensions(extP3)
+	defer protocol.ReleaseExtensions(extP0)
+
+	p3Payload := []byte("starvation-test")
+	for i := 0; i < 10000; i++ {
+		_ = router.Publish(ctx, protocol.Frame{
+			Command:    protocol.CmdPublish,
+			PayloadLen: uint32(len(p3Payload)),
+			Payload:    p3Payload,
+			Extensions: extP3,
+		})
+	}
+
+	p0Payload := []byte("starvation-test")
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(p0Payload)),
+		Payload:    p0Payload,
+		Extensions: extP0,
+	})
+
+	msgRef, p := router.fetchNextMessage(subMu, subQueues)
+	if msgRef == nil {
+		t.Fatal("expected message ref")
+	}
+	defer msgRef.Release()
+
+	if p != protocol.PriorityHighest {
+		t.Fatalf("expected priority 0 first, got priority %d", p)
+	}
+}
+
+func TestPerPriorityTTL(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ttls := [4]time.Duration{100 * time.Millisecond, 0, 0, 0}
+	router := NewRouter(nil, WithPriorityTTLs(ttls))
+	defer router.Close()
+
+	subQueues := &[4]chan *MessageRef{}
+	subMu := &sync.RWMutex{}
+
+	router.mu.Lock()
+	router.streamIDs = append(router.streamIDs, 1)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, "ttl-test")
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, subQueues)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, subMu)
+	router.cancels = append(router.cancels, func() {})
+	topicHash := authz.CombineHashStrings("topic", "ttl-test")
+	router.topicIndex[topicHash] = []int{0}
+	router.mu.Unlock()
+
+	extP0 := protocol.BuildPriorityExtension(protocol.PriorityHighest)
+	defer protocol.ReleaseExtensions(extP0)
+
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len("ttl-test")),
+		Payload:    []byte("ttl-test"),
+		Extensions: extP0,
+	})
+
+	time.Sleep(200 * time.Millisecond)
+
+	msgRef, p := router.fetchNextMessage(subMu, subQueues)
+	if msgRef == nil {
+		t.Fatal("expected message ref in queue before expiration check")
+	}
+
+	nowNano := time.Now().UnixNano()
+	if !msgRef.IsExpired(nowNano) {
+		t.Fatal("expected message to be expired after 200ms with 100ms TTL")
+	}
+	msgRef.Release()
+	if p != protocol.PriorityHighest {
+		t.Fatalf("expected priority 0, got %d", p)
+	}
+}
+
+func TestMemoryEfficiencyLazyInit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	router.mu.Lock()
+	for i := 0; i < 1000; i++ {
+		router.streamIDs = append(router.streamIDs, uint32(i+1))
+		router.streams = append(router.streams, nil)
+		router.topics = append(router.topics, "lazy-test")
+		router.active = append(router.active, true)
+		router.queues = append(router.queues, &[4]chan *MessageRef{})
+		router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+		router.subMus = append(router.subMus, &sync.RWMutex{})
+		router.cancels = append(router.cancels, func() {})
+		topicHash := authz.CombineHashStrings("topic", "lazy-test")
+		router.topicIndex[topicHash] = append(router.topicIndex[topicHash], i)
+	}
+	router.mu.Unlock()
+
+	extP2 := protocol.BuildPriorityExtension(protocol.PriorityNormal)
+	defer protocol.ReleaseExtensions(extP2)
+
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len("lazy-test")),
+		Payload:    []byte("lazy-test"),
+		Extensions: extP2,
+	})
+
+	router.mu.RLock()
+	defer router.mu.RUnlock()
+	for i := 0; i < 1000; i++ {
+		router.subMus[i].RLock()
+		q0 := router.queues[i][0]
+		q1 := router.queues[i][1]
+		q2 := router.queues[i][2]
+		q3 := router.queues[i][3]
+		router.subMus[i].RUnlock()
+
+		if q0 != nil || q1 != nil || q3 != nil {
+			t.Fatalf("subscriber %d had non-nil priority queues (q0=%v, q1=%v, q3=%v)", i, q0, q1, q3)
+		}
+		if q2 == nil {
+			t.Fatalf("subscriber %d priority 2 queue was not lazily initialized", i)
+		}
+	}
+}
+
+func BenchmarkPriorityPublish(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ttls := [4]time.Duration{500 * time.Millisecond, 5 * time.Second, 0, 0}
+	router := NewRouter(nil, WithPriorityTTLs(ttls))
+	defer router.Close()
+
+	subQueues := &[4]chan *MessageRef{}
+	subMu := &sync.RWMutex{}
+
+	router.mu.Lock()
+	router.streamIDs = append(router.streamIDs, 1)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, "bench-prio")
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, subQueues)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, subMu)
+	router.cancels = append(router.cancels, func() {})
+	topicHash := authz.CombineHashStrings("topic", "bench-prio")
+	router.topicIndex[topicHash] = []int{0}
+	router.mu.Unlock()
+
+	exts := [4][]byte{
+		protocol.BuildPriorityExtension(0),
+		protocol.BuildPriorityExtension(1),
+		protocol.BuildPriorityExtension(2),
+		protocol.BuildPriorityExtension(3),
+	}
+	defer func() {
+		for _, e := range exts {
+			protocol.ReleaseExtensions(e)
+		}
+	}()
+
+	payload := []byte("bench-prio")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		p := uint8(i % 4)
+		frame := protocol.Frame{
+			Command:    protocol.CmdPublish,
+			PayloadLen: uint32(len(payload)),
+			Payload:    payload,
+			Extensions: exts[p],
+		}
+		_ = router.Publish(ctx, frame)
+
+		subMu.RLock()
+		q := subQueues[p]
+		subMu.RUnlock()
+		if q != nil {
+			select {
+			case msgRef := <-q:
+				if msgRef != nil {
+					msgRef.Release()
+				}
+			default:
+			}
+		}
+	}
 }

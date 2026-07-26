@@ -1,4 +1,4 @@
-# 解释: 架构与内存模型 (v1.8.0)
+# 解释: 架构与内存模型 (v1.11.0)
 
 本文档说明 Aqueduct 的架构设计、面向数据设计 (DoD)、安全机制以及零内存分配策略。
 
@@ -15,9 +15,9 @@ Aqueduct 使用 **QUIC** (`quic-go`):
 
 ---
 
-## 2. Structure of Arrays (SoA) 与异步 Fan-Out
+## 2. Structure of Arrays (SoA) 与延迟优先级队列 (QoS)
 
-Aqueduct 使用 **SoA 数组布局** 与每个订阅者独立非阻塞队列：
+Aqueduct 使用 **SoA 数组布局** 配合延迟绑定的多优先级环形队列：
 
 ```go
 type Router struct {
@@ -28,15 +28,22 @@ type Router struct {
     streams   []*quic.Stream         // QUIC 流指针
     topics    []string               // 主题名称
     active    []bool                 // 激活标志
-    queues    []chan *MessageRef     // 每个订阅者的环形队列
+    queues    []*[4]chan *MessageRef // 延迟绑定的 4 级优先级队列指针 (0=最高 .. 3=最低)
+    subMus    []*sync.RWMutex        // 每个订阅者的 RWMutex
     cancels   []context.CancelFunc   // 协程取消 Handle
 
     topicIndex   map[uint64][]int    // FNV-1a 主题哈希
     wildcardSubs []WildcardSub       // 通配符模式 (+ 和 #)
+    queuePool    sync.Pool           // 全局队列对象池 (queue_size)
 }
 ```
 
-发布消息时，代理以纳秒级速度将 `MessageRef` 入队，独立的 Writer 协程异步发送，彻底隔离慢消费者。
+### 延迟队列分配与严格优先级调度
+
+1. **延迟初始化**: 订阅时 `queues[idx]` 仅包含全 `nil` 的指针。只有当对应优先级 `P` 的消息到达时，`enqueueToSubscriber` 才从 `r.queuePool` 动态获取 Channel (`0 allocs/op`)。
+2. **严格优先级调度**: Writer 协程按 `0 -> 1 -> 2 -> 3` 严格顺序轮询，高优先级紧急消息超越低优先级流量。
+3. **按优先级 TTL**: 根据 `priority_ttls` 强制重写过期时间戳，出队时延迟丢弃过期消息。
+4. **内存自动回收**: 队列清空 (`len(q) == 0`) 时自动归还至 `r.queuePool` 并复位指针。单优先级订阅者仅占用 1 个队列内存。
 
 ---
 

@@ -603,6 +603,32 @@ func TestOpcodeOfStripsHasExtensions(t *testing.T) {
 	}
 }
 
+func TestPriorityExtension(t *testing.T) {
+	// Test DefaultPriority when no extension
+	p, ok := ExtractPriority(nil)
+	if ok || p != DefaultPriority {
+		t.Fatalf("ExtractPriority(nil) = (%d, %v), want (%d, false)", p, ok, DefaultPriority)
+	}
+
+	// Test BuildPriorityExtension and ExtractPriority for levels 0, 1, 2, 3
+	for lvl := uint8(0); lvl <= 3; lvl++ {
+		extBlock := BuildPriorityExtension(lvl)
+		extracted, ok := ExtractPriority(extBlock)
+		if !ok || extracted != lvl {
+			t.Fatalf("ExtractPriority level %d = (%d, %v), want (%d, true)", lvl, extracted, ok, lvl)
+		}
+		ReleaseExtensions(extBlock)
+	}
+
+	// Test invalid priority level (> 3)
+	badExtBlock := BuildPriorityExtension(99)
+	extracted, ok := ExtractPriority(badExtBlock)
+	if ok || extracted != DefaultPriority {
+		t.Fatalf("ExtractPriority invalid = (%d, %v), want (%d, false)", extracted, ok, DefaultPriority)
+	}
+	ReleaseExtensions(badExtBlock)
+}
+
 func BenchmarkParseFrameBackwardCompat(b *testing.B) {
 	payload := make([]byte, 64)
 	bp := SerializeFrame(CmdPublish, 0, payload)
@@ -619,3 +645,4 @@ func BenchmarkParseFrameBackwardCompat(b *testing.B) {
 		}
 	}
 }
+
