@@ -20,7 +20,10 @@ import (
 	"github.com/kshishtovsky/aqueduct/internal/broker"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
+	"github.com/kshishtovsky/aqueduct/internal/tracing"
 	"github.com/quic-go/quic-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -58,6 +61,7 @@ type Broker struct {
 	readBufSize int
 	maxBufSize  int
 
+	tracer *tracing.Tracer
 	logger *slog.Logger
 }
 
@@ -84,6 +88,11 @@ func WithLogger(l *slog.Logger) Option {
 // WithRouter sets the pub/sub router for CmdPublish and CmdSubscribe handling.
 func WithRouter(r *broker.Router) Option {
 	return func(b *Broker) { b.router = r }
+}
+
+// WithTracer sets the OpenTelemetry tracer for distributed tracing.
+func WithTracer(t *tracing.Tracer) Option {
+	return func(b *Broker) { b.tracer = t }
 }
 
 // WithAAL enables Append-Only Logging for CmdPublish frames.
@@ -393,10 +402,45 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 		if b.router != nil {
 			// If the MeshForwarded bit is set, deliver only to local subscribers (no re-forwarding).
 			if protocol.IsForwarded(frame.Command) {
-				if protocol.OpcodeOf(frame.Command) == protocol.CmdPublish {
-					if err := b.router.PublishFromPeer(jig, frame); err != nil {
+				switch protocol.OpcodeOf(frame.Command) {
+				case protocol.CmdPublish:
+					publishCtx := jig
+					endSpan := func() {}
+					if b.tracer != nil && frame.HasExtensions() {
+						traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
+						if ok {
+							publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameForward,
+								traceID, spanID, traceFlags,
+								trace.WithAttributes(
+									attribute.Int("stream_id", int(frame.StreamID)),
+								),
+							)
+							metrics.TracingSpansTotal.Inc()
+						}
+					}
+					if err := b.router.PublishFromPeer(publishCtx, frame); err != nil {
 						logger.Warn("peer publish error", "err", err)
 					}
+					endSpan()
+				case protocol.CmdPublishBatch:
+					publishCtx := jig
+					endSpan := func() {}
+					if b.tracer != nil && frame.HasExtensions() {
+						traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
+						if ok {
+							publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameForward,
+								traceID, spanID, traceFlags,
+								trace.WithAttributes(
+									attribute.Int("stream_id", int(frame.StreamID)),
+									attribute.String("messaging.operation", "batch_publish"),
+								),
+							)
+						}
+					}
+					if err := b.router.PublishBatch(publishCtx, frame); err != nil {
+						logger.Warn("peer batch publish error", "err", err)
+					}
+					endSpan()
 				}
 				consumed += totalLen
 				continue
@@ -410,15 +454,46 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 				consumed += totalLen
 				continue
 			case protocol.CmdPublish:
-				if err := b.router.Publish(jig, frame); err != nil {
+				publishCtx := jig
+				endSpan := func() {}
+				if b.tracer != nil && frame.HasExtensions() {
+					traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
+					if ok {
+						publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameProcess,
+							traceID, spanID, traceFlags,
+							trace.WithAttributes(
+								attribute.Int("stream_id", int(frame.StreamID)),
+							),
+						)
+						metrics.TracingSpansTotal.Inc()
+					}
+				}
+				if err := b.router.Publish(publishCtx, frame); err != nil {
 					b.logger.Warn("publish error", "err", err)
 				}
+				endSpan()
 				consumed += totalLen
 				continue
 			case protocol.CmdPublishBatch:
-				if err := b.router.PublishBatch(jig, frame); err != nil {
+				publishCtx := jig
+				endSpan := func() {}
+				if b.tracer != nil && frame.HasExtensions() {
+					traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
+					if ok {
+						publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameProcess,
+							traceID, spanID, traceFlags,
+							trace.WithAttributes(
+								attribute.Int("stream_id", int(frame.StreamID)),
+								attribute.String("messaging.operation", "batch_publish"),
+							),
+						)
+						metrics.TracingSpansTotal.Inc()
+					}
+				}
+				if err := b.router.PublishBatch(publishCtx, frame); err != nil {
 					b.logger.Warn("batch publish error", "err", err)
 				}
+				endSpan()
 				consumed += totalLen
 				continue
 			case protocol.CmdAck:

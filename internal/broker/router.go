@@ -16,6 +16,8 @@ import (
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/kshishtovsky/aqueduct/internal/quotas"
 	"github.com/quic-go/quic-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const defaultQueueSize = 1024
@@ -625,6 +627,11 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 		return errors.New("payload exceeds maximum frame size")
 	}
 
+	// Add topic attribute to the active tracing span (if any)
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(attribute.String("messaging.destination", string(frame.Payload)))
+	}
+
 	if r.quotaManager != nil && !r.quotaManager.TryAcquire(clientID) {
 		if r.metrics != nil {
 			r.metrics.OnRateLimited(clientID)
@@ -667,8 +674,15 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 		r.metrics.OnPublish(string(cleanPayload))
 	}
 
-	// Create single frame buffer pooled via sync.Pool
-	buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+	// Preserve TLV extensions in the serialized frame for subscriber delivery
+	// and peer forwarding. The original frame byte slice is used when HasExtensions
+	// is true; otherwise, we create a new frame from the clean payload.
+	var buf *[]byte
+	if frame.HasExtensions() {
+		buf = protocol.SerializeFrameWithExtensions(protocol.CmdPublish, 0, frame.Extensions, cleanPayload)
+	} else {
+		buf = protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+	}
 	msgRef := AcquireMessageRef(buf)
 	msgRef.SetExpiresAt(expiresAt)
 	msgRef.SetOffset(msgOffset)
@@ -785,7 +799,12 @@ func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
 		r.metrics.OnPublish(string(cleanPayload))
 	}
 
-	buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+	var buf *[]byte
+	if frame.HasExtensions() {
+		buf = protocol.SerializeFrameWithExtensions(protocol.CmdPublish, 0, frame.Extensions, cleanPayload)
+	} else {
+		buf = protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+	}
 	msgRef := AcquireMessageRef(buf)
 	msgRef.SetExpiresAt(expiresAt)
 	msgRef.SetOffset(msgOffset)
@@ -894,7 +913,13 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 	}
 
 	// Serialize the batch frame into a pooled buffer (parent buffer for all sub-frames).
-	batchBuf := protocol.SerializeFrame(protocol.CmdPublishBatch, 0, frame.Payload)
+	// Preserve extensions so batch-forwarded frames carry TLV context to peers.
+	var batchBuf *[]byte
+	if frame.HasExtensions() {
+		batchBuf = protocol.SerializeFrameWithExtensions(protocol.CmdPublishBatch, 0, frame.Extensions, frame.Payload)
+	} else {
+		batchBuf = protocol.SerializeFrame(protocol.CmdPublishBatch, 0, frame.Payload)
+	}
 	batchMsgRef := AcquireMessageRef(batchBuf)
 
 	hasPeers := r.peerForwarder != nil && r.peerForwarder.ActivePeers() > 0
