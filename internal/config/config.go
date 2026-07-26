@@ -12,15 +12,16 @@ import (
 
 // Config holds the complete configuration for the Aqueduct broker.
 type Config struct {
-	ListenAddr  string          `yaml:"listen_addr"`
-	MetricsAddr string          `yaml:"metrics_addr"`
-	TLS         TLSConfig       `yaml:"tls"`
-	AAL         AALConfig       `yaml:"aal"`
-	ACL         ACLConfig       `yaml:"acl"`
-	Broker      BrokerConfig    `yaml:"broker"`
-	Transport   TransportConfig `yaml:"transport"`
-	Cluster     ClusterConfig   `yaml:"cluster"`
-	Tracing     TracingConfig   `yaml:"tracing"`
+	ListenAddr  string            `yaml:"listen_addr"`
+	MetricsAddr string            `yaml:"metrics_addr"`
+	TLS         TLSConfig         `yaml:"tls"`
+	AAL         AALConfig         `yaml:"aal"`
+	ACL         ACLConfig         `yaml:"acl"`
+	Broker      BrokerConfig      `yaml:"broker"`
+	Transport   TransportConfig   `yaml:"transport"`
+	Cluster     ClusterConfig     `yaml:"cluster"`
+	Tracing     TracingConfig     `yaml:"tracing"`
+	Compression CompressionConfig `yaml:"compression"`
 }
 
 // TracingConfig defines OpenTelemetry tracing settings.
@@ -92,6 +93,14 @@ type BrokerConfig struct {
 	Quotas             QuotasConfig  `yaml:"quotas"`
 }
 
+// CompressionConfig defines payload compression settings for batch forwarding.
+// Only ZSTD is supported. Compression is applied to batches exceeding MinBatchSize.
+type CompressionConfig struct {
+	Enabled      bool `yaml:"enabled"`
+	MinBatchSize int  `yaml:"min_batch_size"` // bytes, default 1024 (1KB)
+	Level        int  `yaml:"level"`          // ZSTD compression level (0=default, 1=fastest, 3=default)
+}
+
 // TransportConfig defines internal buffer limits.
 type TransportConfig struct {
 	MaxBufSize  int `yaml:"max_buf_size"`
@@ -134,6 +143,11 @@ func Default() *Config {
 		Transport: TransportConfig{
 			MaxBufSize:  64 * 1024,
 			ReadBufSize: 1024,
+		},
+		Compression: CompressionConfig{
+			Enabled:      false,
+			MinBatchSize: 1024,
+			Level:        0,
 		},
 		Tracing: TracingConfig{
 			Enabled:     false,
