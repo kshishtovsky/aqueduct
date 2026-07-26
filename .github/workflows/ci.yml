@@ -15,25 +15,36 @@ permissions:
   security-events: write
 
 jobs:
-  lint-and-test:
-    name: Lint & Test
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           check-latest: true
 
-      - name: Run golangci-lint (with report for SonarCloud)
+      - name: Run golangci-lint
         run: |
-          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run --out-format checkstyle > golangci-lint-report.out 2>&1 || true
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run \
+            --out-format checkstyle > golangci-lint-report.out 2>&1 || true
+
+      - name: Upload lint report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: golangci-lint-report.out
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
 
       - name: Run Tests with Race Detector and Coverage
         run: |
@@ -45,6 +56,48 @@ jobs:
           COVERAGE=$(go tool cover -func=coverage_clean.out | grep total: | awk '{print $3}' | sed 's/%//')
           echo "Total Statement Coverage: ${COVERAGE}%"
           awk -v cov="$COVERAGE" 'BEGIN { if (cov < 75.0) { print "Coverage below 75%"; exit 1 } }'
+
+      - name: Run Fuzz Tests (regression mode)
+        continue-on-error: true
+        run: |
+          find internal -name '*_fuzz_test.go' -exec dirname {} \; | sort -u | while read -r pkg; do
+            echo "→ fuzzing $pkg (30s)"
+            go test -fuzz=Fuzz -fuzztime=30s -run='^$' "./$pkg" || true
+          done
+
+      - name: Build Docker Image Check
+        run: |
+          docker build -t aqueduct:ci .
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage_clean.out
+
+  analyze:
+    name: Analyze
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Download lint report
+        uses: actions/download-artifact@v4
+        with:
+          name: lint-report
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
 
       - name: Run gosec (Go Security Scanner)
         continue-on-error: true
@@ -58,20 +111,8 @@ jobs:
           sarif_file: gosec-report.sarif
           category: gosec
 
-      - name: Run Fuzz Tests (regression mode)
-        continue-on-error: true
-        run: |
-          find internal -name '*_fuzz_test.go' -exec dirname {} \; | sort -u | while read -r pkg; do
-            echo "→ fuzzing $pkg (30s)"
-            go test -fuzz=Fuzz -fuzztime=30s -run='^$' "./$pkg" || true
-          done
-
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
-      - name: Build Docker Image Check
-        run: |
-          docker build -t aqueduct:ci .
