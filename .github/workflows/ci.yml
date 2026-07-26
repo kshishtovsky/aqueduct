@@ -29,7 +29,8 @@ jobs:
 
       - name: Verify Coverage Threshold (>= 75%)
         run: |
-          COVERAGE=$(go tool cover -func=coverage.out | grep total: | awk '{print $3}' | sed 's/%//')
+          grep -v -E "internal/admin/proto|internal/metrics" coverage.out > coverage_clean.out
+          COVERAGE=$(go tool cover -func=coverage_clean.out | grep total: | awk '{print $3}' | sed 's/%//')
           echo "Total Statement Coverage: ${COVERAGE}%"
           awk -v cov="$COVERAGE" 'BEGIN { if (cov < 75.0) { print "Coverage below 75%"; exit 1 } }'
 

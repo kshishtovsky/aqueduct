@@ -1,21 +1,35 @@
-# Aqueduct
+<div align="center">
+  <img src="docs/image_readme.png" alt="Aqueduct Banner">
+</div>
 
-[ English | [Русский](README.ru.md) | [中文](README.zh.md) ]
+<div align="center">
 
-[![CI](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml/badge.svg)](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go Reference](https://pkg.go.dev/badge/github.com/kshishtovsky/aqueduct.svg)](https://pkg.go.dev/github.com/kshishtovsky/aqueduct)
+[ 🇬🇧 English | [🇷🇺 Русский](README.ru.md) | [🇨🇳 中文](README.zh.md) ]
+
+# 🌊 Aqueduct
+
+**Ultra-fast, zero-allocation message broker built on Go & QUIC**
+
+[![CI](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml/badge.svg)](https://github.com/kshishtovsky/aqueduct/actions)
+![Go Version](https://img.shields.io/badge/go-1.22%2B-blue)
+![Latency](https://img.shields.io/badge/latency-%3C1.5%C2%B0s-orange)
+![Allocations](https://img.shields.io/badge/allocs-0_B%2Fop-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+</div>
 
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
 > [!IMPORTANT]
-> **Production Ready (v1.11.0)**
-> Aqueduct features **Hard Real-Time Lazy Priority Queues (QoS)**, **Per-Priority TTL**, **Strict Prioritization**, **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **zero-allocation ZSTD payload compression**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching**, **coalesced subscriber writes**, **NACK-based redelivery** and **Dead Letter Queues**.
+> **Production Ready (v1.13.0)**
+> Aqueduct features **Consumer Groups & Lock-Free Atomic Round-Robin Routing**, **gRPC Control Plane (Admin API)** for **lock-free RCU Hot-Reload** of Quotas and ACL rules, **Hard Real-Time Lazy Priority Queues (QoS)**, **Per-Priority TTL**, **Strict Prioritization**, **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **zero-allocation ZSTD payload compression**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching**, **coalesced subscriber writes**, **NACK-based redelivery** and **Dead Letter Queues**.
 
 ---
 
 ## Features
 
+- **Consumer Groups & Atomic Round-Robin Routing**: Competing consumers join named groups (e.g. `topic:orders:group:payment-workers`). Messages published to a topic are load-balanced across active group workers via **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`). Group Durable Offsets persist and recover at the group level across worker failovers.
+- **Dynamic Control Plane (gRPC Admin API)**: Dedicated gRPC Admin server (`:9091`) with mTLS role validation (`admin-*` CN) for lock-free RCU Hot-Reload of client rate quotas and ACL authorization rules without restarting or lock contention.
 - **QUIC Transport Layer**: Multiplexed QUIC connection handling with 0-RTT connection establishment, stream isolation, and amplification protection.
 - **Zero-Copy Binary Protocol**: Flat 10-byte binary header parser (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) with optional TLV extension region using zero-allocation pointer arithmetic.
 - **Lazy Priority Queues (QoS)**: 4 message priority levels (`0` Highest, `1` High, `2` Normal, `3` Low) carried in TLV `ExtPriority` (`0x03`). Subscriber priority queues are lazily acquired from `sync.Pool` on first use (`0 allocs/op`). Single-priority subscribers consume memory for 1 queue only.

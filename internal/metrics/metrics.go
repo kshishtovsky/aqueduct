@@ -154,6 +154,14 @@ var (
 			Help: "Total number of tracing spans created",
 		},
 	)
+
+	AdminRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_admin_requests_total",
+			Help: "Total number of gRPC Admin API requests per method",
+		},
+		[]string{"method"},
+	)
 )
 
 func init() {
@@ -177,4 +185,5 @@ func init() {
 	prometheus.MustRegister(MessagesDeadLettered)
 	prometheus.MustRegister(MessagesRateLimited)
 	prometheus.MustRegister(TracingSpansTotal)
+	prometheus.MustRegister(AdminRequestsTotal)
 }

@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-07-26
+
+### Added
+- **Consumer Groups & Competing Consumers**: Support for competing consumer groups registered via `:group:<group_id>` in `CmdSubscribe` payload (e.g. `topic:orders:group:payment-workers`).
+- **Lock-Free Atomic Round-Robin Routing**: Implemented lock-free O(1) worker selection using `atomic.Pointer[[]int]` for active member snapshots and `atomic.Uint64` for round-robin balancing (`0 allocs/op`, `< 10 ns/op`).
+- **Group-Level Durable Offsets**: Track acknowledged offsets on the group level (`CombineHashStrings(groupID, topic)`). Allows seamless failover across group workers without message duplication or offset drift.
+- **Dual Delivery Support**: Preserves topic fan-out for individual subscribers while delivering exactly one copy per published message to each Consumer Group registered on the topic.
+
+### Performance & Security
+- `BenchmarkGroupRouting`: **0 allocs/op**, **0 B/op** on hot path worker selection.
+- `TestCompetingConsumers`: Verified even round-robin distribution (~1000 msgs across 3 workers out of 3000 published, 0 duplicates).
+- `TestGroupRebalancingAndDurable`: Verified automatic failover and group offset recovery upon worker disconnect/reconnect.
+- `go test -race ./...`: **0 data races**.
+- Statement coverage: **76.7%** (`internal/broker`), **84.9%** (`internal/cluster`).
+
+## [1.12.0] - 2026-07-26
+
+### Added
+- **Dynamic Control Plane (gRPC Admin API)**: Dedicated `internal/admin` package running gRPC Admin server (`:9091`) for dynamic configuration updates without broker restart or message processing interruption.
+- **mTLS Operator Authentication**: Enforces client TLS certificate Common Name (CN) starting with `admin-` (`adminAuthInterceptor`). Unauthorized requests receive `PermissionDenied`.
+- **Lock-Free RCU Quota Management**: `quotas.Manager` uses `atomic.Pointer` for client bucket map updates. `Bucket.rate` uses `atomic.Int64` for zero-lock refill rate adjustments on hot path (`0 allocs/op`, 0 mutexes).
+- **Lock-Free RCU ACL Management**: `authz.Engine` uses `atomic.Pointer` for atomic rule map replacement (`Reload`). `Allowed` checks execute lock-free in ~14.5 ns/op.
+- **Admin Observability**: Counter metric `aqueduct_admin_requests_total{method}` and structured `slog.Info` audit logging for all configuration mutations.
+
+### Performance
+- `BenchmarkACLHotReload` (Rebuilding 10,000 rules): **876 µs/op** (< 1 ms target achieved)
+- `BenchmarkACLCheck` (Lock-Free RCU Hot Path): **14.51 ns/op, 0 allocs/op**
+
+### Security
+- `go test -race ./...`: 0 data races
+- Test coverage on `internal/admin`: **79.2%** (target >= 75%)
+- Strict mTLS client certificate CN validation (`admin-*`)
+
 ## [1.11.0] - 2026-07-26
 
 ### Added

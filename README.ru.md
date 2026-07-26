@@ -1,6 +1,10 @@
+<div align="center">
+  <img src="docs/image_readme.png" alt="Aqueduct Banner">
+</div>
+
 # Aqueduct
 
-[ [English](README.md) | Русский | [中文](README.zh.md) ]
+[ [🇬🇧 English](README.md) | 🇷🇺 Русский | [🇨🇳 中文](README.zh.md) ]
 
 [![CI](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml/badge.svg)](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -9,13 +13,15 @@
 Aqueduct — это сверхвысокопроизводительный брокер сообщений с нулевыми аллокациями памяти на Go поверх **QUIC** (библиотека `quic-go`). Спроектирован для работы с микросекундными задержками (< 1.5 µs), zero-copy бинарным фреймингом и Data-Oriented Design (DoD).
 
 > [!IMPORTANT]
-> **Production Ready (v1.11.0)**
-> Aqueduct поддерживает **Ленивые очереди приоритетов (QoS Hard Real-Time)**, **Per-Priority TTL**, **Строгую приоритизацию**, **двустороннюю аутентификацию mTLS 1.3**, **авторизацию ACL без аллокаций**, **зашифрованный журнал AAL (AES-256-GCM)** с **восстановлением состояния при старте (Replay)**, **асинхронный Fan-Out с изоляцией медленных потребителей**, **ZSTD-сжатие без аллокаций**, **маршрутизацию по Wildcard-топикам MQTT**, **Direct Mesh Clustering**, **протокольный батчинг без копирования**, **коалесцированную запись подписчиков**, **NACK-переотправку** и **Dead Letter Queues**.
+> **Production Ready (v1.13.0)**
+> Aqueduct поддерживает **Consumer Groups & Lock-Free Atomic Round-Robin Routing**, **gRPC Control Plane (Admin API)** для **Lock-Free RCU Hot-Reload** квот и правил ACL, **Ленивые очереди приоритетов (QoS Hard Real-Time)**, **Per-Priority TTL**, **Строгую приоритизацию**, **двустороннюю аутентификацию mTLS 1.3**, **авторизацию ACL без аллокаций**, **зашифрованный журнал AAL (AES-256-GCM)** с **восстановлением состояния при старте (Replay)**, **асинхронный Fan-Out с изоляцией медленных потребителей**, **ZSTD-сжатие без аллокаций**, **маршрутизацию по Wildcard-топикам MQTT**, **Direct Mesh Clustering**, **протокольный батчинг без копирования**, **коалесцированную запись подписчиков**, **NACK-переотправку** и **Dead Letter Queues**.
 
 ---
 
 ## Возможности
 
+- **Consumer Groups & Atomic Round-Robin Routing**: Конкурирующие подписчики (Competing Consumers) объединяются в группы (например `topic:orders:group:payment-workers`). Сообщения балансируются за **`0 allocs/op`** и **`< 10 ns/op`** без мьютексов (`atomic.AddUint64` + modulo). Групповые Durable Offset'ы сохраняются и восстанавливаются на уровне всей группы при фейловере воркеров.
+- **Dynamic Control Plane (gRPC Admin API)**: Выделенный gRPC Admin сервер (`:9091`) с валидацией mTLS ролей (`admin-*` CN) для Lock-Free RCU Hot-Reload квот пользователей и правил авторизации ACL без перезапуска брокера и без блокировок горячего пути.
 - **Транспортный слой QUIC**: Мультиплексирование QUIC с поддержкой 0-RTT, изоляцией стримов и защитой от Amplification атак.
 - **Zero-Copy бинарный протокол**: Плоский 10-байтовый заголовок (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) с опциональным блоком TLV-расширений.
 - **Ленивые очереди приоритетов (QoS)**: 4 уровня приоритета сообщений (`0` Highest, `1` High, `2` Normal, `3` Low) в TLV `ExtPriority` (`0x03`). Очереди инициализируются из `sync.Pool` при первом поступлении (`0 allocs/op`). Подписчик с 1 приоритетом потребляет память только под 1 очередь.
@@ -46,11 +52,13 @@ docker compose up -d
 ```
 
 Проверка статуса:
+
 - **Health check**: `http://localhost:9090/healthz`
 - **Prometheus**: `http://localhost:9091`
 - **Grafana**: `http://localhost:3000` (Логин: `admin` / Пароль: `admin`)
 
 Остановка стека:
+
 ```bash
 docker compose down
 ```
