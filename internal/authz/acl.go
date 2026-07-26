@@ -17,21 +17,35 @@ const (
 	prime64  = 1099511628211
 )
 
-// HashBytes computes the 64-bit FNV-1a hash of a byte slice with zero heap allocation.
-func HashBytes(b []byte) uint64 {
+// CombineHashes computes a non-commutative 64-bit FNV-1a composite hash of clientID and topic.
+// It guarantees zero heap allocations on hot paths and prevents XOR commutativity vulnerabilities
+// (e.g. CombineHashes("A", []byte("B")) != CombineHashes("B", []byte("A"))).
+func CombineHashes(clientID string, topicBytes []byte) uint64 {
 	hash := uint64(offset64)
-	for i := 0; i < len(b); i++ {
-		hash ^= uint64(b[i])
+	for i := 0; i < len(clientID); i++ {
+		hash ^= uint64(clientID[i])
+		hash *= prime64
+	}
+	hash ^= uint64(':')
+	hash *= prime64
+	for i := 0; i < len(topicBytes); i++ {
+		hash ^= uint64(topicBytes[i])
 		hash *= prime64
 	}
 	return hash
 }
 
-// HashString computes the 64-bit FNV-1a hash of a string with zero heap allocation.
-func HashString(s string) uint64 {
+// CombineHashStrings computes a non-commutative 64-bit FNV-1a composite hash of clientID and topic strings.
+func CombineHashStrings(clientID, topic string) uint64 {
 	hash := uint64(offset64)
-	for i := 0; i < len(s); i++ {
-		hash ^= uint64(s[i])
+	for i := 0; i < len(clientID); i++ {
+		hash ^= uint64(clientID[i])
+		hash *= prime64
+	}
+	hash ^= uint64(':')
+	hash *= prime64
+	for i := 0; i < len(topic); i++ {
+		hash ^= uint64(topic[i])
 		hash *= prime64
 	}
 	return hash
@@ -39,7 +53,7 @@ func HashString(s string) uint64 {
 
 // Engine provides lock-free, zero-allocation O(1) permission checks.
 type Engine struct {
-	rules       map[uint64]Permission // key: clientIDHash ^ topicHash -> Permission bitmask
+	rules       map[uint64]Permission // key: CombineHashStrings(clientID, topic) -> Permission bitmask
 	defaultPerm Permission
 }
 
@@ -51,14 +65,13 @@ func NewEngine(rules map[uint64]Permission, defaultPerm Permission) *Engine {
 	}
 }
 
-// Allowed performs a zero-allocation O(1) permission check.
+// Allowed performs a zero-allocation O(1) permission check for a clientID and topic.
 // It executes in under 5 nanoseconds on hot paths.
-func (e *Engine) Allowed(clientIDHash uint64, topicBytes []byte, required Permission) bool {
+func (e *Engine) Allowed(clientID string, topicBytes []byte, required Permission) bool {
 	if e == nil {
 		return true
 	}
-	topicHash := HashBytes(topicBytes)
-	key := clientIDHash ^ topicHash
+	key := CombineHashes(clientID, topicBytes)
 
 	perm, ok := e.rules[key]
 	if !ok {
@@ -83,9 +96,7 @@ func NewBuilder(defaultPerm Permission) *Builder {
 
 // Allow registers permission for a specific clientID and topic.
 func (b *Builder) Allow(clientID, topic string, perm Permission) *Builder {
-	cHash := HashString(clientID)
-	tHash := HashString(topic)
-	key := cHash ^ tHash
+	key := CombineHashStrings(clientID, topic)
 	b.rules[key] |= perm
 	return b
 }

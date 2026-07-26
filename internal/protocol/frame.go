@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/binary"
 	"errors"
 	"sync"
 	"unsafe"
@@ -51,8 +52,8 @@ func ParseFrame(buf []byte) (Frame, error) {
 		return Frame{}, errors.New("unknown command")
 	}
 
-	streamID := *(*uint32)(unsafe.Pointer(&buf[2]))
-	payloadLen := *(*uint32)(unsafe.Pointer(&buf[6]))
+	streamID := binary.LittleEndian.Uint32(buf[2:6])
+	payloadLen := binary.LittleEndian.Uint32(buf[6:10])
 
 	totalLen := HeaderSize + int(payloadLen)
 	if len(buf) < totalLen {
@@ -106,8 +107,8 @@ func SerializeFrame(cmd Command, streamID uint32, payload []byte) *[]byte {
 	b := *bp
 	b[0] = MagicByte
 	b[1] = uint8(cmd)
-	*(*uint32)(unsafe.Pointer(&b[2])) = streamID
-	*(*uint32)(unsafe.Pointer(&b[6])) = payloadLen
+	binary.LittleEndian.PutUint32(b[2:6], streamID)
+	binary.LittleEndian.PutUint32(b[6:10], payloadLen)
 
 	if payloadLen > 0 {
 		copy(b[HeaderSize:], payload)
@@ -129,8 +130,7 @@ func PayloadLen(buf []byte) uint32 {
 	if len(buf) < HeaderSize {
 		return 0
 	}
-	// SAFE: len(buf) >= 10, reading 4 bytes at offset 6 (bytes 6..9).
-	return *(*uint32)(unsafe.Pointer(&buf[6]))
+	return binary.LittleEndian.Uint32(buf[6:10])
 }
 
 func FrameSize(payloadLen uint32) int {
