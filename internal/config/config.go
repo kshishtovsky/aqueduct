@@ -67,6 +67,7 @@ type BrokerConfig struct {
 	BackpressurePolicy string        `yaml:"backpressure_policy"` // "drop_oldest", "drop_newest", "disconnect"
 	BatchSize          int           `yaml:"batch_size"`          // coalesced write threshold in bytes (default 64KB)
 	FlushInterval      time.Duration `yaml:"flush_interval"`      // micro-timer flush interval (default 50µs)
+	MaxRetries         int           `yaml:"max_retries"`         // max NACK retries before DLQ (default 3)
 }
 
 // TransportConfig defines internal buffer limits.
@@ -102,6 +103,7 @@ func Default() *Config {
 			BackpressurePolicy: "drop_oldest",
 			BatchSize:          64 * 1024,             // 64 KB
 			FlushInterval:      50 * time.Microsecond, // 50 µs
+			MaxRetries:         3,                     // 3 NACK retries before DLQ
 		},
 		Transport: TransportConfig{
 			MaxBufSize:  64 * 1024,
@@ -189,6 +191,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_BROKER_FLUSH_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			cfg.Broker.FlushInterval = d
+		}
+	}
+	if v := os.Getenv("AQUEDUCT_BROKER_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Broker.MaxRetries = n
 		}
 	}
 	if v := os.Getenv("AQUEDUCT_TRANSPORT_MAX_BUF_SIZE"); v != "" {

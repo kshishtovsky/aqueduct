@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-07-26
+
+### Added
+- **Negative Acknowledgment (`CmdNack`)**: New `0x05` command opcode allowing subscribers to NACK a message by offset. NACK payload: 8-byte little-endian `MessageOffset`.
+- **Automatic Redelivery**: NACK'd messages are redelivered to the same subscriber up to `max_retries` (default: 3, configurable via `AQUEDUCT_BROKER_MAX_RETRIES`).
+- **Dead Letter Queues (DLQ)**: After `max_retries` exhausted, the message is published to `__dlq__<original_topic>` for offline inspection.
+- **NACK Routing**: `NackByStream(streamID, offset)` routes NACK to the correct subscriber writer goroutine via a buffered channel — zero locks on hot path.
+- **Bounded Frame Cache**: Per-subscriber FIFO cache (256 entries) stores `offset→topic` mappings for NACK → redelivery/DLQ resolution. Evicted oldest-first.
+- **NACK/DLQ Metrics**: `aqueduct_messages_nacked_total` and `aqueduct_messages_dead_lettered_total` counter vecs.
+
+### Performance
+- `BenchmarkNackHandling`: **0 allocs/op** on `NackByStream` hot path (non-blocking channel send).
+
 ## [1.6.0] - 2026-07-26
 
 ### Added

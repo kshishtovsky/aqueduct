@@ -123,6 +123,22 @@ var (
 			Help: "Total number of mesh-forwarded frames received from peer nodes",
 		},
 	)
+
+	MessagesNacked = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_nacked_total",
+			Help: "Total number of messages nacked (negative acknowledged) per topic",
+		},
+		[]string{"topic"},
+	)
+
+	MessagesDeadLettered = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_dead_lettered_total",
+			Help: "Total number of messages moved to DLQ per topic",
+		},
+		[]string{"topic"},
+	)
 )
 
 func init() {
@@ -142,4 +158,6 @@ func init() {
 	prometheus.MustRegister(ClusterPeersActive)
 	prometheus.MustRegister(ClusterFramesForwarded)
 	prometheus.MustRegister(ClusterFramesReceived)
+	prometheus.MustRegister(MessagesNacked)
+	prometheus.MustRegister(MessagesDeadLettered)
 }
