@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	MagicByte       = 0x1F
-	HeaderSize      = 10
+	MagicByte  = 0x1F
+	HeaderSize = 10
 	// MeshForwardedBit is set in the Command byte (bit 7) to mark frames that have
 	// already been forwarded by a peer node. Receivers must NOT re-forward such frames,
 	// preventing mesh broadcast storms. The lower 7 bits remain the command opcode.
@@ -21,6 +21,7 @@ const (
 	CmdSubscribe
 	CmdUnsubscribe
 	CmdAck
+	CmdPublishBatch
 )
 
 var bufPool = sync.Pool{
@@ -55,7 +56,7 @@ func ParseFrame(buf []byte) (Frame, error) {
 	// Mask off the MeshForwarded bit before opcode validation; preserve it in the Frame.
 	rawCmd := Command(buf[1])
 	cmd := rawCmd & ^MeshForwardedBit
-	if cmd < CmdPublish || cmd > CmdAck {
+	if cmd < CmdPublish || cmd > CmdPublishBatch {
 		return Frame{}, errors.New("unknown command")
 	}
 
@@ -157,4 +158,45 @@ func PayloadLen(buf []byte) uint32 {
 
 func FrameSize(payloadLen uint32) int {
 	return HeaderSize + int(payloadLen)
+}
+
+// ParseBatchFrame extracts the next complete frame slice from buf starting at offset.
+// It returns the frame slice (pointing into the original buf), the next offset, and any error.
+// SAFE: All bounds checks are performed before returning the sub-slice.
+func ParseBatchFrame(buf []byte, offset int) (frame []byte, nextOffset int, err error) {
+	remaining := buf[offset:]
+	if len(remaining) < HeaderSize {
+		return nil, offset, errors.New("batch frame too short: header truncated")
+	}
+	if remaining[0] != MagicByte {
+		return nil, offset, errors.New("invalid magic byte in batch frame")
+	}
+	cmd := Command(remaining[1])
+	opcode := OpcodeOf(cmd)
+	if opcode < CmdPublish || opcode > CmdAck {
+		return nil, offset, errors.New("unknown command in batch frame")
+	}
+	payloadLen := binary.LittleEndian.Uint32(remaining[6:10])
+	totalLen := HeaderSize + int(payloadLen)
+	if len(remaining) < totalLen {
+		return nil, offset, errors.New("batch frame truncated: payload exceeds remaining buffer")
+	}
+	return buf[offset : offset+totalLen], offset + totalLen, nil
+}
+
+// ParseBatch iterates over a batch payload and calls fn for each complete frame.
+// The frame slice passed to fn points into the original batch buffer (zero-copy).
+func ParseBatch(batchBuf []byte, fn func(frame []byte) error) error {
+	offset := 0
+	for offset < len(batchBuf) {
+		frame, nextOffset, err := ParseBatchFrame(batchBuf, offset)
+		if err != nil {
+			return err
+		}
+		if err := fn(frame); err != nil {
+			return err
+		}
+		offset = nextOffset
+	}
+	return nil
 }

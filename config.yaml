@@ -37,6 +37,8 @@ acl:
 broker:
   queue_size: 1024               # Per-subscriber ring queue capacity
   backpressure_policy: "drop_oldest" # "drop_oldest", "drop_newest", or "disconnect"
+  batch_size: 65536              # Coalesced write batch size in bytes (default 64 KB)
+  flush_interval: 50us           # Micro-timer flush interval (default 50 µs)
 
 # Transport & Memory Hardening Limits
 transport:
