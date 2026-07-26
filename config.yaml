@@ -13,6 +13,7 @@ tls:
   cert_file: ""
   key_file: ""
   require_client_cert: false
+  client_ca_file: "" # Path to PEM-encoded Client CA certificate for mTLS
 
 # Encrypted Append-Only Logging (AAL) Configuration
 aal:
