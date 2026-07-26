@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,7 @@ var (
 )
 
 // Log represents a zero-allocation Append-Only Log writer.
-// All published frames are appended directly to disk in raw or AES-256-GCM encrypted format.
+// All published frames are appended directly to disk in length-prefixed raw or AES-256-GCM encrypted format.
 type Log struct {
 	mu     sync.Mutex
 	file   *os.File
@@ -47,7 +48,7 @@ func OpenEncrypted(path string, key []byte) (*Log, error) {
 		file: file,
 		pool: sync.Pool{
 			New: func() any {
-				b := make([]byte, 12+65536)
+				b := make([]byte, 16+65536)
 				return &b
 			},
 		},
@@ -78,7 +79,7 @@ func OpenEncrypted(path string, key []byte) (*Log, error) {
 	return l, nil
 }
 
-// WriteFrame writes raw or encrypted frame bytes directly to storage media.
+// WriteFrame writes length-prefixed raw or encrypted frame bytes directly to storage media.
 // It is safe for concurrent access and performs zero heap allocations.
 func (l *Log) WriteFrame(frameBytes []byte) error {
 	if l == nil || l.file == nil {
@@ -88,34 +89,197 @@ func (l *Log) WriteFrame(frameBytes []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.aead != nil {
-		bufPtr := l.pool.Get().(*[]byte)
-		buf := *bufPtr
+	bufPtr := l.pool.Get().(*[]byte)
+	buf := *bufPtr
 
+	if l.aead != nil {
 		// Generate 12-byte cryptographically unique nonce:
 		// [4 bytes random session prefix] + [8 bytes strictly monotonic counter]
 		nonceVal := l.nonce.Add(1)
-		nonce := buf[:12]
+		nonce := buf[4:16]
 		copy(nonce[:4], l.prefix[:])
 		binary.BigEndian.PutUint64(nonce[4:12], nonceVal)
 
-		// Encrypt in-place using pool buffer
-		out := l.aead.Seal(buf[12:12], nonce, frameBytes, nil)
-		fullLen := 12 + len(out)
+		// Encrypt in-place using pool buffer starting at offset 16
+		out := l.aead.Seal(buf[16:16], nonce, frameBytes, nil)
+		cipherLen := uint32(12 + len(out))
+
+		// 4-byte length prefix + 12-byte nonce + encrypted ciphertext
+		binary.LittleEndian.PutUint32(buf[0:4], cipherLen)
+		fullLen := 4 + int(cipherLen)
 
 		_, err := l.file.Write(buf[:fullLen])
 		l.pool.Put(bufPtr)
 		return err
 	}
 
-	_, err := l.file.Write(frameBytes)
+	// Unencrypted mode: 4-byte length prefix + raw frameBytes
+	frameLen := uint32(len(frameBytes))
+	binary.LittleEndian.PutUint32(buf[0:4], frameLen)
+	copy(buf[4:4+len(frameBytes)], frameBytes)
+	fullLen := 4 + int(frameLen)
+
+	_, err := l.file.Write(buf[:fullLen])
+	l.pool.Put(bufPtr)
 	return err
 }
 
-// DecryptFrame decrypts a raw encrypted log record (nonce + ciphertext + tag) using AES-256-GCM.
+// Replay reads an AAL file sequentially chunk-by-chunk using a pooled buffer,
+// decrypting records if key is provided and executing handler for each frame.
+func Replay(path string, key []byte, handler func(frameBytes []byte) error) (int, error) {
+	if path == "" {
+		return 0, nil
+	}
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("aal: open replay file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil || stat.Size() == 0 {
+		return 0, nil
+	}
+
+	var gcm cipher.AEAD
+	if len(key) > 0 {
+		if len(key) != 32 {
+			return 0, ErrInvalidKeySize
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return 0, fmt.Errorf("aal: replay cipher: %w", err)
+		}
+		gcm, err = cipher.NewGCM(block)
+		if err != nil {
+			return 0, fmt.Errorf("aal: replay gcm: %w", err)
+		}
+	}
+
+	buf := make([]byte, 64*1024)
+	off := 0
+	count := 0
+
+	for {
+		n, err := f.Read(buf[off:])
+		if n > 0 {
+			off += n
+		}
+
+		consumed := 0
+		for consumed < off {
+			remaining := off - consumed
+			if remaining < 4 {
+				break
+			}
+			recLen := int(binary.LittleEndian.Uint32(buf[consumed : consumed+4]))
+			if recLen <= 0 || recLen > 10*1024*1024 {
+				// Corrupt record length, skip 1 byte
+				consumed++
+				continue
+			}
+			if remaining < 4+recLen {
+				break
+			}
+
+			recBytes := buf[consumed+4 : consumed+4+recLen]
+			if gcm != nil {
+				if len(recBytes) < 12+16 {
+					consumed += 4 + recLen
+					continue
+				}
+				nonce := recBytes[:12]
+				ciphertext := recBytes[12:]
+				plain, err := gcm.Open(nil, nonce, ciphertext, nil)
+				if err != nil {
+					consumed += 4 + recLen
+					continue
+				}
+				if err := handler(plain); err != nil {
+					return count, err
+				}
+			} else {
+				if err := handler(recBytes); err != nil {
+					return count, err
+				}
+			}
+			count++
+			consumed += 4 + recLen
+		}
+
+		if consumed > 0 {
+			copy(buf, buf[consumed:off])
+			off -= consumed
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return count, err
+		}
+	}
+
+	return count, nil
+}
+
+// Rotate rewrites the AAL file if file size exceeds maxSize.
+func (l *Log) Rotate(maxSize int64, key []byte) error {
+	if l == nil || l.file == nil || maxSize <= 0 {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	stat, err := l.file.Stat()
+	if err != nil || stat.Size() < maxSize {
+		return nil
+	}
+
+	origPath := l.file.Name()
+	tmpPath := origPath + ".rotate.tmp"
+	tmpLog, err := OpenEncrypted(tmpPath, key)
+	if err != nil {
+		return err
+	}
+
+	_, err = Replay(origPath, key, func(frameBytes []byte) error {
+		return tmpLog.WriteFrame(frameBytes)
+	})
+	_ = tmpLog.Close()
+
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	_ = l.file.Close()
+	if err := os.Rename(tmpPath, origPath); err != nil {
+		return err
+	}
+
+	newFile, err := os.OpenFile(origPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	l.file = newFile
+	return nil
+}
+
+// DecryptFrame decrypts a length-prefixed raw encrypted log record using AES-256-GCM.
 func DecryptFrame(record []byte, key []byte) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, ErrInvalidKeySize
+	}
+	// Record can be [4-byte len prefix] + [12-byte nonce] + [ciphertext] or [12-byte nonce] + [ciphertext]
+	if len(record) >= 4+12+16 {
+		recLen := int(binary.LittleEndian.Uint32(record[0:4]))
+		if recLen+4 == len(record) {
+			record = record[4:]
+		}
 	}
 	if len(record) < 12+16 {
 		return nil, ErrShortCiphertext
