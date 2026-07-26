@@ -1,48 +1,67 @@
-# Reference: Binary Protocol Specification (v1.0.0)
+# Reference: Binary Protocol Specification (v1.3.0)
 
-This document provides a technical specification of the binary frame layout, command codes, and byte ordering used by Aqueduct.
+This document provides the formal technical specification for Aqueduct's zero-copy binary wire protocol.
 
-## Binary Frame Structure
+---
 
-Every frame sent over a QUIC stream consists of a fixed 10-byte binary header followed by a variable-length payload.
+## 1. Frame Wire Format
+
+Aqueduct uses a flat 10-byte binary header followed by an arbitrary payload byte array. All integer fields are encoded in **Little-Endian** byte order.
 
 ```text
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Magic (0xAQ)  | Command (0x..) |          Stream ID            |
+| Magic (0x41)  | Command (1B)  |         Stream ID (4B)        |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|          Stream ID (cont.)     |        Payload Length        |
+| Stream ID cntd|        Payload Length (4B)                    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|     Payload Length (cont.)     | Payload Bytes (N bytes) ...  |
+| Payload Length| Payload Data (N Bytes) ...                    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-## Header Fields
+### Header Fields
 
-| Field | Size (Bytes) | Offset | Type | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `Magic` | 1 | 0 | `uint8` | Fixed magic identifier `0xAQ` (`'A'` ASCII byte = 0x41) |
-| `Command` | 1 | 1 | `uint8` | Command code identifier |
-| `StreamID` | 4 | 2 | `uint32` (Big Endian) | QUIC stream identifier |
-| `PayloadLen` | 4 | 6 | `uint32` (Big Endian) | Length of following payload bytes ($N$) |
-
-Total Header Size: **10 Bytes** (`protocol.HeaderSize`).
-
----
-
-## Command Codes
-
-| Code | Constant | Description | Payload Format |
+| Offset | Field | Type | Description |
 | :--- | :--- | :--- | :--- |
-| `0x01` | `CmdPublish` | Publish message to topic | `topic` name bytes |
-| `0x02` | `CmdSubscribe` | Subscribe stream to topic | `"topic:<name>"` string bytes |
-| `0x03` | `CmdAck` | Acknowledgment response | Optional response payload |
+| `0` | `Magic` | `uint8` | Protocol identifier. Must be `0x41` ('A'). |
+| `1` | `Command` | `uint8` | Command opcode (see Command Table below). |
+| `2-5` | `StreamID` | `uint32` | QUIC stream identifier (Little-Endian). |
+| `6-9` | `PayloadLen`| `uint32` | Length $N$ of `Payload Data` in bytes (Little-Endian). |
+| `10..` | `Payload` | `[]byte` | Raw payload payload content. |
 
 ---
 
-## Limits & Validation Rules
+## 2. Command Opcodes
 
-- **Magic Byte Validation**: If `header[0] != 0x41`, the parser returns `ErrInvalidMagicByte`.
-- **Maximum Payload Limit**: Default `maxPayloadSize` per message is 1 MB (`1 << 20` bytes).
-- **Buffer Hardening**: If `PayloadLen > maxBufSize` (default 64 KB), the stream is immediately canceled by the broker with a `WARN` log.
+| Opcode | Name | Description | Payload Format |
+| :--- | :--- | :--- | :--- |
+| `0x01` | `CmdPublish` | Publish message to topic | `[ttl:<ms>:]<topic_name>` or raw message |
+| `0x02` | `CmdSubscribe` | Subscribe QUIC stream to topic | `topic:<topic_name>` (supports `+` and `#` wildcards) |
+| `0x03` | `CmdUnsubscribe`| Unsubscribe stream from topic | `topic:<topic_name>` |
+
+---
+
+## 3. Message TTL Payload Format
+
+Messages can specify an optional Time-To-Live (TTL) header in the payload byte array:
+
+```text
+ttl:<milliseconds>:<payload_data>
+```
+
+Example:
+- `ttl:500:sensor/room1/temp` (Expires 500ms after publish if queued).
+
+---
+
+## 4. AAL Log Record Binary Framing
+
+When stored in Append-Only Log files (encrypted or raw), records are framed as:
+
+```text
++-------------------+-------------------+-------------------+
+| 4-Byte Record Len | 12-Byte Nonce     | Encrypted Payload |
+| (Little-Endian)   | (Session+Counter) | (Header+Payload)  |
++-------------------+-------------------+-------------------+
+```
