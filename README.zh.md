@@ -13,13 +13,14 @@
 Aqueduct 是一个基于 **QUIC**（通过 `quic-go`）使用 Go 语言构建的超高性能、零内存分配消息代理。专为极低延迟（< 1.5 微秒）、零拷贝二进制解析和面向数据设计（DoD）而设计。
 
 > [!IMPORTANT]
-> **生产就绪 (v1.12.0)**
-> Aqueduct 支持 **gRPC Control Plane (Admin API)** 实现 Quotas 与 ACL 的 **Lock-Free RCU 热重载**、**硬实时延迟优先级队列 (QoS)**、**Per-Priority TTL**、**严格优先级调度**、**mTLS 1.3 传输身份验证**、**零分配 ACL 授权**、**AES-256-GCM 加密日志 (AAL)** 与 **启动状态恢复 (Replay)**、**异步 Fan-Out 与慢消费者隔离**、**零分配 ZSTD 数据压缩**、**MQTT 通配符主题路由**、**直连网状集群 (P2P Federation)**、**零拷贝协议批处理**、**订阅者写合并**、**NACK 重投** 和 **死信队列 (DLQ)**。
+> **生产就绪 (v1.13.0)**
+> Aqueduct 支持 **Consumer Groups & Lock-Free Atomic Round-Robin Routing**、**gRPC Control Plane (Admin API)** 实现 Quotas 与 ACL 的 **Lock-Free RCU 热重载**、**硬实时延迟优先级队列 (QoS)**、**Per-Priority TTL**、**严格优先级调度**、**mTLS 1.3 传输身份验证**、**零分配 ACL 授权**、**AES-256-GCM 加密日志 (AAL)** 与 **启动状态恢复 (Replay)**、**异步 Fan-Out 与慢消费者隔离**、**零分配 ZSTD 数据压缩**、**MQTT 通配符主题路由**、**直连网状集群 (P2P Federation)**、**零拷贝协议批处理**、**订阅者写合并**、**NACK 重投** 和 **死信队列 (DLQ)**。
 
 ---
 
 ## 核心特性
 
+- **Consumer Groups & Atomic Round-Robin Routing**: 竞争消费者 (Competing Consumers) 可加入指定消费组 (如 `topic:orders:group:payment-workers`)。消息在组内成员间通过 **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`) 实现无锁负载均衡。Group Durable Offset 在 Worker 故障转移时维持组级别的断点续传。
 - **Dynamic Control Plane (gRPC Admin API)**: 独立 gRPC Admin 服务器 (`:9091`)，支持 mTLS 角色验证 (`admin-*` CN)，实现无锁 RCU 动态热重载限额与 ACL 规则。
 - **QUIC 传输层**: 具备 0-RTT 连接建立、流隔离和放大攻击保护。
 - **零拷贝二进制协议**: 扁平 10 字节二进制首部 (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`)，支持 TLV 扩展块的零拷贝解析。
