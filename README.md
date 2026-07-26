@@ -9,8 +9,8 @@
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
 > [!IMPORTANT]
-> **Production Ready (v1.3.0)**
-> Aqueduct features **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **message TTL**, and **MQTT wildcard topic routing**.
+> **Production Ready (v1.6.0)**
+> Aqueduct features **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **message TTL**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching** and **coalesced subscriber writes**.
 
 ---
 
@@ -22,6 +22,9 @@ Aqueduct is an ultra-high performance, zero-allocation message broker built in G
 - **Async Fan-Out & Ring Queues**: Per-subscriber non-blocking bounded channels and Writer goroutines eliminating Head-of-Line blocking.
 - **Slow Consumer Isolation (Backpressure)**: Configurable queue overflow handling (`drop_oldest`, `drop_newest`, `disconnect`).
 - **Atomic Reference Counting (`MessageRef`)**: Safe zero-allocation buffer recycling into `sync.Pool` when count drops to zero (`0 allocs/op`).
+- **Zero-Copy Protocol Batching**: `CmdPublishBatch` (0x04) command with zero-copy bulk publish — sub-frames unpack via `unsafe.Slice` directly into the batch buffer (< 4 ns/frame, `0 allocs/op`).
+- **Coalesced Subscriber Writes**: Per-subscriber micro-batching with configurable 64 KB threshold and 50 µs micro-timer flush. Achieves 6.67M msg/s throughput.
+- **Nested Reference Counting**: Parent-child `MessageRef` hierarchy for batch buffer lifetime management — all `atomic.Int32`, zero locks on hot path.
 - **MQTT Wildcard Topic Routing**: Zero-allocation single-level (`+`) and multi-level (`#`) pattern matching (< 51 ns/op, `0 allocs/op`).
 - **Message Time-To-Live (TTL)**: Lazy message expiration on dequeue (`ttl:<ms>:<payload>` format).
 - **Encrypted Append-Only Logging (AAL)**: AES-256-GCM encrypted persistence with cryptographically unique 12-byte nonces (4-byte random session prefix) and streaming length-prefixed records.
@@ -97,6 +100,8 @@ acl:
 broker:
   queue_size: 1024
   backpressure_policy: "drop_oldest"
+  batch_size: 65536
+  flush_interval: "50us"
 
 transport:
   max_buf_size: 65536
@@ -121,6 +126,8 @@ transport:
 | `AQUEDUCT_ACL_ENABLED` | `acl.enabled` | `true` |
 | `AQUEDUCT_BROKER_QUEUE_SIZE` | `broker.queue_size` | `2048` |
 | `AQUEDUCT_BROKER_BACKPRESSURE_POLICY` | `broker.backpressure_policy` | `drop_oldest` |
+| `AQUEDUCT_BROKER_BATCH_SIZE` | `broker.batch_size` | `65536` |
+| `AQUEDUCT_BROKER_FLUSH_INTERVAL` | `broker.flush_interval` | `50us` |
 | `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
 
 ---

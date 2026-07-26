@@ -1,4 +1,4 @@
-# 参考: 二进制协议规范 (v1.5.0)
+# 参考: 二进制协议规范 (v1.6.0)
 
 本文档提供 Aqueduct 零拷贝二进制线缆协议的技术规范。
 
@@ -39,6 +39,7 @@
 | `0x01` | `CmdPublish` | 发布消息到主题 | `[ttl:<ms>:]<topic_name>` 或数据 |
 | `0x02` | `CmdSubscribe` | 订阅主题 | `topic:<topic_name>` (支持 `+` 与 `#`) |
 | `0x03` | `CmdUnsubscribe`| 取消订阅 | `topic:<topic_name>` |
+| `0x04` | `CmdPublishBatch` | 批量发布子帧 | 标准帧的扁平数组 `[Magic][Cmd][StreamID][Len][Payload]...` |
 
 ### MeshForwarded 位（第 7 位）
 

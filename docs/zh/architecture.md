@@ -1,4 +1,4 @@
-# 解释: 架构与内存模型 (v1.5.0)
+# 解释: 架构与内存模型 (v1.6.0)
 
 本文档说明 Aqueduct 的架构设计、面向数据设计 (DoD)、安全机制以及零内存分配策略。
 
@@ -100,3 +100,56 @@ Aqueduct 支持通过直接 P2P QUIC 网格连接多个代理实例形成集群�
 1. 通过 SoA fan-out 投递到本地订阅者
 2. 调用 `PeerManager.Forward()` 广播到所有对等节点
 3. 接收节点调用 `Router.PublishFromPeer()`，仅本地分发（不重新转发）
+
+---
+
+## 7. 批处理协议与写合并
+
+### 问题: OS PPS 限制
+
+`quic.Stream.Write()` 单次调用开销大（syscall、打包、加密）。逐帧发送将吞吐量限制在 ∼300k RPS。
+
+### 解决方案: 智能批处理
+
+#### 7.1 协议级批处理 (`CmdPublishBatch`)
+
+命令 `0x04` 将多个标准帧编码为单个 QUIC 流写入中的扁平字节数组：
+
+```text
++--------------------------+
+| CmdPublishBatch Frame    |
+| +----------------------+ |
+| | 子帧 1..N            | |
+| +----------------------+ |
++--------------------------+
+```
+
+子帧通过 `unsafe.Slice` 和指针运算解析 — 每个子切片直接指向父批处理缓冲区（**零拷贝解包**，`0 allocs/op`）。
+
+#### 7.2 嵌套引用计数 (Nested RC)
+
+1. **父 `MessageRef`** 包装批处理缓冲区 (ref = 1 + 帧数)
+2. 通过 `AcquireChildMessageRef()` 为每个子帧创建 **子 `MessageRef`** — 每个子节点存储 `frame []byte` 子切片（指向父缓冲区）并递增父节点的引用计数
+3. `Release()` 时：子 ref → 0 触发 `parent.Release()`。父 ref → 0 时缓冲区返回 `sync.Pool`
+4. 全部操作 `atomic.Int32`，热路径零锁
+
+#### 7.3 写合并 (Coalesced Writer)
+
+订阅者 Writer 协程累积出站帧，在以下条件触发时批量刷新：
+
+1. **大小阈值**: 累积超过 `batch_size`（默认 64 KB）
+2. **微定时器**: 单个可复用 `time.Timer` 在第一个帧累积后重置，在 `flush_interval`（默认 50 µs）后触发
+
+```yaml
+broker:
+  batch_size: 65536
+  flush_interval: "50us"
+```
+
+#### 7.4 基准测试
+
+| 场景 | 吞吐量 | allocs/op |
+|----------|-----------|-----------|
+| **BatchUnpack** (1000 帧) | 19.9 GB/s | **0** |
+| **BatchPublish** (100 消息) | 6.67M msg/s, 921 MB/s | **0** |
+| 单帧 vs 批量 (每消息) | ~150 ns/msg (batch) vs ~920 ns/msg (single) | **0** |
