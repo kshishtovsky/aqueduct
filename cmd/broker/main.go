@@ -264,6 +264,10 @@ func (m *prometheusMetrics) SetActiveSubscribers(n float64) {
 	metrics.ActiveSubscribers.Set(n)
 }
 
+func (m *prometheusMetrics) OnRateLimited(clientID string) {
+	metrics.MessagesRateLimited.WithLabelValues(clientID).Inc()
+}
+
 func generateSelfSignedTLS() (*tls.Config, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

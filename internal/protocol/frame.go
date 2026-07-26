@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"unsafe"
+
+	"github.com/kshishtovsky/aqueduct/internal/mem"
 )
 
 const (
@@ -25,14 +27,24 @@ const (
 	CmdNack
 )
 
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 1024)
-		return &b
-	},
-}
-
 type Command uint8
+
+var (
+	globalSlab = mem.New()
+
+	bufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 1024)
+			return &b
+		},
+	}
+)
+
+func SetSlabAllocator(sa *mem.SlabAllocator) {
+	if sa != nil {
+		globalSlab = sa
+	}
+}
 
 type Frame struct {
 	Command    Command
@@ -109,7 +121,40 @@ func OpcodeOf(cmd Command) Command {
 	return cmd & ^MeshForwardedBit
 }
 
-func SerializeFrame(cmd Command, streamID uint32, payload []byte) *[]byte {
+var (
+	slabClasses = []int{128, 256, 512, 2048, 8192, 32768}
+	bufPtrPool  = sync.Pool{
+		New: func() any {
+			var b []byte
+			return &b
+		},
+	}
+)
+
+func serializeFrameSlab(cmd Command, streamID uint32, payload []byte) *[]byte {
+	payloadLen := uint32(len(payload))
+	totalSize := HeaderSize + int(payloadLen)
+
+	b, err := globalSlab.Acquire(totalSize)
+	if err != nil {
+		return serializeFramePool(cmd, streamID, payload)
+	}
+
+	b = b[:totalSize]
+	b[0] = MagicByte
+	b[1] = uint8(cmd)
+	binary.LittleEndian.PutUint32(b[2:6], streamID)
+	binary.LittleEndian.PutUint32(b[6:10], payloadLen)
+	if payloadLen > 0 {
+		copy(b[HeaderSize:], payload)
+	}
+
+	bp := bufPtrPool.Get().(*[]byte)
+	*bp = b
+	return bp
+}
+
+func serializeFramePool(cmd Command, streamID uint32, payload []byte) *[]byte {
 	payloadLen := uint32(len(payload))
 	totalSize := HeaderSize + int(payloadLen)
 
@@ -141,9 +186,23 @@ func SerializeFrame(cmd Command, streamID uint32, payload []byte) *[]byte {
 	return bp
 }
 
+func SerializeFrame(cmd Command, streamID uint32, payload []byte) *[]byte {
+	return serializeFrameSlab(cmd, streamID, payload)
+}
+
 func ReleaseBuffer(bp *[]byte) {
 	if bp == nil {
 		return
+	}
+	b := *bp
+	c := cap(b)
+	for _, s := range slabClasses {
+		if c == s {
+			globalSlab.Release(b)
+			*bp = nil
+			bufPtrPool.Put(bp)
+			return
+		}
 	}
 	bufPool.Put(bp)
 }
