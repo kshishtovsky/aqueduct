@@ -40,6 +40,7 @@ broker:
   batch_size: 65536              # Coalesced write batch size in bytes (default 64 KB)
   flush_interval: 50us           # Micro-timer flush interval (default 50 µs)
   max_retries: 3                 # Max NACK retries before moving to DLQ (default 3)
+  priority_ttls: ["500ms", "5s", "0", "0"] # Per-priority message TTL constraints (0 = no TTL)
 
   # Per-tenant rate limiting (Token Bucket)
   quotas:
