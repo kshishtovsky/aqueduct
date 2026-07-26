@@ -1,4 +1,4 @@
-# 指南: 生产部署与安全 (v1.5.0)
+# 指南: 生产部署与安全 (v1.8.0)
 
 本指南说明在生产环境中部署与加固 Aqueduct 消息代理的最佳实践。
 
@@ -50,6 +50,12 @@ aal:
 broker:
   queue_size: 2048
   backpressure_policy: "drop_oldest"
+  batch_size: 65536
+  flush_interval: 50us
+  max_retries: 3
+  quotas:
+    default_publish_rate: 100
+    default_burst_size: 1000
 ```
 
 ---
@@ -64,7 +70,7 @@ ulimit -n 65536
 
 ---
 
-## 5. 集群部署 (v1.5.0+)
+## 5. 集群部署 (v1.8.0+)
 
 部署多个 Aqueduct 代理组成直接网格以实现水平扩展。每个代理连接到所有其他代理。
 
@@ -99,3 +105,25 @@ cluster:
 - 每个节点必须配置自己的 TLS 证书/密钥
 - 对于 3+ 节点拓扑，每个节点必须列出所有其他对等节点
 - 不保证跨节点的消息顺序（fire-and-forget）
+
+---
+
+## 6. NACK/DLQ 生产配置
+
+配置 NACK 重投递和死信队列:
+
+- 在 `config.yaml` 中设置 `max_retries`（默认 3）或通过 `AQUEDUCT_BROKER_MAX_RETRIES` 环境变量
+- DLQ 主题遵循 `__dlq__<original_topic>` 模式
+- 监控 `aqueduct_messages_nacked_total` 和 `aqueduct_messages_dead_lettered_total` 指标
+- 连接订阅者到 `__dlq__*` 主题以进行离线检查
+
+---
+
+## 7. 速率限制配额
+
+配置按租户的速率限制:
+
+- 在 `config.yaml` 中设置 `broker.quotas.default_publish_rate` 和 `broker.quotas.default_burst_size`
+- 客户端覆盖: `broker.quotas.per_client.<client_id>`
+- 监控 `aqueduct_messages_rate_limited_total` 指标
+- 完整的配额配置块见第 3 节的 YAML 示例
