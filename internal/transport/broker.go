@@ -32,10 +32,11 @@ const (
 )
 
 var (
-	prefixTopic         = []byte("topic:")
-	errOversizedPayload = errors.New("payload length exceeds maxBufSize")
-	errBufferExceeded   = errors.New("unread buffer exceeds maxBufSize")
-	errUnauthorized     = errors.New("authorization denied")
+	prefixTopic                 = []byte("topic:")
+	errOversizedPayload         = errors.New("payload length exceeds maxBufSize")
+	errBufferExceeded           = errors.New("unread buffer exceeds maxBufSize")
+	errUnauthorized             = errors.New("authorization denied")
+	errFrameDecompressionFailed = errors.New("frame decompression failed")
 )
 
 // Handler processes a parsed frame and returns an optional response payload.
@@ -63,6 +64,9 @@ type Broker struct {
 
 	tracer *tracing.Tracer
 	logger *slog.Logger
+
+	compression        broker.CompressionEngine
+	compressionMinSize int
 }
 
 // Option configures the Broker.
@@ -111,6 +115,16 @@ func WithAALReplay(path string, key []byte) Option {
 // WithAuthz enables the zero-allocation ACL authorization engine.
 func WithAuthz(e *authz.Engine) Option {
 	return func(b *Broker) { b.authz = e }
+}
+
+// WithCompression enables batch payload decompression for received frames.
+// engine provides ZSTD decompression. minBatchSize is ignored on the receive side
+// (all compressed batches are decompressed regardless of size).
+func WithCompression(engine broker.CompressionEngine, minBatchSize int) Option {
+	return func(b *Broker) {
+		b.compression = engine
+		b.compressionMinSize = minBatchSize
+	}
 }
 
 // New creates a Broker with the given options. Call Listen to start accepting.
@@ -373,6 +387,20 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 			return 0, err
 		}
 
+		// Decompress payload if Compression TLV extension is present.
+		// This must happen before authorization and routing.
+		var extToRelease []byte
+		frame, extToRelease, err = b.decompressFrame(frame)
+		if err != nil {
+			logger.Warn("frame decompression error", "err", err)
+			stream.CancelRead(1)
+			stream.CancelWrite(1)
+			return 0, errFrameDecompressionFailed
+		}
+		if extToRelease != nil {
+			defer protocol.ReleaseExtensions(extToRelease)
+		}
+
 		// Authorization check
 		if b.authz != nil {
 			var requiredPerm authz.Permission
@@ -624,4 +652,44 @@ func parseAckPayload(payload []byte) (consumerID, topic string, offset uint64, e
 		return consumerID, topic, offset, err
 	}
 	return "", "", 0, errors.New("invalid ack payload format")
+}
+
+// decompressFrame checks for the Compression TLV extension and decompresses
+// the frame payload if present. Returns the frame unchanged if no compression.
+// On decompression, strips the Compression TLV from extensions so downstream
+// routing does not see it. The second return value is a slab-allocated extension
+// block that the caller must ReleaseExtensions when routing is complete.
+func (b *Broker) decompressFrame(frame protocol.Frame) (protocol.Frame, []byte, error) {
+	if b.compression == nil {
+		return frame, nil, nil
+	}
+	extVal, found := protocol.FindExtension(frame.Extensions, protocol.ExtCompression)
+	if !found || len(extVal) < protocol.ExtCompressionValueLen {
+		return frame, nil, nil
+	}
+
+	algo := extVal[0]
+	uncompressedSize := binary.LittleEndian.Uint32(extVal[1:5])
+
+	if algo != protocol.AlgoZSTD || uncompressedSize == 0 {
+		return frame, nil, nil
+	}
+	if uncompressedSize > uint32(b.maxBufSize)*16 {
+		return frame, nil, errors.New("decompressed size exceeds max limit")
+	}
+
+	decompressed, err := b.compression.Decompress(frame.Payload, int(uncompressedSize))
+	if err != nil {
+		return frame, nil, err
+	}
+
+	cleanExt := protocol.StripExtension(frame.Extensions, protocol.ExtCompression)
+
+	return protocol.Frame{
+		Command:    frame.Command,
+		StreamID:   frame.StreamID,
+		PayloadLen: uncompressedSize,
+		Payload:    decompressed,
+		Extensions: cleanExt,
+	}, cleanExt, nil
 }

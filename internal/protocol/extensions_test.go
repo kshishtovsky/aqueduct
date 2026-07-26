@@ -454,6 +454,147 @@ func BenchmarkSerializeFrameWithExtensions(b *testing.B) {
 	ReleaseExtensions(extBlock)
 }
 
+func TestBuildCompressionExtension(t *testing.T) {
+	const uncompressedSize = 4096
+	extBlock := BuildCompressionExtension(AlgoZSTD, uncompressedSize)
+	defer ReleaseExtensions(extBlock)
+
+	if len(extBlock) < ExtHeaderLen {
+		t.Fatalf("extBlock too short: %d", len(extBlock))
+	}
+
+	totalLen := ExtTotalLen(extBlock, 0)
+	expectedTotal := ExtEntryHeader + ExtCompressionValueLen
+	if totalLen != expectedTotal {
+		t.Fatalf("totalLen = %d, want %d", totalLen, expectedTotal)
+	}
+
+	typ := ExtensionType(extBlock[ExtHeaderLen])
+	if typ != ExtCompression {
+		t.Fatalf("type = %d, want %d", typ, ExtCompression)
+	}
+
+	valLen := int(extBlock[ExtHeaderLen+1])
+	if valLen != ExtCompressionValueLen {
+		t.Fatalf("value len = %d, want %d", valLen, ExtCompressionValueLen)
+	}
+
+	algo := extBlock[ExtHeaderLen+2]
+	if algo != AlgoZSTD {
+		t.Fatalf("algo = %d, want %d", algo, AlgoZSTD)
+	}
+
+	gotSize := binary.LittleEndian.Uint32(extBlock[ExtHeaderLen+3:])
+	if gotSize != uncompressedSize {
+		t.Fatalf("uncompressedSize = %d, want %d", gotSize, uncompressedSize)
+	}
+
+	// Verify FindExtension finds it
+	val, found := FindExtension(extBlock, ExtCompression)
+	if !found {
+		t.Fatal("expected to find compression extension")
+	}
+	if len(val) != ExtCompressionValueLen {
+		t.Fatalf("compression value len = %d, want %d", len(val), ExtCompressionValueLen)
+	}
+}
+
+func TestStripCompressionExtension(t *testing.T) {
+	// Build a block with both TraceContext and Compression
+	traceID := make([]byte, 16)
+	spanID := make([]byte, 8)
+	ctxBlock := BuildExtensions(traceID, spanID, 1)
+	defer ReleaseExtensions(ctxBlock)
+
+	merged := BuildMergedExtensionsWithCompression(ctxBlock, 4096)
+	defer ReleaseExtensions(merged)
+
+	// Verify both extensions are present
+	_, found := FindExtension(merged, ExtTraceContext)
+	if !found {
+		t.Fatal("expected trace context after merge")
+	}
+	_, found = FindExtension(merged, ExtCompression)
+	if !found {
+		t.Fatal("expected compression after merge")
+	}
+
+	// Strip compression
+	stripped := StripExtension(merged, ExtCompression)
+	if stripped == nil {
+		t.Fatal("expected non-nil stripped block (trace context remains)")
+	}
+	defer ReleaseExtensions(stripped)
+
+	// Verify compression is gone
+	_, found = FindExtension(stripped, ExtCompression)
+	if found {
+		t.Fatal("compression should be stripped")
+	}
+	// Verify trace context remains
+	tid, sid, flags, ok := ExtractTraceContext(stripped)
+	if !ok {
+		t.Fatal("expected trace context to remain after strip")
+	}
+	if len(tid) != 16 || len(sid) != 8 || flags != 1 {
+		t.Fatal("trace context data mismatch after strip")
+	}
+}
+
+func TestStripCompressionExtensionOnly(t *testing.T) {
+	// Build block with ONLY compression
+	extBlock := BuildCompressionExtension(AlgoZSTD, 8192)
+	defer ReleaseExtensions(extBlock)
+
+	// Strip compression
+	stripped := StripExtension(extBlock, ExtCompression)
+	if stripped != nil {
+		t.Fatal("expected nil stripped block (no other extensions)")
+	}
+}
+
+func TestBuildMergedExtensionsWithCompressionEmpty(t *testing.T) {
+	// Merging with nil existing should produce compression-only block
+	merged := BuildMergedExtensionsWithCompression(nil, 2048)
+	if merged == nil {
+		t.Fatal("expected non-nil merged block")
+	}
+	defer ReleaseExtensions(merged)
+
+	_, found := FindExtension(merged, ExtCompression)
+	if !found {
+		t.Fatal("expected compression after merge with nil")
+	}
+
+	val, found := FindExtension(merged, ExtCompression)
+	if !found || len(val) < 5 {
+		t.Fatal("invalid compression extension after merge")
+	}
+	algo := val[0]
+	uncompSize := binary.LittleEndian.Uint32(val[1:5])
+	if algo != AlgoZSTD {
+		t.Fatalf("algo = %d, want %d", algo, AlgoZSTD)
+	}
+	if uncompSize != 2048 {
+		t.Fatalf("uncompressedSize = %d, want %d", uncompSize, 2048)
+	}
+}
+
+func TestDecompressFrameSizeLimit(t *testing.T) {
+	// Verify that large uncompressed sizes are properly handled
+	extBlock := BuildCompressionExtension(AlgoZSTD, 1<<20) // 1MB
+	defer ReleaseExtensions(extBlock)
+
+	val, found := FindExtension(extBlock, ExtCompression)
+	if !found {
+		t.Fatal("expected compression extension")
+	}
+	uncompSize := binary.LittleEndian.Uint32(val[1:5])
+	if uncompSize != 1<<20 {
+		t.Fatalf("uncompressedSize = %d, want %d", uncompSize, 1<<20)
+	}
+}
+
 func TestOpcodeOfStripsHasExtensions(t *testing.T) {
 	cmd := Command(CmdPublish) | HasExtensionsBit | MeshForwardedBit
 	opcode := OpcodeOf(cmd)

@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
+	"github.com/kshishtovsky/aqueduct/internal/compress"
+	"github.com/kshishtovsky/aqueduct/internal/mem"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/quic-go/quic-go"
 )
@@ -1787,6 +1789,118 @@ func TestNackByStream(t *testing.T) {
 
 	// NACK on unregistered stream should be a no-op
 	router.NackByStream(999, 1)
+}
+
+// mockCompressionPeerForwarder captures forwarded data for compression benchmarks.
+type mockCompressionPeerForwarder struct {
+	active         atomic.Int32
+	forwardedBytes atomic.Int64
+}
+
+func (m *mockCompressionPeerForwarder) Forward(rawBuf []byte, addForwardedBit bool) {
+	m.forwardedBytes.Add(int64(len(rawBuf)))
+}
+
+func (m *mockCompressionPeerForwarder) ActivePeers() int {
+	return int(m.active.Load())
+}
+
+// BenchmarkBatchPublishWithCompression measures throughput with ZSTD compression.
+// Uses a mock peer forwarder to trigger the compression path.
+// Expected: 3-5x reduction in wire bytes, slightly higher ns/op due to CPU cost.
+func BenchmarkBatchPublishWithCompression(b *testing.B) {
+	slab := mem.New()
+	engine := compress.NewZstdEngine(slab)
+
+	mpf := &mockCompressionPeerForwarder{}
+	mpf.active.Store(2)
+
+	router := NewRouter(nil, WithCompression(engine, 512), WithPeerForwarder(mpf))
+	defer router.Close()
+
+	const batchSize = 100
+	const msgSize = 128
+
+	var batchParts []*[]byte
+	totalBatchBytes := 0
+	for i := range batchSize {
+		payload := make([]byte, msgSize)
+		payload[0] = byte(i)
+		f := protocol.SerializeFrame(protocol.CmdPublish, uint32(i), payload)
+		batchParts = append(batchParts, f)
+		totalBatchBytes += len(*f)
+	}
+
+	batchPayload := make([]byte, 0, totalBatchBytes)
+	for _, f := range batchParts {
+		batchPayload = append(batchPayload, *f...)
+	}
+	for _, f := range batchParts {
+		protocol.ReleaseBuffer(f)
+	}
+
+	totalPayloadBytes := int64(totalBatchBytes)
+
+	batchFrame := protocol.Frame{
+		Command:    protocol.CmdPublishBatch,
+		PayloadLen: uint32(len(batchPayload)),
+		Payload:    batchPayload,
+	}
+
+	b.SetBytes(totalPayloadBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = router.PublishBatch(context.Background(), batchFrame)
+	}
+}
+
+// BenchmarkBatchPublishNoCompressionSamePeerCount measures throughput WITHOUT compression
+// but with the same active peer count for fair comparison.
+func BenchmarkBatchPublishNoCompressionSamePeerCount(b *testing.B) {
+	mpf := &mockCompressionPeerForwarder{}
+	mpf.active.Store(2)
+
+	router := NewRouter(nil, WithPeerForwarder(mpf))
+	defer router.Close()
+
+	const batchSize = 100
+	const msgSize = 128
+
+	var batchParts []*[]byte
+	totalBatchBytes := 0
+	for i := range batchSize {
+		payload := make([]byte, msgSize)
+		payload[0] = byte(i)
+		f := protocol.SerializeFrame(protocol.CmdPublish, uint32(i), payload)
+		batchParts = append(batchParts, f)
+		totalBatchBytes += len(*f)
+	}
+
+	batchPayload := make([]byte, 0, totalBatchBytes)
+	for _, f := range batchParts {
+		batchPayload = append(batchPayload, *f...)
+	}
+	for _, f := range batchParts {
+		protocol.ReleaseBuffer(f)
+	}
+
+	totalPayloadBytes := int64(totalBatchBytes)
+
+	batchFrame := protocol.Frame{
+		Command:    protocol.CmdPublishBatch,
+		PayloadLen: uint32(len(batchPayload)),
+		Payload:    batchPayload,
+	}
+
+	b.SetBytes(totalPayloadBytes)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = router.PublishBatch(context.Background(), batchFrame)
+	}
 }
 
 // BenchmarkNackHandling measures the performance of NACK processing.
