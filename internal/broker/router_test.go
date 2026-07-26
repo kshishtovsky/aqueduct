@@ -474,9 +474,10 @@ func TestRouterUnsubscribe(t *testing.T) {
 
 // mockMetrics records calls for verification.
 type mockMetrics struct {
-	published atomic.Int64
-	delivered atomic.Int64
-	subs      atomic.Int64
+	published   atomic.Int64
+	delivered   atomic.Int64
+	subs        atomic.Int64
+	rateLimited atomic.Int64
 }
 
 func (m *mockMetrics) OnPublish(topic string) { m.published.Add(1) }
@@ -484,6 +485,7 @@ func (m *mockMetrics) OnDeliver(topic string) { m.delivered.Add(1) }
 func (m *mockMetrics) SetActiveSubscribers(n float64) {
 	m.subs.Store(int64(n))
 }
+func (m *mockMetrics) OnRateLimited(clientID string) { m.rateLimited.Add(1) }
 
 // TestRouterMetrics verifies that metrics callbacks fire correctly.
 func TestRouterMetrics(t *testing.T) {

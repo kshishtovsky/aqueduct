@@ -132,6 +132,14 @@ var (
 		[]string{"topic"},
 	)
 
+	MessagesRateLimited = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_rate_limited_total",
+			Help: "Total number of messages rate limited (dropped) per client",
+		},
+		[]string{"client"},
+	)
+
 	MessagesDeadLettered = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "aqueduct_messages_dead_lettered_total",
@@ -160,4 +168,5 @@ func init() {
 	prometheus.MustRegister(ClusterFramesReceived)
 	prometheus.MustRegister(MessagesNacked)
 	prometheus.MustRegister(MessagesDeadLettered)
+	prometheus.MustRegister(MessagesRateLimited)
 }
