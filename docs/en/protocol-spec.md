@@ -1,4 +1,4 @@
-# Reference: Binary Protocol Specification (v1.3.0)
+# Reference: Binary Protocol Specification (v1.5.0)
 
 This document provides the formal technical specification for Aqueduct's zero-copy binary wire protocol.
 
@@ -39,6 +39,17 @@ Aqueduct uses a flat 10-byte binary header followed by an arbitrary payload byte
 | `0x01` | `CmdPublish` | Publish message to topic | `[ttl:<ms>:]<topic_name>` or raw message |
 | `0x02` | `CmdSubscribe` | Subscribe QUIC stream to topic | `topic:<topic_name>` (supports `+` and `#` wildcards) |
 | `0x03` | `CmdUnsubscribe`| Unsubscribe stream from topic | `topic:<topic_name>` |
+
+### MeshForwarded Bit (Bit 7)
+
+The Command byte's most significant bit (bit 7, value `0x80`) is reserved as the **MeshForwarded** flag for cluster forwarding:
+
+```
+Bit 7 set (Command & 0x80)  == Frame was forwarded from another broker node
+Bit 7 clear                 == Frame originated locally or is being forwarded for the first time
+```
+
+When a broker receives a frame with the MeshForwarded bit set, it dispatches the frame only to local subscribers and does **not** re-forward it to its own peers. This prevents infinite forwarding loops in mesh topologies.
 
 ---
 
