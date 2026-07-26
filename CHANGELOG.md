@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-07-26
+
+### Added
+- **Dynamic Control Plane (gRPC Admin API)**: Dedicated `internal/admin` package running gRPC Admin server (`:9091`) for dynamic configuration updates without broker restart or message processing interruption.
+- **mTLS Operator Authentication**: Enforces client TLS certificate Common Name (CN) starting with `admin-` (`adminAuthInterceptor`). Unauthorized requests receive `PermissionDenied`.
+- **Lock-Free RCU Quota Management**: `quotas.Manager` uses `atomic.Pointer` for client bucket map updates. `Bucket.rate` uses `atomic.Int64` for zero-lock refill rate adjustments on hot path (`0 allocs/op`, 0 mutexes).
+- **Lock-Free RCU ACL Management**: `authz.Engine` uses `atomic.Pointer` for atomic rule map replacement (`Reload`). `Allowed` checks execute lock-free in ~14.5 ns/op.
+- **Admin Observability**: Counter metric `aqueduct_admin_requests_total{method}` and structured `slog.Info` audit logging for all configuration mutations.
+
+### Performance
+- `BenchmarkACLHotReload` (Rebuilding 10,000 rules): **876 µs/op** (< 1 ms target achieved)
+- `BenchmarkACLCheck` (Lock-Free RCU Hot Path): **14.51 ns/op, 0 allocs/op**
+
+### Security
+- `go test -race ./...`: 0 data races
+- Test coverage on `internal/admin`: **79.2%** (target >= 75%)
+- Strict mTLS client certificate CN validation (`admin-*`)
+
 ## [1.11.0] - 2026-07-26
 
 ### Added

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
+	"github.com/kshishtovsky/aqueduct/internal/admin"
 	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/broker"
 	"github.com/kshishtovsky/aqueduct/internal/cluster"
@@ -161,6 +162,7 @@ func main() {
 		transport.WithReadBufSize(cfg.Transport.ReadBufSize),
 	}
 
+	var authzEngine *authz.Engine
 	if cfg.ACL.Enabled {
 		defaultPerm := authz.PermNone
 		if strings.ToLower(cfg.ACL.Default) == "all" {
@@ -179,7 +181,8 @@ func main() {
 			}
 			builder.Allow(r.Client, r.Topic, perm)
 		}
-		opts = append(opts, transport.WithAuthz(builder.Build()))
+		authzEngine = builder.Build()
+		opts = append(opts, transport.WithAuthz(authzEngine))
 		logger.Info("authorization ACL engine enabled")
 	}
 
@@ -222,6 +225,20 @@ func main() {
 		return nil, nil
 	})
 
+	var adminServer *admin.Server
+	if cfg.Admin.Enabled {
+		if authzEngine == nil {
+			authzEngine = authz.NewEngine(nil, authz.PermAll)
+			b.SetAuthzEngine(authzEngine)
+		}
+		adminServer = admin.NewServer(router.QuotaManager(), authzEngine, admin.WithLogger(logger))
+		if err := adminServer.Start(cfg.Admin.Addr, tlsConf); err != nil {
+			logger.Error("failed to start admin server", "addr", cfg.Admin.Addr, "err", err)
+			os.Exit(1)
+		}
+		logger.Info("admin gRPC server started", "addr", cfg.Admin.Addr)
+	}
+
 	if err := b.Listen(ctx, cfg.ListenAddr, tlsConf); err != nil {
 		logger.Error("failed to start listener", "err", err)
 		os.Exit(1)
@@ -237,6 +254,10 @@ func main() {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
+
+	if adminServer != nil {
+		adminServer.Stop()
+	}
 
 	if err := b.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown error", "err", err)

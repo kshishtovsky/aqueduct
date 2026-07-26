@@ -1,3 +1,17 @@
+```
+                                                                                                   
+                                                                                                   
+      db       .g8""8q. `7MMF'   `7MF'`7MM"""YMM  `7MM"""Yb. `7MMF'   `7MF' .g8"""bgd MMP""MM""YMM 
+     ;MM:    .dP'    `YM. MM       M    MM    `7    MM    `Yb. MM       M .dP'     `M P'   MM   `7 
+    ,V^MM.   dM'      `MM MM       M    MM   d      MM     `Mb MM       M dM'       `      MM      
+   ,M  `MM   MM        MM MM       M    MMmmMM      MM      MM MM       M MM               MM      
+   AbmmmqMA  MM.      ,MP MM       M    MM   Y  ,   MM     ,MP MM       M MM.              MM      
+  A'     VML `Mb.    ,dP' YM.     ,M    MM     ,M   MM    ,dP' YM.     ,M `Mb.     ,'      MM      
+.AMA.   .AMMA. `"bmmd"'    `bmmmmd"'  .JMMmmmmMMM .JMMmmmdP'    `bmmmmd"'   `"bmmmd'     .JMML.    
+                   MMb                                                                             
+                    `bood'                                                                         
+```
+
 # Aqueduct
 
 [ [English](README.md) | Русский | [中文](README.zh.md) ]
@@ -9,13 +23,14 @@
 Aqueduct — это сверхвысокопроизводительный брокер сообщений с нулевыми аллокациями памяти на Go поверх **QUIC** (библиотека `quic-go`). Спроектирован для работы с микросекундными задержками (< 1.5 µs), zero-copy бинарным фреймингом и Data-Oriented Design (DoD).
 
 > [!IMPORTANT]
-> **Production Ready (v1.11.0)**
-> Aqueduct поддерживает **Ленивые очереди приоритетов (QoS Hard Real-Time)**, **Per-Priority TTL**, **Строгую приоритизацию**, **двустороннюю аутентификацию mTLS 1.3**, **авторизацию ACL без аллокаций**, **зашифрованный журнал AAL (AES-256-GCM)** с **восстановлением состояния при старте (Replay)**, **асинхронный Fan-Out с изоляцией медленных потребителей**, **ZSTD-сжатие без аллокаций**, **маршрутизацию по Wildcard-топикам MQTT**, **Direct Mesh Clustering**, **протокольный батчинг без копирования**, **коалесцированную запись подписчиков**, **NACK-переотправку** и **Dead Letter Queues**.
+> **Production Ready (v1.12.0)**
+> Aqueduct поддерживает **gRPC Control Plane (Admin API)** для **Lock-Free RCU Hot-Reload** квот и правил ACL, **Ленивые очереди приоритетов (QoS Hard Real-Time)**, **Per-Priority TTL**, **Строгую приоритизацию**, **двустороннюю аутентификацию mTLS 1.3**, **авторизацию ACL без аллокаций**, **зашифрованный журнал AAL (AES-256-GCM)** с **восстановлением состояния при старте (Replay)**, **асинхронный Fan-Out с изоляцией медленных потребителей**, **ZSTD-сжатие без аллокаций**, **маршрутизацию по Wildcard-топикам MQTT**, **Direct Mesh Clustering**, **протокольный батчинг без копирования**, **коалесцированную запись подписчиков**, **NACK-переотправку** и **Dead Letter Queues**.
 
 ---
 
 ## Возможности
 
+- **Dynamic Control Plane (gRPC Admin API)**: Выделенный gRPC Admin сервер (`:9091`) с валидацией mTLS ролей (`admin-*` CN) для Lock-Free RCU Hot-Reload квот пользователей и правил авторизации ACL без перезапуска брокера и без блокировок горячего пути.
 - **Транспортный слой QUIC**: Мультиплексирование QUIC с поддержкой 0-RTT, изоляцией стримов и защитой от Amplification атак.
 - **Zero-Copy бинарный протокол**: Плоский 10-байтовый заголовок (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) с опциональным блоком TLV-расширений.
 - **Ленивые очереди приоритетов (QoS)**: 4 уровня приоритета сообщений (`0` Highest, `1` High, `2` Normal, `3` Low) в TLV `ExtPriority` (`0x03`). Очереди инициализируются из `sync.Pool` при первом поступлении (`0 allocs/op`). Подписчик с 1 приоритетом потребляет память только под 1 очередь.
@@ -46,11 +61,13 @@ docker compose up -d
 ```
 
 Проверка статуса:
+
 - **Health check**: `http://localhost:9090/healthz`
 - **Prometheus**: `http://localhost:9091`
 - **Grafana**: `http://localhost:3000` (Логин: `admin` / Пароль: `admin`)
 
 Остановка стека:
+
 ```bash
 docker compose down
 ```

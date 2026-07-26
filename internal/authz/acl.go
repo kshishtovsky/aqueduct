@@ -1,6 +1,8 @@
 // Package authz implements a high-performance, zero-allocation ACL engine.
 package authz
 
+import "sync/atomic"
+
 // Permission represents a bitmask of allowed actions.
 type Permission uint8
 
@@ -51,36 +53,67 @@ func CombineHashStrings(clientID, topic string) uint64 {
 	return hash
 }
 
-// Engine provides lock-free, zero-allocation O(1) permission checks.
+// Engine provides lock-free, zero-allocation O(1) permission checks with RCU hot-reloading.
 type Engine struct {
-	rules       map[uint64]Permission // key: CombineHashStrings(clientID, topic) -> Permission bitmask
+	rulesPtr    atomic.Pointer[map[uint64]Permission]
 	defaultPerm Permission
 }
 
 // NewEngine creates an Engine initialized with compiled rules and a default permission.
 func NewEngine(rules map[uint64]Permission, defaultPerm Permission) *Engine {
-	return &Engine{
-		rules:       rules,
+	e := &Engine{
 		defaultPerm: defaultPerm,
 	}
+	if rules == nil {
+		rules = make(map[uint64]Permission)
+	}
+	e.rulesPtr.Store(&rules)
+	return e
 }
 
 // Allowed performs a zero-allocation O(1) permission check for a clientID and topic.
-// It executes in under 5 nanoseconds on hot paths.
+// It executes lock-free via atomic.Pointer (RCU).
 func (e *Engine) Allowed(clientID string, topicBytes []byte, required Permission) bool {
 	if e == nil {
 		return true
 	}
+	rulesMap := e.rulesPtr.Load()
+	if rulesMap == nil {
+		return (e.defaultPerm & required) != 0
+	}
 	key := CombineHashes(clientID, topicBytes)
 
-	perm, ok := e.rules[key]
+	perm, ok := (*rulesMap)[key]
 	if !ok {
 		return (e.defaultPerm & required) != 0
 	}
 	return (perm & required) != 0
 }
 
-// Builder constructs an immutable Engine.
+// Reload replaces the rule map atomically using RCU without locking hot paths.
+func (e *Engine) Reload(newRules map[uint64]Permission) {
+	if e == nil {
+		return
+	}
+	if newRules == nil {
+		newRules = make(map[uint64]Permission)
+	}
+	e.rulesPtr.Store(&newRules)
+}
+
+// RulesCount returns the current count of active rules.
+func (e *Engine) RulesCount() int {
+	if e == nil {
+		return 0
+	}
+	rulesMap := e.rulesPtr.Load()
+	if rulesMap == nil {
+		return 0
+	}
+	return len(*rulesMap)
+}
+
+// Builder constructs an Engine.
 type Builder struct {
 	rules       map[uint64]Permission
 	defaultPerm Permission
@@ -101,7 +134,7 @@ func (b *Builder) Allow(clientID, topic string, perm Permission) *Builder {
 	return b
 }
 
-// Build compiles the rules into an immutable Engine.
+// Build compiles the rules into an Engine.
 func (b *Builder) Build() *Engine {
 	return NewEngine(b.rules, b.defaultPerm)
 }
