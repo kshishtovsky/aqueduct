@@ -33,6 +33,11 @@ acl:
       topic: "orders"
       permission: "subscribe"
 
+# Async Fan-Out & Slow Consumer Isolation Policy
+broker:
+  queue_size: 1024               # Per-subscriber ring queue capacity
+  backpressure_policy: "drop_oldest" # "drop_oldest", "drop_newest", or "disconnect"
+
 # Transport & Memory Hardening Limits
 transport:
   max_buf_size: 65536     # 64 KB maximum buffer limit per stream
