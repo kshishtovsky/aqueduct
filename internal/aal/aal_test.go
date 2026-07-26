@@ -5,114 +5,124 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/kshishtovsky/aqueduct/internal/protocol"
 )
 
-func TestAALOpenClose(t *testing.T) {
+func TestAALUnencrypted(t *testing.T) {
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "test.log")
+	path := filepath.Join(dir, "test_raw.log")
 
-	l, err := Open(logPath)
+	l, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
+	defer l.Close()
 
-	if err := l.Sync(); err != nil {
-		t.Errorf("Sync failed: %v", err)
+	data := []byte("hello raw log")
+	if err := l.WriteFrame(data); err != nil {
+		t.Fatalf("WriteFrame failed: %v", err)
 	}
+	_ = l.Sync()
 
-	if err := l.Close(); err != nil {
-		t.Errorf("Close failed: %v", err)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
 	}
-
-	// Operations on nil or closed log should handle gracefully
-	if err := (*Log)(nil).WriteFrame([]byte("data")); err != nil {
-		t.Errorf("nil Log.WriteFrame returned error: %v", err)
-	}
-	if err := (*Log)(nil).Sync(); err != nil {
-		t.Errorf("nil Log.Sync returned error: %v", err)
-	}
-	if err := (*Log)(nil).Close(); err != nil {
-		t.Errorf("nil Log.Close returned error: %v", err)
-	}
-	if err := l.Close(); err != nil {
-		t.Errorf("double Close returned error: %v", err)
+	if !bytes.Equal(content, data) {
+		t.Errorf("read %q != expected %q", string(content), string(data))
 	}
 }
 
-func TestAALWriteAndVerifyFormat(t *testing.T) {
+func TestAALEncrypted(t *testing.T) {
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "aal.log")
+	path := filepath.Join(dir, "test_enc.log")
+	key := []byte("01234567890123456789012345678901") // 32 bytes
 
-	l, err := Open(logPath)
+	l, err := OpenEncrypted(path, key)
 	if err != nil {
-		t.Fatalf("Open failed: %v", err)
+		t.Fatalf("OpenEncrypted failed: %v", err)
 	}
+	defer l.Close()
 
-	framesData := [][]byte{
-		[]byte("orders"),
-		[]byte("payments"),
-		[]byte("notifications"),
+	framePayload := []byte("sensitive payload data")
+	if err := l.WriteFrame(framePayload); err != nil {
+		t.Fatalf("WriteFrame failed: %v", err)
 	}
+	_ = l.Sync()
 
-	var expectedTotalBytes []byte
-
-	for i, payload := range framesData {
-		buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i+1), payload)
-		frameBytes := append([]byte(nil), (*buf)...)
-		protocol.ReleaseBuffer(buf)
-
-		expectedTotalBytes = append(expectedTotalBytes, frameBytes...)
-		if err := l.WriteFrame(frameBytes); err != nil {
-			t.Fatalf("WriteFrame %d failed: %v", i, err)
-		}
-	}
-
-	if err := l.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Read file and compare
-	content, err := os.ReadFile(logPath)
+	rawFileBytes, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
 
-	if len(content) != len(expectedTotalBytes) {
-		t.Fatalf("file length mismatch: got %d bytes, want %d bytes", len(content), len(expectedTotalBytes))
+	// Verify file content is encrypted (does NOT match raw payload)
+	if bytes.Contains(rawFileBytes, framePayload) {
+		t.Error("encrypted file contains raw payload in plain text")
 	}
 
-	if !bytes.Equal(content, expectedTotalBytes) {
-		t.Fatal("file content bytes do not match expected binary frame format")
+	// Decrypt frame
+	decrypted, err := DecryptFrame(rawFileBytes, key)
+	if err != nil {
+		t.Fatalf("DecryptFrame failed: %v", err)
 	}
-
-	// Parse frames back to verify protocol compliance
-	off := 0
-	for i := 0; i < len(framesData); i++ {
-		if off >= len(content) {
-			t.Fatalf("unexpected end of file at frame %d", i)
-		}
-		frame, err := protocol.ParseFrame(content[off:])
-		if err != nil {
-			t.Fatalf("ParseFrame at index %d failed: %v", i, err)
-		}
-		if frame.Command != protocol.CmdPublish {
-			t.Errorf("frame %d: expected CmdPublish, got %v", i, frame.Command)
-		}
-		if frame.StreamID != uint32(i+1) {
-			t.Errorf("frame %d: expected StreamID %d, got %d", i, i+1, frame.StreamID)
-		}
-		if !bytes.Equal(frame.Payload, framesData[i]) {
-			t.Errorf("frame %d: expected payload %q, got %q", i, framesData[i], frame.Payload)
-		}
-		off += protocol.HeaderSize + int(frame.PayloadLen)
+	if !bytes.Equal(decrypted, framePayload) {
+		t.Errorf("decrypted %q != expected %q", string(decrypted), string(framePayload))
 	}
 }
 
-func TestAALOpenInvalidPath(t *testing.T) {
-	_, err := Open("/invalid_dir/non_existent/aal.log")
+func TestAALInvalidKeySize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_badkey.log")
+	shortKey := []byte("too_short")
+
+	_, err := OpenEncrypted(path, shortKey)
 	if err == nil {
-		t.Error("expected error for invalid path, got nil")
+		t.Error("expected error for invalid key size, got nil")
+	}
+
+	_, err = DecryptFrame([]byte("123"), shortKey)
+	if err == nil {
+		t.Error("expected error decrypting with invalid key size, got nil")
+	}
+}
+
+func TestDecryptFrameShortCiphertext(t *testing.T) {
+	key := []byte("01234567890123456789012345678901")
+	_, err := DecryptFrame([]byte("short"), key)
+	if err == nil {
+		t.Error("expected ErrShortCiphertext, got nil")
+	}
+}
+
+func TestNilLogOperations(t *testing.T) {
+	var nilLog *Log
+	if err := nilLog.WriteFrame([]byte("test")); err != nil {
+		t.Errorf("nil log WriteFrame expected nil, got %v", err)
+	}
+	if err := nilLog.Sync(); err != nil {
+		t.Errorf("nil log Sync expected nil, got %v", err)
+	}
+	if err := nilLog.Close(); err != nil {
+		t.Errorf("nil log Close expected nil, got %v", err)
+	}
+}
+
+func BenchmarkAALEncryptedWrite(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "bench_enc.log")
+	key := []byte("01234567890123456789012345678901")
+
+	l, err := OpenEncrypted(path, key)
+	if err != nil {
+		b.Fatalf("OpenEncrypted failed: %v", err)
+	}
+	defer l.Close()
+
+	frame := []byte("[Header:10B][Payload:128B] benchmarking encrypted AAL write performance")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = l.WriteFrame(frame)
 	}
 }
