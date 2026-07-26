@@ -4,15 +4,21 @@ import (
 	"testing"
 )
 
-func TestHashBytesAndString(t *testing.T) {
-	str := "orders"
-	bytes := []byte(str)
+func TestCombineHashesAndStrings(t *testing.T) {
+	client := "service-a"
+	topic := "orders"
 
-	h1 := HashString(str)
-	h2 := HashBytes(bytes)
+	h1 := CombineHashStrings(client, topic)
+	h2 := CombineHashes(client, []byte(topic))
 
 	if h1 != h2 {
-		t.Errorf("HashString(%q) = %d != HashBytes = %d", str, h1, h2)
+		t.Errorf("CombineHashStrings(%q, %q) = %d != CombineHashes = %d", client, topic, h1, h2)
+	}
+
+	// Test non-commutativity (security requirement: key(A,B) != key(B,A))
+	hReverse := CombineHashStrings(topic, client)
+	if h1 == hReverse {
+		t.Errorf("vulnerability detected: CombineHashStrings is commutative! %d == %d", h1, hReverse)
 	}
 }
 
@@ -24,10 +30,10 @@ func TestEnginePermissions(t *testing.T) {
 
 	engine := builder.Build()
 
-	clientA := HashString("service-a")
-	clientB := HashString("service-b")
-	clientC := HashString("service-c")
-	clientD := HashString("service-d")
+	clientA := "service-a"
+	clientB := "service-b"
+	clientC := "service-c"
+	clientD := "service-d"
 
 	topicOrders := []byte("orders")
 	topicPayments := []byte("payments")
@@ -38,6 +44,11 @@ func TestEnginePermissions(t *testing.T) {
 	}
 	if engine.Allowed(clientA, topicOrders, PermSubscribe) {
 		t.Error("service-a should NOT be allowed to subscribe to orders")
+	}
+
+	// Commutative vulnerability test: client "orders" accessing topic "service-a" MUST be denied
+	if engine.Allowed("orders", []byte("service-a"), PermPublish) {
+		t.Error("vulnerability: client 'orders' for topic 'service-a' was incorrectly granted permission!")
 	}
 
 	// Service B tests
@@ -66,7 +77,7 @@ func TestEnginePermissions(t *testing.T) {
 
 func TestNilEngineAllowed(t *testing.T) {
 	var nilEngine *Engine
-	if !nilEngine.Allowed(123, []byte("orders"), PermPublish) {
+	if !nilEngine.Allowed("client-a", []byte("orders"), PermPublish) {
 		t.Error("nil engine should allow all actions")
 	}
 }
@@ -76,13 +87,13 @@ func BenchmarkACLCheck(b *testing.B) {
 		Allow("service-a", "orders", PermPublish).
 		Build()
 
-	clientIDHash := HashString("service-a")
+	clientStr := "service-a"
 	topicBytes := []byte("orders")
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = engine.Allowed(clientIDHash, topicBytes, PermPublish)
+		_ = engine.Allowed(clientStr, topicBytes, PermPublish)
 	}
 }

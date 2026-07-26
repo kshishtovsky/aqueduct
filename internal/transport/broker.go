@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -24,6 +25,7 @@ const (
 )
 
 var (
+	prefixTopic         = []byte("topic:")
 	errOversizedPayload = errors.New("payload length exceeds maxBufSize")
 	errBufferExceeded   = errors.New("unread buffer exceeds maxBufSize")
 	errUnauthorized     = errors.New("authorization denied")
@@ -178,7 +180,6 @@ func runHandleConn(b *Broker, jig context.Context, conn *quic.Conn) {
 			clientIDStr = cn
 		}
 	}
-	clientIDHash := authz.HashString(clientIDStr)
 
 	go func() {
 		<-jig.Done()
@@ -198,13 +199,13 @@ func runHandleConn(b *Broker, jig context.Context, conn *quic.Conn) {
 		b.wg.Add(1)
 		go func() {
 			defer b.wg.Done()
-			b.processStream(jig, conn, stream, clientIDStr, clientIDHash)
+			b.processStream(jig, conn, stream, clientIDStr)
 		}()
 	}
 }
 
 // processStream reads frames from a single QUIC stream and dispatches them.
-func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *quic.Stream, clientIDStr string, clientIDHash uint64) {
+func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *quic.Stream, clientIDStr string) {
 	streamID := stream.StreamID()
 	span := b.logger.With(
 		"stream_id", streamID,
@@ -227,7 +228,7 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 	for {
 		if off == cap(buf) {
 			var err error
-			off, err = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr, clientIDHash)
+			off, err = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr)
 			if err != nil {
 				if errors.Is(err, errUnauthorized) {
 					stream.CancelRead(401)
@@ -260,7 +261,7 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 		if n > 0 {
 			off += n
 			var dispatchErr error
-			off, dispatchErr = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr, clientIDHash)
+			off, dispatchErr = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr)
 			if dispatchErr != nil {
 				if errors.Is(dispatchErr, errUnauthorized) {
 					stream.CancelRead(401)
@@ -289,7 +290,7 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 // dispatchFrames splits buf[:off] into complete frames and invokes handlers
 // or the built-in router. Returns the new offset after consuming all complete
 // frames (preserving any trailing partial frame bytes for the next read).
-func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []byte, off int, stream *quic.Stream, clientIDStr string, clientIDHash uint64) (int, error) {
+func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []byte, off int, stream *quic.Stream, clientIDStr string) (int, error) {
 	consumed := 0
 	for consumed < off {
 		remaining := off - consumed
@@ -328,7 +329,7 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 			}
 			if requiredPerm != authz.PermNone {
 				topicBytes := extractTopicBytes(frame.Payload)
-				if !b.authz.Allowed(clientIDHash, topicBytes, requiredPerm) {
+				if !b.authz.Allowed(clientIDStr, topicBytes, requiredPerm) {
 					metrics.AuthzDenied.WithLabelValues(clientIDStr, string(topicBytes)).Inc()
 					return 0, errUnauthorized
 				}
@@ -397,7 +398,7 @@ func (b *Broker) sendResponse(stream *quic.Stream, streamID uint32, payload []by
 }
 
 func extractTopicBytes(payload []byte) []byte {
-	if len(payload) >= 6 && string(payload[:6]) == "topic:" {
+	if len(payload) >= 6 && bytes.HasPrefix(payload, prefixTopic) {
 		return payload[6:]
 	}
 	return payload
@@ -457,4 +458,3 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 
 	return closeErr
 }
-

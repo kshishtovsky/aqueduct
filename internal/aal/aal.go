@@ -3,6 +3,8 @@ package aal
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -20,11 +22,12 @@ var (
 // Log represents a zero-allocation Append-Only Log writer.
 // All published frames are appended directly to disk in raw or AES-256-GCM encrypted format.
 type Log struct {
-	mu    sync.Mutex
-	file  *os.File
-	aead  cipher.AEAD
-	pool  sync.Pool
-	nonce atomic.Uint64
+	mu     sync.Mutex
+	file   *os.File
+	aead   cipher.AEAD
+	pool   sync.Pool
+	prefix [4]byte
+	nonce  atomic.Uint64
 }
 
 // Open opens or creates an unencrypted append-only log file at the given path.
@@ -54,6 +57,10 @@ func OpenEncrypted(path string, key []byte) (*Log, error) {
 		if len(key) != 32 {
 			_ = file.Close()
 			return nil, ErrInvalidKeySize
+		}
+		if _, err := rand.Read(l.prefix[:]); err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("aal: generate random nonce prefix: %w", err)
 		}
 		block, err := aes.NewCipher(key)
 		if err != nil {
@@ -85,21 +92,12 @@ func (l *Log) WriteFrame(frameBytes []byte) error {
 		bufPtr := l.pool.Get().(*[]byte)
 		buf := *bufPtr
 
-		// Generate 12-byte nonce
+		// Generate 12-byte cryptographically unique nonce:
+		// [4 bytes random session prefix] + [8 bytes strictly monotonic counter]
 		nonceVal := l.nonce.Add(1)
 		nonce := buf[:12]
-		nonce[0] = byte(nonceVal >> 56)
-		nonce[1] = byte(nonceVal >> 48)
-		nonce[2] = byte(nonceVal >> 40)
-		nonce[3] = byte(nonceVal >> 32)
-		nonce[4] = byte(nonceVal >> 24)
-		nonce[5] = byte(nonceVal >> 16)
-		nonce[6] = byte(nonceVal >> 8)
-		nonce[7] = byte(nonceVal)
-		nonce[8] = 0x41
-		nonce[9] = 0x41
-		nonce[10] = 0x4c
-		nonce[11] = 0x31
+		copy(nonce[:4], l.prefix[:])
+		binary.BigEndian.PutUint64(nonce[4:12], nonceVal)
 
 		// Encrypt in-place using pool buffer
 		out := l.aead.Seal(buf[12:12], nonce, frameBytes, nil)
