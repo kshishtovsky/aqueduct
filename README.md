@@ -1,24 +1,32 @@
-```
-                                                                                                   
-                                                                                                   
-      db       .g8""8q. `7MMF'   `7MF'`7MM"""YMM  `7MM"""Yb. `7MMF'   `7MF' .g8"""bgd MMP""MM""YMM 
-     ;MM:    .dP'    `YM. MM       M    MM    `7    MM    `Yb. MM       M .dP'     `M P'   MM   `7 
-    ,V^MM.   dM'      `MM MM       M    MM   d      MM     `Mb MM       M dM'       `      MM      
-   ,M  `MM   MM        MM MM       M    MMmmMM      MM      MM MM       M MM               MM      
-   AbmmmqMA  MM.      ,MP MM       M    MM   Y  ,   MM     ,MP MM       M MM.              MM      
-  A'     VML `Mb.    ,dP' YM.     ,M    MM     ,M   MM    ,dP' YM.     ,M `Mb.     ,'      MM      
-.AMA.   .AMMA. `"bmmd"'    `bmmmmd"'  .JMMmmmmMMM .JMMmmmdP'    `bmmmmd"'   `"bmmmd'     .JMML.    
-                   MMb                                                                             
-                    `bood'                                                                         
-```
+<div align="center">
 
-# Aqueduct
+```yaml
+ ________  ________  ___  ___  _______   ________  ___  ___  ________ _________   
+|\   __  \|\   __  \|\  \|\  \|\  ___ \ |\   ___ \|\  \|\  \|\   ____\\___   ___\ 
+\ \  \|\  \ \  \|\  \ \  \\\  \ \   __/|\ \  \_|\ \ \  \\\  \ \  \___\|___ \  \_| 
+ \ \   __  \ \  \\\  \ \  \\\  \ \  \_|/_\ \  \ \\ \ \  \\\  \ \  \       \ \  \  
+  \ \  \ \  \ \  \\\  \ \  \\\  \ \  \_|\ \ \  \_\\ \ \  \\\  \ \  \____   \ \  \ 
+   \ \__\ \__\ \_____  \ \_______\ \_______\ \_______\ \_______\ \_______\  \ \__\
+    \|__|\|__|\|___| \__\|_______|\|_______|\|_______|\|_______|\|_______|   \|__|
+                    \|__|
+```
+</div>
+
+<div align="center">
 
 [ English | [Русский](README.ru.md) | [中文](README.zh.md) ]
 
-[![CI](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml/badge.svg)](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go Reference](https://pkg.go.dev/badge/github.com/kshishtovsky/aqueduct.svg)](https://pkg.go.dev/github.com/kshishtovsky/aqueduct)
+# 🌊 Aqueduct
+
+**Ultra-fast, zero-allocation message broker built on Go & QUIC**
+
+[![CI](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml/badge.svg)](https://github.com/kshishtovsky/aqueduct/actions)
+![Go Version](https://img.shields.io/badge/go-1.22%2B-blue)
+![Latency](https://img.shields.io/badge/latency-%3C1.5%C2%B0s-orange)
+![Allocations](https://img.shields.io/badge/allocs-0_B%2Fop-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+</div>
 
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
