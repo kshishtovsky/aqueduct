@@ -941,11 +941,163 @@ func BenchmarkRouterPublishWithWildcards(b *testing.B) {
 		Payload:    topic,
 	}
 
-	b.SetBytes(int64(protocol.FrameSize(uint32(len(topic)))))
+	for i := 0; i < b.N; i++ {
+		_ = router.Publish(ctx, pubFrame)
+	}
+}
+
+// TestDurableSubscriptionsReconnect tests durable subscriber reconnection and AAL backfill replay.
+func TestDurableSubscriptionsReconnect(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "durable_aal.log")
+	aalLog, err := aal.Open(logPath)
+	if err != nil {
+		t.Fatalf("aal.Open failed: %v", err)
+	}
+	defer aalLog.Close()
+
+	sTLS, cTLS := genTLS(t)
+	router := NewRouter(nil, WithAALPath(logPath, nil))
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func(s *quic.Stream) {
+						buf := make([]byte, 1024)
+						n, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						frame, err := protocol.ParseFrame(buf[:n])
+						if err != nil {
+							return
+						}
+						if frame.Command == protocol.CmdSubscribe {
+							_ = router.Subscribe(ctx, s, frame)
+						}
+					}(stream)
+				}
+			}()
+		}
+	}()
+
+	// 1. Initial durable subscription
+	conn1 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub1, err := conn1.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub1: %v", err)
+	}
+	sendFrame(t, sub1, protocol.CmdSubscribe, 1, []byte("topic:durable-topic:durable:client-a:0"))
+	time.Sleep(200 * time.Millisecond)
+
+	// Sub1 disconnects
+	sub1.Close()
+
+	// 2. Publish 20 messages to durable-topic while Sub1 is offline
+	for i := 0; i < 20; i++ {
+		payload := []byte("durable-topic")
+		buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i+1), payload)
+		if err := aalLog.WriteFrame(*buf); err != nil {
+			t.Fatalf("write frame %d: %v", i, err)
+		}
+		protocol.ReleaseBuffer(buf)
+		_ = router.Publish(ctx, protocol.Frame{
+			Command:    protocol.CmdPublish,
+			PayloadLen: uint32(len(payload)),
+			Payload:    payload,
+		})
+	}
+	_ = aalLog.Sync()
+
+	// 3. Sub1 reconnects asking for offset 0 backfill
+	conn2 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub2, err := conn2.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub2: %v", err)
+	}
+	sendFrame(t, sub2, protocol.CmdSubscribe, 2, []byte("topic:durable-topic:durable:client-a:0"))
+
+	// 4. Verify sub2 receives backfilled messages
+	receivedCount := 0
+	sub2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	readBuf := make([]byte, 4096)
+	off := 0
+	for receivedCount < 20 {
+		n, err := sub2.Read(readBuf[off:])
+		if err != nil {
+			t.Fatalf("sub2 backfill read failed: %v", err)
+		}
+		off += n
+		consumed := 0
+		for consumed < off {
+			if off-consumed < protocol.HeaderSize {
+				break
+			}
+			f, parseErr := protocol.ParseFrame(readBuf[consumed:off])
+			if parseErr != nil {
+				break
+			}
+			if string(f.Payload) == "durable-topic" {
+				receivedCount++
+			}
+			consumed += f.Size()
+		}
+		copy(readBuf, readBuf[consumed:off])
+		off -= consumed
+	}
+
+	if receivedCount != 20 {
+		t.Errorf("expected 20 backfilled messages, got %d", receivedCount)
+	}
+}
+
+// TestConsumerACK verifies consumer ACK offset tracking.
+func TestConsumerACK(t *testing.T) {
+	router := NewRouter(nil)
+	defer router.Close()
+
+	router.AckOffset("service-a", "orders", 150)
+	got := router.GetConsumerOffset("service-a", "orders")
+	if got != 150 {
+		t.Errorf("expected consumer offset 150, got %d", got)
+	}
+}
+
+// BenchmarkDurablePublish measures publish latency with topic offset tracking.
+func BenchmarkDurablePublish(b *testing.B) {
+	router := NewRouter(nil)
+	defer router.Close()
+
+	topic := []byte("orders")
+	frame := protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(topic)),
+		Payload:    topic,
+	}
+
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = router.Publish(ctx, pubFrame)
+		_ = router.Publish(context.Background(), frame)
 	}
 }

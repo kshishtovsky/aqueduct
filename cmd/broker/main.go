@@ -116,12 +116,23 @@ func main() {
 	}
 	logger.Info("metrics server started", "addr", cfg.MetricsAddr)
 
+	var aalKey []byte
+	if cfg.AAL.Enabled && cfg.AAL.Key != "" {
+		keyBytes, err := base64.StdEncoding.DecodeString(cfg.AAL.Key)
+		if err == nil && len(keyBytes) == 32 {
+			aalKey = keyBytes
+		} else if len(cfg.AAL.Key) == 32 {
+			aalKey = []byte(cfg.AAL.Key)
+		}
+	}
+
 	routerMetrics := &prometheusMetrics{}
 	policy := broker.ParseBackpressurePolicy(cfg.Broker.BackpressurePolicy)
 	router := broker.NewRouter(
 		routerMetrics,
 		broker.WithQueueSize(cfg.Broker.QueueSize),
 		broker.WithBackpressurePolicy(policy),
+		broker.WithAALPath(cfg.AAL.FilePath, aalKey),
 	)
 	logger.Info("router initialized", "queue_size", cfg.Broker.QueueSize, "backpressure_policy", policy.String())
 
