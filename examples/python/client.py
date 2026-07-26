@@ -1,6 +1,6 @@
 """
 Aqueduct Python QUIC Client Example.
-Demonstrates binary frame construction [Magic: 0x41][Cmd][StreamID][PayloadLen][Payload]
+Demonstrates binary frame construction [Magic: 0x1F][Cmd][StreamID][PayloadLen][Payload]
 and asynchronous stream processing using aioquic.
 """
 
@@ -9,14 +9,14 @@ import struct
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
 
-MAGIC = 0x41  # 'A' ASCII byte
+MAGIC = 0x1F
 CMD_PUBLISH = 0x01
 CMD_SUBSCRIBE = 0x02
 
 
 def build_frame(cmd: int, stream_id: int, payload: bytes) -> bytes:
     """Build 10-byte binary header + payload."""
-    header = struct.pack("!BBII", MAGIC, cmd, stream_id, len(payload))
+    header = struct.pack("<BBII", MAGIC, cmd, stream_id, len(payload))
     return header + payload
 
 
@@ -24,7 +24,7 @@ def parse_frame(data: bytes):
     """Parse 10-byte binary header + payload."""
     if len(data) < 10:
         raise ValueError("Buffer too short")
-    magic, cmd, stream_id, payload_len = struct.unpack("!BBII", data[:10])
+    magic, cmd, stream_id, payload_len = struct.unpack("<BBII", data[:10])
     if magic != MAGIC:
         raise ValueError(f"Invalid magic byte: {hex(magic)}")
     payload = data[10 : 10 + payload_len]
@@ -55,7 +55,9 @@ async def main():
         # 3. Read delivered message
         data = await reader.read(1024)
         cmd, stream_id, payload = parse_frame(data)
-        print(f"[Python Client] Received frame: Cmd={cmd}, StreamID={stream_id}, Payload={payload.decode()}")
+        print(
+            f"[Python Client] Received frame: Cmd={cmd}, StreamID={stream_id}, Payload={payload.decode()}"
+        )
 
 
 if __name__ == "__main__":

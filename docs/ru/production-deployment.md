@@ -1,4 +1,4 @@
-# Руководство: Безопасность и развертывание в Production (v1.5.0)
+# Руководство: Безопасность и развертывание в Production (v1.8.0)
 
 Настоящее руководство описывает лучшие практики безопасного развертывания Aqueduct в промышленной среде.
 
@@ -52,6 +52,12 @@ aal:
 broker:
   queue_size: 2048
   backpressure_policy: "drop_oldest"
+  batch_size: 65536
+  flush_interval: 50us
+  max_retries: 3
+  quotas:
+    default_publish_rate: 100
+    default_burst_size: 1000
 ```
 
 ---
@@ -68,7 +74,7 @@ ulimit -n 65536
 
 ---
 
-## 5. Кластерное развертывание (v1.5.0+)
+## 5. Кластерное развертывание (v1.8.0+)
 
 Разверните несколько брокеров Aqueduct в прямом mesh для горизонтального масштабирования.
 
@@ -103,3 +109,25 @@ cluster:
 - Каждый узел должен иметь собственные TLS-сертификаты
 - Для топологий с 3+ узлами каждый узел должен перечислить всех пиров
 - Нет гарантий порядка сообщений между узлами (fire-and-forget)
+
+---
+
+## 6. NACK/DLQ в Production
+
+Настройка повторной доставки NACK и Dead Letter Queue:
+
+- Установите `max_retries` (по умолчанию 3) в `config.yaml` или через `AQUEDUCT_BROKER_MAX_RETRIES`
+- DLQ топики следуют шаблону `__dlq__<original_topic>`
+- Отслеживайте метрики `aqueduct_messages_nacked_total` и `aqueduct_messages_dead_lettered_total`
+- Подключите подписчика к топикам `__dlq__*` для автономного просмотра
+
+---
+
+## 7. Квоты Rate Limiting
+
+Настройка ограничения скорости для каждого клиента:
+
+- Установите `broker.quotas.default_publish_rate` и `broker.quotas.default_burst_size` в `config.yaml`
+- Индивидуальные настройки: `broker.quotas.per_client.<client_id>`
+- Отслеживайте метрику `aqueduct_messages_rate_limited_total`
+- Полный блок конфигурации квот приведен в YAML-примере Раздела 3

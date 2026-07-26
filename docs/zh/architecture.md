@@ -1,4 +1,4 @@
-# 解释: 架构与内存模型 (v1.6.0)
+# 解释: 架构与内存模型 (v1.8.0)
 
 本文档说明 Aqueduct 的架构设计、面向数据设计 (DoD)、安全机制以及零内存分配策略。
 
@@ -46,16 +46,20 @@ type Router struct {
 
 ```go
 type MessageRef struct {
-    buf       *[]byte
+    buf       *[]byte    // 来自池的缓冲区（仅父级）
+    frame     []byte     // 父缓冲区的零拷贝子切片（批量子节点使用）
     ref       atomic.Int32
-    expiresAt int64 // unix nano
+    expiresAt int64      // unix 纳秒时间戳，0 = 永不过期
+    offset    uint64     // 主题偏移量
+    parent    *MessageRef // 父级引用（父级为 nil）
 }
 ```
 
 - `AcquireMessageRef` 初始化 `ref = 1`。
 - 每个目标订阅者通过 `Retain()` 增加引用。
 - 发送完成后调用 `Release()`。
-- 当 `ref.Add(-1) == 0` 时，缓冲区安全归还至 `sync.Pool` (**`0 allocs/op`**)。
+- 当 `ref.Add(-1) == 0` 时，缓冲区安全归还至 `protocol.ReleaseBuffer` (**`0 allocs/op`**)。
+- **嵌套引用计数 (Nested RC, v1.6.0)**: 批量消息使用父子 `MessageRef` 层次结构。父级包装批处理缓冲区，`ref = 1 + 帧数`。每个子级通过 `AcquireChildMessageRef()` 创建，带有指向父缓冲区的 `frame []byte` 子切片。当子级的引用计数归零时，`Release()` 调用 `parent.Release()`。父级的 `buf` 生命周期通过 `protocol.ReleaseBuffer` 管理。
 
 ---
 
@@ -153,3 +157,113 @@ broker:
 | **BatchUnpack** (1000 帧) | 19.9 GB/s | **0** |
 | **BatchPublish** (100 消息) | 6.67M msg/s, 921 MB/s | **0** |
 | 单帧 vs 批量 (每消息) | ~150 ns/msg (batch) vs ~920 ns/msg (single) | **0** |
+
+---
+
+## 8. 基于 NACK 的重投递与死信队列
+
+Aqueduct v1.7.0 引入否定确认 (NACK) 机制实现可靠投递：
+
+### NACK 协议 (`CmdNack`)
+
+- **操作码**: `0x05` (`CmdNack`)
+- **负载**: 8 字节 uint64 消息偏移量 (小端序)
+- 收到后，代理根据偏移量查找原始消息并调度重投递
+
+### 自动重投递
+
+- 每条消息有内部重试计数器
+- 默认 `max_retries`: 3
+- 每次 NACK 后，消息重新入队到订阅者通道
+- 超过 `max_retries` 后：消息路由到死信队列
+
+### 每订阅者帧缓存
+
+- 每订阅者有界 FIFO 缓存 (256 条目)
+- 存储 offset → topic 映射，实现 O(1) 重投递查找
+- 防止恶意快速 NACK 导致内存耗尽
+
+### 死信队列
+
+- 超过 `max_retries` 后，毒丸消息路由到 `__dlq__<原始主题>`
+- DLQ 订阅者对 `__dlq__` 主题模式使用标准订阅语义
+
+### 指标
+
+| 指标 | 类型 | 描述 |
+|------|------|------|
+| `aqueduct_messages_nacked_total` | Counter | 总计 NACK 消息数 |
+| `aqueduct_messages_dead_lettered_total` | Counter | 总计路由到 DLQ 的消息数 |
+
+### 无锁路径
+
+- `NackByStream` 通过缓冲通道路由 NACK — 热路径零锁
+- 每订阅者通道解耦 NACK 接收与重投递处理
+
+---
+
+## 9. Slab 分配器
+
+Aqueduct v1.8.0 在热路径上使用高性能 slab 分配器替代 `sync.Pool` 管理 `*[]byte` 帧缓冲区：
+
+### 设计
+
+- **预分配 Arena**: 每个大小类连续 64 MB 内存区域
+- **大小类**: 128B、256B、512B、2KB、8KB、32KB
+- **无锁空闲链表**: Treiber 栈（原子 CAS）实现分配与释放
+- **零 GC 压力**: Arena 内存不被 Go GC 扫描
+
+### 性能
+
+| 指标 | 值 |
+|------|-----|
+| 分配延迟 | ~15 ns/op（无竞争） |
+| 每次操作分配数 | 0（预分配） |
+| GC 影响 | 无 |
+
+### 集成
+
+- `slab.Allocate(size) → *[]byte` 替代 `pool.Get().(*[]byte)`
+- `slab.Deallocate(buf)` 替代 `pool.Put(buf)`
+- 超过 32 KB 的大小回退到堆分配
+
+---
+
+## 10. 每租户速率限制 (Token Bucket)
+
+Aqueduct v1.8.0 使用令牌桶算法实现无锁每租户速率限制：
+
+### 设计
+
+- **无锁令牌桶**: 使用原子操作进行令牌消费和补充
+- **后台补充**: 专用 goroutine 以 100ms 为周期补充所有桶
+- **每租户隔离**: 每个客户端有独立的令牌桶
+
+### 性能
+
+| 指标 | 值 |
+|------|-----|
+| 无竞争检查 | 2.1 ns/op |
+| 每次操作分配数 | 0 |
+
+### 配置
+
+```yaml
+broker:
+  quotas:
+    default_publish_rate: 1000  # 每秒消息数
+    default_burst_size: 100     # 突发容量
+```
+
+环境变量覆盖：
+
+| 变量 | 默认值 |
+|------|--------|
+| `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` | 1000 |
+| `AQUEDUCT_BROKER_DEFAULT_BURST_SIZE` | 100 |
+
+### 集成
+
+- 在 `Router.Publish()` 消息分发前检查
+- 如果被限流，消息被丢弃，计数器递增
+- 指标: `aqueduct_messages_rate_limited_total`（计数器）

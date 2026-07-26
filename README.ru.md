@@ -9,7 +9,7 @@
 Aqueduct — это сверхвысокопроизводительный брокер сообщений с нулевыми аллокациями памяти на Go поверх **QUIC** (библиотека `quic-go`). Спроектирован для работы с микросекундными задержками (< 1.5 µs), zero-copy бинарным фреймингом и Data-Oriented Design (DoD).
 
 > [!IMPORTANT]
-> **Production Ready (v1.7.0)**
+> **Production Ready (v1.8.0)**
 > Aqueduct поддерживает **двустороннюю аутентификацию mTLS 1.3**, **авторизацию ACL без аллокаций**, **зашифрованный журнал AAL (AES-256-GCM)** с **восстановлением состояния при старте (Replay)**, **асинхронный Fan-Out с изоляцией медленных потребителей**, **Message TTL**, **маршрутизацию по Wildcard-топикам MQTT**, **Direct Mesh Clustering**, **протокольный батчинг без копирования**, **коалесцированную запись подписчиков**, **NACK-переотправку** и **Dead Letter Queues**.
 
 ---
@@ -102,11 +102,39 @@ broker:
   batch_size: 65536
   flush_interval: "50us"
   max_retries: 3
+  quotas:
+    default_publish_rate: 0
+    default_burst_size: 1000
 
 transport:
   max_buf_size: 65536
   read_buf_size: 1024
 ```
+
+### Переопределение переменными окружения
+
+| Переменная окружения | Переопределяет | Пример |
+| :--- | :--- | :--- |
+| `AQUEDUCT_LISTEN_ADDR` | `listen_addr` | `:4242` |
+| `AQUEDUCT_METRICS_ADDR` | `metrics_addr` | `:9090` |
+| `AQUEDUCT_TLS_GENERATE` | `tls.generate` | `false` |
+| `AQUEDUCT_TLS_CERT_FILE` | `tls.cert_file` | `/etc/certs/cert.pem` |
+| `AQUEDUCT_TLS_KEY_FILE` | `tls.key_file` | `/etc/certs/key.pem` |
+| `AQUEDUCT_TLS_REQUIRE_CLIENT_CERT` | `tls.require_client_cert` | `true` |
+| `AQUEDUCT_TLS_CLIENT_CA_FILE` | `tls.client_ca_file` | `/etc/certs/ca.pem` |
+| `AQUEDUCT_AAL_ENABLED` | `aal.enabled` | `true` |
+| `AQUEDUCT_AAL_FILE_PATH` | `aal.file_path` | `/var/log/aal.log` |
+| `AQUEDUCT_AAL_KEY` | `aal.key` | `base64_encoded_key` |
+| `AQUEDUCT_AAL_MAX_SIZE` | `aal.max_aal_size` | `104857600` |
+| `AQUEDUCT_ACL_ENABLED` | `acl.enabled` | `true` |
+| `AQUEDUCT_BROKER_QUEUE_SIZE` | `broker.queue_size` | `2048` |
+| `AQUEDUCT_BROKER_BACKPRESSURE_POLICY` | `broker.backpressure_policy` | `drop_oldest` |
+| `AQUEDUCT_BROKER_BATCH_SIZE` | `broker.batch_size` | `65536` |
+| `AQUEDUCT_BROKER_FLUSH_INTERVAL` | `broker.flush_interval` | `50us` |
+| `AQUEDUCT_BROKER_MAX_RETRIES` | `broker.max_retries` | `3` |
+| `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` | `broker.quotas.default_publish_rate` | `100` |
+| `AQUEDUCT_BROKER_DEFAULT_BURST_SIZE` | `broker.quotas.default_burst_size` | `1000` |
+| `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
 
 ---
 
