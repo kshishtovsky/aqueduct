@@ -22,9 +22,8 @@ jobs:
           check-latest: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
+        run: |
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run
 
       - name: Run Tests with Race Detector and Coverage
         run: |
