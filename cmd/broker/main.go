@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -14,10 +15,12 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/kshishtovsky/aqueduct/internal/aal"
+	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/broker"
 	"github.com/kshishtovsky/aqueduct/internal/config"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
@@ -87,6 +90,11 @@ func main() {
 		}
 	}
 
+	if cfg.TLS.RequireClientCert {
+		tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
+		logger.Info("mTLS enabled: strict client certificate verification required")
+	}
+
 	if err := metrics.StartServer(cfg.MetricsAddr); err != nil {
 		logger.Error("failed to start metrics server", "err", err)
 		os.Exit(1)
@@ -103,13 +111,52 @@ func main() {
 		transport.WithReadBufSize(cfg.Transport.ReadBufSize),
 	}
 
+	if cfg.ACL.Enabled {
+		defaultPerm := authz.PermNone
+		if strings.ToLower(cfg.ACL.Default) == "all" {
+			defaultPerm = authz.PermAll
+		}
+		builder := authz.NewBuilder(defaultPerm)
+		for _, r := range cfg.ACL.Rules {
+			var perm authz.Permission
+			switch strings.ToLower(r.Permission) {
+			case "publish":
+				perm = authz.PermPublish
+			case "subscribe":
+				perm = authz.PermSubscribe
+			case "all":
+				perm = authz.PermAll
+			}
+			builder.Allow(r.Client, r.Topic, perm)
+		}
+		opts = append(opts, transport.WithAuthz(builder.Build()))
+		logger.Info("authorization ACL engine enabled")
+	}
+
 	if cfg.AAL.Enabled && cfg.AAL.FilePath != "" {
-		aalLog, err := aal.Open(cfg.AAL.FilePath)
+		var aalKey []byte
+		if cfg.AAL.Key != "" {
+			keyBytes, err := base64.StdEncoding.DecodeString(cfg.AAL.Key)
+			if err == nil && len(keyBytes) == 32 {
+				aalKey = keyBytes
+			} else if len(cfg.AAL.Key) == 32 {
+				aalKey = []byte(cfg.AAL.Key)
+			} else {
+				logger.Error("AAL encryption key must be 32 bytes (base64 encoded or raw)")
+				os.Exit(1)
+			}
+		}
+
+		aalLog, err := aal.OpenEncrypted(cfg.AAL.FilePath, aalKey)
 		if err != nil {
 			logger.Error("failed to open AAL file", "path", cfg.AAL.FilePath, "err", err)
 			os.Exit(1)
 		}
-		logger.Info("append-only logging enabled", "path", cfg.AAL.FilePath)
+		if len(aalKey) > 0 {
+			logger.Info("encrypted append-only logging enabled (AES-256-GCM)", "path", cfg.AAL.FilePath)
+		} else {
+			logger.Info("append-only logging enabled", "path", cfg.AAL.FilePath)
+		}
 		opts = append(opts, transport.WithAAL(aalLog))
 	}
 
@@ -149,10 +196,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("broker stopped gracefully")
+	logger.Info("broker stopped cleanly")
 }
 
-// prometheusMetrics adapts the global Prometheus counters to the RouterMetrics interface.
 type prometheusMetrics struct{}
 
 func (m *prometheusMetrics) OnPublish(topic string) {
@@ -167,43 +213,44 @@ func (m *prometheusMetrics) SetActiveSubscribers(n float64) {
 	metrics.ActiveSubscribers.Set(n)
 }
 
+
 func generateSelfSignedTLS() (*tls.Config, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate rsa key: %w", err)
 	}
 
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generate serial number: %w", err)
 	}
 
-	template := &x509.Certificate{
+	template := x509.Certificate{
 		SerialNumber:          serialNumber,
-		Subject:               pkix.Name{Organization: []string{"Aqueduct"}},
+		Subject:               pkix.Name{Organization: []string{"Aqueduct Ephemeral"}},
 		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IsCA:                  true,
 		BasicConstraintsValid: true,
+		IsCA:                  true,
 	}
 
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create certificate: %w", err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal private key: %w", err)
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load key pair: %w", err)
 	}
 
 	return &tls.Config{
@@ -212,5 +259,3 @@ func generateSelfSignedTLS() (*tls.Config, error) {
 		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
-
-

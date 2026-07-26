@@ -6,17 +6,31 @@ listen_addr: ":4242"
 # HTTP listen address for Prometheus metrics (/metrics) and health checks (/healthz)
 metrics_addr: ":9090"
 
-# TLS Configuration (TLS 1.3 strictly required)
+# TLS & mTLS Configuration (TLS 1.3 strictly required)
 tls:
   # Set to true to generate ephemeral self-signed certificates for development
   generate: true
   cert_file: ""
   key_file: ""
+  require_client_cert: false
 
-# Append-Only Logging (AAL) Configuration
+# Encrypted Append-Only Logging (AAL) Configuration
 aal:
   enabled: false
   file_path: ""
+  key: "" # Base64 encoded 32-byte key for AES-256-GCM encryption
+
+# Authorization ACL (Zero-Allocation SoA Bitmask Matrix)
+acl:
+  enabled: false
+  default: "none" # "none" or "all"
+  rules:
+    - client: "service-a"
+      topic: "orders"
+      permission: "publish"
+    - client: "service-b"
+      topic: "orders"
+      permission: "subscribe"
 
 # Transport & Memory Hardening Limits
 transport:
