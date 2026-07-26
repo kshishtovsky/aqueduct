@@ -18,13 +18,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version: '1.24'
           check-latest: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v4
+        uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.57.2
+          version: v1.64.5
 
       - name: Run Tests with Race Detector and Coverage
         run: |
@@ -34,10 +34,7 @@ jobs:
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total: | awk '{print $3}' | sed 's/%//')
           echo "Total Statement Coverage: ${COVERAGE}%"
-          if [ $(echo "$COVERAGE < 75.0" | bc -l) -eq 1 ]; then
-            echo "Coverage (${COVERAGE}%) is below 75% threshold!"
-            exit 1
-          fi
+          awk -v cov="$COVERAGE" 'BEGIN { if (cov < 75.0) { print "Coverage below 75%"; exit 1 } }'
 
       - name: Build Docker Image Check
         run: |
