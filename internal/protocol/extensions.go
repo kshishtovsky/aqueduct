@@ -10,6 +10,18 @@ const (
 	// ExtTraceContext is the TLV type for W3C Trace Context propagation.
 	ExtTraceContext ExtensionType = 0x01
 
+	// ExtCompression is the TLV type for payload compression metadata.
+	// Value: [Algo:1][UncompressedSize:4] (5 bytes total).
+	// Algo 1 = ZSTD. UncompressedSize is little-endian uint32.
+	ExtCompression ExtensionType = 0x02
+
+	// ExtCompressionValueLen is the fixed value length of a Compression TLV:
+	// Algo (1) + UncompressedSize (4) = 5 bytes.
+	ExtCompressionValueLen = 5
+
+	// AlgoZSTD is the algorithm identifier for ZSTD compression.
+	AlgoZSTD uint8 = 1
+
 	// ExtTraceContextLen is the fixed value length of a Trace Context TLV:
 	// TraceID (16) + SpanID (8) + TraceFlags (1) = 25 bytes.
 	ExtTraceContextLen = 25
@@ -152,6 +164,129 @@ func BuildExtensions(traceID []byte, spanID []byte, traceFlags byte) []byte {
 	SetExtTotalLen(b, 0, totalLen)
 	SetTraceContext(b, ExtHeaderLen, traceID, spanID, traceFlags)
 	return b
+}
+
+// BuildCompressionExtension creates a TLV entry value for compression metadata.
+// Returns a slab-allocated extension block containing a single Compression TLV entry.
+// Caller must ReleaseExtensions on the result.
+func BuildCompressionExtension(algo uint8, uncompressedSize uint32) []byte {
+	totalSize := ExtHeaderLen + ExtEntryHeader + ExtCompressionValueLen
+	b, err := globalSlab.Acquire(totalSize)
+	if err != nil {
+		b = make([]byte, totalSize)
+	} else {
+		b = b[:totalSize]
+	}
+
+	SetExtTotalLen(b, 0, ExtEntryHeader+ExtCompressionValueLen)
+	b[ExtHeaderLen] = byte(ExtCompression)
+	b[ExtHeaderLen+1] = ExtCompressionValueLen
+	b[ExtHeaderLen+2] = algo
+	binary.LittleEndian.PutUint32(b[ExtHeaderLen+3:ExtHeaderLen+7], uncompressedSize)
+	return b
+}
+
+// BuildMergedExtensionsWithCompression returns a new extension block containing all
+// entries from existing plus a Compression TLV entry. If existing is nil, returns
+// only the Compression TLV block. Caller must ReleaseExtensions on the result.
+func BuildMergedExtensionsWithCompression(existing []byte, uncompressedSize uint32) []byte {
+	var existingEntries []byte
+	if len(existing) >= ExtHeaderLen {
+		totalLen := ExtTotalLen(existing, 0)
+		if totalLen > 0 && len(existing) >= ExtHeaderLen+totalLen {
+			existingEntries = existing[ExtHeaderLen : ExtHeaderLen+totalLen]
+		}
+	}
+
+	compEntrySize := ExtEntryHeader + ExtCompressionValueLen
+	totalEntries := len(existingEntries) + compEntrySize
+	totalSize := ExtHeaderLen + totalEntries
+
+	b, err := globalSlab.Acquire(totalSize)
+	if err != nil {
+		b = make([]byte, totalSize)
+	} else {
+		b = b[:totalSize]
+	}
+
+	SetExtTotalLen(b, 0, totalEntries)
+	off := ExtHeaderLen
+
+	if len(existingEntries) > 0 {
+		copy(b[off:], existingEntries)
+		off += len(existingEntries)
+	}
+
+	b[off] = byte(ExtCompression)
+	b[off+1] = ExtCompressionValueLen
+	b[off+2] = AlgoZSTD
+	binary.LittleEndian.PutUint32(b[off+3:off+7], uncompressedSize)
+
+	return b
+}
+
+// StripExtension returns a new extension block with all entries of the given type removed.
+// Returns nil if no entries remain. Uses slab allocator for the new block.
+// SAFETY: extBlock is not modified.
+func StripExtension(extBlock []byte, typ ExtensionType) []byte {
+	if len(extBlock) < ExtHeaderLen {
+		return nil
+	}
+	totalLen := ExtTotalLen(extBlock, 0)
+	if totalLen == 0 {
+		return nil
+	}
+	if len(extBlock) < ExtHeaderLen+totalLen {
+		return nil
+	}
+
+	src := extBlock[ExtHeaderLen : ExtHeaderLen+totalLen]
+	var keepBytes int
+	off := 0
+	for off < len(src) {
+		if off+ExtEntryHeader > len(src) {
+			break
+		}
+		t := ExtensionType(src[off])
+		l := int(src[off+1])
+		if t != typ {
+			keepBytes += ExtEntryHeader + l
+		}
+		off += ExtEntryHeader + l
+	}
+
+	if keepBytes == 0 {
+		return nil
+	}
+
+	blockSize := ExtHeaderLen + keepBytes
+	dst, err := globalSlab.Acquire(blockSize)
+	if err != nil {
+		dst = make([]byte, blockSize)
+	} else {
+		dst = dst[:blockSize]
+	}
+
+	SetExtTotalLen(dst, 0, keepBytes)
+	dstOff := ExtHeaderLen
+	srcOff := 0
+	for srcOff < len(src) {
+		if srcOff+ExtEntryHeader > len(src) {
+			break
+		}
+		t := ExtensionType(src[srcOff])
+		l := int(src[srcOff+1])
+		if t != typ {
+			dst[dstOff] = byte(t)
+			dst[dstOff+1] = byte(l)
+			if l > 0 {
+				copy(dst[dstOff+2:dstOff+2+l], src[srcOff+2:srcOff+2+l])
+			}
+			dstOff += ExtEntryHeader + l
+		}
+		srcOff += ExtEntryHeader + l
+	}
+	return dst[:blockSize]
 }
 
 // ReleaseExtensions releases an extension block allocated via BuildExtensions.
