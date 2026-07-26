@@ -97,6 +97,7 @@
 * При мерже новой версии: создай тэг (`git tag vX.Y.Z main && git push origin vX.Y.Z`), обнови CHANGELOG.md.
 * В конце сессии: `git push origin --all` (все ветки) + `git push origin --tags`.
 * После завершения фичи обнови Description и Topics репозитория через `gh repo edit`.
+* **Pre-commit hooks:** activate with `git config core.hooksPath .githooks` — runs `golangci-lint` + `go test -race` on changed packages before every commit.
 
 ## 8. Формат вывода и коммуникации
 
