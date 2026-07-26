@@ -81,6 +81,18 @@ transport:
 
 ---
 
+## 性能压测工具 (`aqueduct-bench`)
+
+```bash
+# 编译压测工具
+go build -o bin/aqueduct-bench ./cmd/aqueduct-bench
+
+# 执行压测 (10 并发, 100,000 请求, 128 字节 Payload)
+./bin/aqueduct-bench -addr 127.0.0.1:4242 -c 10 -n 100000 -size 128 -topic bench
+```
+
+---
+
 ## 客户端代码示例
 
 - [Go 客户端示例](examples/go/main.go) — `quic-go` 原生实现。

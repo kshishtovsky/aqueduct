@@ -3,11 +3,9 @@ FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
-# Download dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source code
 COPY . .
 
 # Build static binary without CGO and strip debug symbols
@@ -18,11 +16,9 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /etc/aqueduct
 
-# Copy compiled binary and default config
 COPY --from=builder /bin/aqueduct-broker /bin/aqueduct-broker
 COPY config.yaml /etc/aqueduct/config.yaml
 
-# Run as non-root user
 USER 65532:65532
 
 # Expose QUIC UDP port and HTTP Prometheus metrics port
