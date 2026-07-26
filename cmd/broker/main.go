@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -144,12 +145,47 @@ func main() {
 
 	// Initialize cluster peer federation if peers are configured.
 	var pm *cluster.PeerManager
-	if len(cfg.Cluster.Peers) > 0 {
+	if len(cfg.Cluster.Peers) > 0 || cfg.Cluster.Discovery.Enabled {
 		peerTLS := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"aqueduct-mesh"}}
 		peerQUIC := &quic.Config{MaxIdleTimeout: 30 * time.Second}
-		pm = cluster.New(ctx, cfg.Cluster.Peers, peerTLS, peerQUIC)
+
+		// Start with static peers (may be empty if discovery-only mode).
+		pm = cluster.NewWithLogger(ctx, cfg.Cluster.Peers, peerTLS, peerQUIC, logger)
 		routerOpts = append(routerOpts, broker.WithPeerForwarder(pm))
-		logger.Info("cluster federation enabled", "peers", cfg.Cluster.Peers)
+
+		if len(cfg.Cluster.Peers) > 0 {
+			logger.Info("cluster federation enabled (static peers)", "peers", cfg.Cluster.Peers)
+		}
+
+		// Start DNS-based peer discovery if configured.
+		if cfg.Cluster.Discovery.Enabled && cfg.Cluster.Discovery.Host != "" {
+			discInterval, err := time.ParseDuration(cfg.Cluster.Discovery.Interval)
+			if err != nil || discInterval <= 0 {
+				discInterval = 10 * time.Second
+			}
+			discPort := cfg.Cluster.Discovery.Port
+			if discPort == "" {
+				// Extract port from listen_addr if not explicitly set.
+				if _, p, err := net.SplitHostPort(cfg.ListenAddr); err == nil && p != "" {
+					discPort = p
+				} else {
+					discPort = "4242"
+				}
+			}
+			discCfg := cluster.DiscoveryConfig{
+				Enabled:  true,
+				Host:     cfg.Cluster.Discovery.Host,
+				Port:     discPort,
+				Interval: discInterval,
+			}
+			disc := cluster.NewDiscovery(cluster.DefaultResolver{}, discCfg, pm, logger)
+			disc.Start(ctx)
+			logger.Info("dns peer discovery started",
+				"host", cfg.Cluster.Discovery.Host,
+				"port", discPort,
+				"interval", discInterval,
+			)
+		}
 	}
 
 	router := broker.NewRouter(routerMetrics, routerOpts...)

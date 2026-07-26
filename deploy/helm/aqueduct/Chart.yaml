@@ -1,0 +1,15 @@
+apiVersion: v2
+name: aqueduct
+description: Aqueduct - Ultra-fast QUIC message broker with P2P mesh federation
+type: application
+version: 0.1.0
+appVersion: "1.9.0"
+keywords:
+  - messaging
+  - broker
+  - quic
+  - p2p
+  - mesh
+home: https://github.com/kshishtovsky/aqueduct
+maintainers:
+  - name: aqueduct

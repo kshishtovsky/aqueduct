@@ -1,4 +1,4 @@
-# Explanation: Architecture & Memory Model (v1.11.0)
+# Explanation: Architecture & Memory Model (v1.14.0)
 
 This document explains the architectural principles, Data-Oriented Design (DoD) choices, security primitives, and zero-allocation memory strategies underlying Aqueduct's performance.
 
@@ -90,16 +90,52 @@ MQTT wildcard matching operates directly on byte slices without string conversio
 
 ---
 
-## 6. Direct Mesh Clustering (P2P Federation)
+## 6. Direct Mesh Clustering (P2P Federation) & DNS Discovery
 
 Aqueduct supports forming a cluster of broker instances connected via a direct peer-to-peer QUIC mesh. There is no central coordinator or consensus protocol (no Raft/Paxos). Forwarding is fire-and-forget.
 
-### PeerManager
+### PeerManager (RCU Pattern, v1.14.0)
 
-Each broker maintains outgoing QUIC connections to a static peer list. The PeerManager:
-- Dials each peer address on startup with mTLS 1.3
-- Runs a background reconnect loop with exponential backoff on disconnect
-- Exposes `Forward()` for zero-copy frame forwarding to all connected peers
+The PeerManager uses a **Read-Copy-Update (RCU)** pattern for lock-free reads on the hot path:
+
+```go
+type PeerManager struct {
+    peers   atomic.Pointer[peerSlice]   // lock-free atomic snapshot
+    mu      sync.Mutex                  // write-path only
+    addrSet map[string]int              // fast address lookup
+}
+```
+
+- **Reads** (`Forward()`, `PeerCount()`): Grab atomic pointer — zero locks, zero contention
+- **Writes** (`AddPeer()`, `RemovePeer()`): Create new slice, atomic swap. Write-path mutex only protects `addrSet` map
+- **Constructor**: `NewWithLogger()` initializes static peers, builds initial `peerSlice`
+
+### Dynamic Peer Management (v1.14.0)
+
+- `AddPeer(ctx, addr)` — dials new peer, adds to atomic snapshot, starts reconnect loop
+- `RemovePeer(addr)` — cancels context, closes stream, removes from atomic snapshot
+- `PeerCount()` — returns current peer count (atomic read)
+
+### DNS Discovery (v1.14.0)
+
+For Kubernetes StatefulSet deployments, the `Discovery` module polls Headless Service DNS records:
+
+```go
+type Discovery struct {
+    manager     *PeerManager
+    resolver    Resolver            // injectable interface for testing
+    hostname    string
+    port        int
+    interval    time.Duration
+    knownIPs    map[string]struct{} // fast diff tracking
+    cancel      context.CancelFunc
+}
+```
+
+- Polls `net.LookupHost(hostname)` every `interval` (default 10s)
+- Diffs against `knownIPs` map → calls `AddPeer()`/`RemovePeer()` only on change
+- `normalize()` deduplicates IPs and filters link-local (`169.254.x.x`) addresses
+- `Resolver` interface allows mocking DNS in tests without external deps
 
 ### MeshForwarded Bit
 
@@ -107,7 +143,7 @@ A single bit in the protocol's Command byte (bit 7, mask `0x80`) marks a frame a
 
 ### Zero-Copy Forwarding
 
-The `Forward()` method sets the MeshForwarded bit in-place on the shared buffer (0 heap allocations, 0 allocs/op) and writes the modified frame directly to each peer's QUIC stream.
+The `Forward()` method reads the atomic peer snapshot, then sets the MeshForwarded bit in-place on the shared buffer (0 heap allocations, 0 allocs/op) and writes the modified frame directly to each peer's QUIC stream. After write, the bit is restored to preserve buffer for local delivery.
 
 ### Router Integration
 

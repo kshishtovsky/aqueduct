@@ -1,4 +1,4 @@
-# 教程: Aqueduct 入门指南 (v1.11.0)
+# 教程: Aqueduct 入门指南 (v1.14.0)
 
 本教程指导您如何安装、配置和运行 Aqueduct 消息代理。
 
@@ -8,6 +8,7 @@
 
 - **Go 1.23+**
 - **Docker & Docker Compose** (可选)
+- **Kubernetes 1.28+** 含 `kubectl` 和 `helm`（可选，用于 K8s 部署）
 
 ---
 
@@ -23,7 +24,40 @@ docker compose up -d
 
 ---
 
-## 2. 配置文件 (`config.yaml`)
+## 2. Kubernetes 快速开始 (v1.14.0)
+
+部署 3 副本集群并启用 DNS 对等发现：
+
+```bash
+helm install aqueduct deploy/helm/aqueduct \
+  --set replicaCount=3 \
+  --set config.cluster.discovery.enabled=true \
+  --set config.cluster.discovery.host="aqueduct-headless.default.svc.cluster.local" \
+  --set config.cluster.discovery.port=4242
+```
+
+验证集群状态：
+
+```bash
+kubectl get pods -l app.kubernetes.io/name=aqueduct
+kubectl logs statefulset/aqueduct --tail=10 -f
+```
+
+动态扩缩容：
+
+```bash
+kubectl scale statefulset aqueduct --replicas=5
+```
+
+原始清单（不用 Helm）：
+
+```bash
+kubectl apply -f deploy/k8s/
+```
+
+---
+
+## 3. 配置文件 (`config.yaml`)
 
 ```yaml
 listen_addr: ":4242"
@@ -80,7 +114,7 @@ cluster:
 
 ---
 
-## 3. QoS 优先级队列、按优先级 TTL 与通配符
+## 4. QoS 优先级队列、按优先级 TTL 与通配符
 
 ### 优先级 TLV 扩展 (`ExtPriority = 0x03`)
 - 支持 `0`（最高/紧急）到 `3`（最低）共 4 个优先级。
@@ -96,6 +130,6 @@ cluster:
 
 ---
 
-## 4. NACK 与死信队列 (DLQ)
+## 5. NACK 与死信队列 (DLQ)
 
 订阅者可以通过 `CmdNack` (0x05) 操作码按偏移量对消息发送 NACK（否定确认）。代理会自动重新投递消息（最多 `max_retries` 次），之后消息将被路由到死信队列 `__dlq__<topic>`。

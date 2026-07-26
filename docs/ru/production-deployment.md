@@ -1,4 +1,4 @@
-# Руководство: Безопасность и развертывание в Production (v1.11.0)
+# Руководство: Безопасность и развертывание в Production (v1.14.0)
 
 Настоящее руководство описывает лучшие практики безопасного развертывания Aqueduct в промышленной среде.
 
@@ -112,7 +112,93 @@ cluster:
 
 ---
 
-## 6. NACK/DLQ в Production
+## 6. Развертывание в Kubernetes (v1.14.0+)
+
+### Почему Kubernetes?
+
+Статические списки пиров (`cluster.peers`) требуют ручной координации. StatefulSet с Headless Service обеспечивает **динамическое обнаружение пиров через DNS** без внешних зависимостей (Consul, etcd).
+
+### Helm Chart (Рекомендуется)
+
+```bash
+helm install aqueduct deploy/helm/aqueduct \
+  --set replicaCount=3 \
+  --set config.cluster.peers[0]="aqueduct-0.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.peers[1]="aqueduct-1.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.peers[2]="aqueduct-2.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.discovery.enabled=true \
+  --set config.cluster.discovery.host="aqueduct-headless.default.svc.cluster.local" \
+  --set config.cluster.discovery.port=4242 \
+  --set config.cluster.discovery.interval="10s"
+```
+
+### Headless Service (Обязательно для DNS Discovery)
+
+Headless Service (`clusterIP: None`) возвращает A-записи для каждого пода StatefulSet:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: aqueduct-headless
+spec:
+  clusterIP: None
+  ports:
+    - name: quic
+      port: 4242
+  selector:
+    app.kubernetes.io/name: aqueduct
+```
+
+DNS-паттерны подов:
+- `aqueduct-0.aqueduct-headless.<namespace>.svc.cluster.local`
+- `aqueduct-1.aqueduct-headless.<namespace>.svc.cluster.local`
+- и т.д.
+
+### DNS Discovery
+
+При включённом обнаружении брокер опрашивает DNS-запись Headless Service с интервалом `interval` и вычисляет разницу:
+
+```go
+ips, err := net.LookupHost("aqueduct-headless.default.svc.cluster.local")
+```
+
+- **Масштабирование вверх**: Новые IP подов автоматически подключаются через `AddPeer()`
+- **Масштабирование вниз**: Удалённые IP отключаются через `RemovePeer()`
+- **Нулевой даунтайм**: Переиспользуется экспоненциальная задержка переподключения
+
+### Конфигурация
+
+```yaml
+cluster:
+  peers: []  # пусто — discovery заполняет автоматически
+  discovery:
+    enabled: true
+    type: "dns"
+    host: "aqueduct-headless.default.svc.cluster.local"
+    port: 4242
+    interval: "10s"
+```
+
+### Масштабирование
+
+```bash
+kubectl scale statefulset aqueduct --replicas=5
+kubectl rollout restart statefulset aqueduct
+```
+
+### Raw-манифесты Kubernetes
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/configmap.yaml
+kubectl apply -f deploy/k8s/services.yaml
+kubectl apply -f deploy/k8s/statefulset.yaml
+```
+
+---
+
+## 7. NACK/DLQ в Production
 
 Настройка повторной доставки NACK и Dead Letter Queue:
 
@@ -123,7 +209,7 @@ cluster:
 
 ---
 
-## 7. Квоты Rate Limiting
+## 8. Квоты Rate Limiting
 
 Настройка ограничения скорости для каждого клиента:
 

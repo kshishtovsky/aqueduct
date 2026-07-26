@@ -1,4 +1,4 @@
-# How-to: Production Deployment & Security (v1.11.0)
+# How-to: Production Deployment & Security (v1.14.0)
 
 This guide details best practices for deploying Aqueduct securely in enterprise production environments.
 
@@ -112,7 +112,99 @@ cluster:
 
 ---
 
-## 6. NACK/DLQ in Production
+## 6. Kubernetes Deployment (v1.14.0+)
+
+### Why Kubernetes?
+
+Static peer lists (`cluster.peers`) require manual coordination — every node must know all others in advance. Kubernetes StatefulSets with Headless Services provide **dynamic DNS-based peer discovery** with zero external dependencies (Consul, etcd).
+
+### Helm Chart (Recommended)
+
+```bash
+helm install aqueduct deploy/helm/aqueduct \
+  --set replicaCount=3 \
+  --set config.cluster.peers[0]="aqueduct-0.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.peers[1]="aqueduct-1.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.peers[2]="aqueduct-2.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.discovery.enabled=true \
+  --set config.cluster.discovery.host="aqueduct-headless.default.svc.cluster.local" \
+  --set config.cluster.discovery.port=4242 \
+  --set config.cluster.discovery.interval="10s"
+```
+
+### Headless Service (Required for DNS Discovery)
+
+The Headless Service (`clusterIP: None`) returns A records for individual StatefulSet pods:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: aqueduct-headless
+spec:
+  clusterIP: None
+  ports:
+    - name: quic
+      port: 4242
+  selector:
+    app.kubernetes.io/name: aqueduct
+```
+
+Pod DNS patterns:
+- `aqueduct-0.aqueduct-headless.<namespace>.svc.cluster.local`
+- `aqueduct-1.aqueduct-headless.<namespace>.svc.cluster.local`
+- etc.
+
+### DNS Discovery
+
+With discovery enabled, the broker polls the Headless Service DNS record every `interval` and diffs the result against known peers:
+
+```go
+// ResolveHead resolves Headless Service A records via net.LookupHost
+ips, err := net.LookupHost("aqueduct-headless.default.svc.cluster.local")
+```
+
+- **Scale up**: New pod IPs are automatically connected via `AddPeer()`
+- **Scale down**: Removed IPs are disconnected via `RemovePeer()`
+- **Zero downtime**: Connections use exponential backoff reconnect
+
+### Configuration
+
+```yaml
+cluster:
+  peers: []  # empty — discovery populates automatically
+  discovery:
+    enabled: true
+    type: "dns"
+    host: "aqueduct-headless.default.svc.cluster.local"
+    port: 4242
+    interval: "10s"
+```
+
+### Scaling
+
+```bash
+# Scale to 5 replicas
+kubectl scale statefulset aqueduct --replicas=5
+
+# Rollout restart (zero-downtime upgrade)
+kubectl rollout restart statefulset aqueduct
+```
+
+### Raw Kubernetes Manifests
+
+For non-Helm users, raw manifests are in `deploy/k8s/`:
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/configmap.yaml
+kubectl apply -f deploy/k8s/services.yaml
+kubectl apply -f deploy/k8s/statefulset.yaml
+```
+
+---
+
+## 7. NACK/DLQ in Production
 
 Configure NACK redelivery and Dead Letter Queue:
 
@@ -123,7 +215,7 @@ Configure NACK redelivery and Dead Letter Queue:
 
 ---
 
-## 7. Rate Limiting Quotas
+## 8. Rate Limiting Quotas
 
 Configure per-tenant rate limiting:
 

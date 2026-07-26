@@ -144,6 +144,10 @@ transport:
 | `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` | `broker.quotas.default_publish_rate` | `100` |
 | `AQUEDUCT_BROKER_DEFAULT_BURST_SIZE` | `broker.quotas.default_burst_size` | `1000` |
 | `AQUEDUCT_TRANSPORT_MAX_BUF_SIZE` | `transport.max_buf_size` | `131072` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_ENABLED` | `cluster.discovery.enabled` | `true` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_HOST` | `cluster.discovery.host` | `aqueduct-headless.default.svc.cluster.local` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_PORT` | `cluster.discovery.port` | `4242` |
+| `AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL` | `cluster.discovery.interval` | `10s` |
 
 ---
 
@@ -153,6 +157,71 @@ transport:
 - **Справочник**: [Спецификация бинарного протокола](docs/ru/protocol-spec.md)
 - **Объяснение**: [Архитектура и модель памяти](docs/ru/architecture.md)
 - **Практическое руководство**: [Развертывание в Production и безопасность](docs/ru/production-deployment.md)
+
+---
+
+## Развертывание в Kubernetes (Helm)
+
+Разверните 3-узловой кластер Aqueduct с DNS-обнаружением пиров одной командой:
+
+```bash
+helm install aqueduct ./deploy/helm/aqueduct \
+  --namespace aqueduct --create-namespace
+```
+
+### Как работает обнаружение пиров
+
+При развертывании в Kubernetes Aqueduct использует **DNS-обнаружение пиров** через Headless Service:
+
+1. Каждый под получает стабильное DNS-имя: `aqueduct-0.aqueduct-headless.aqueduct.svc.cluster.local`
+2. Headless Service возвращает **A-записи** для всех готовых подов
+3. Фоновая горутина опрашивает DNS каждые 10 секунд (настраивается)
+4. Новые поды (скейлап) автоматически подключаются, завершенные поды (скейлдаун) удаляются
+5. Используется RCU (Read-Copy-Update) атомарный swap — нулевые блокировки на горячем пути маршрутизации
+
+### Почему DNS вместо K8s API (client-go)
+
+| Аспект | DNS-резолюция | client-go |
+| :--- | :--- | :--- |
+| Влияние на размер бинарника | 0 MB (stdlib) | ~40 MB |
+| Внешние зависимости | Нет | REST-клиент, protobuf, informers |
+| Динамические обновления | Автоматически (Headless Service) | Watch + label selector |
+| Философия статического бинарника | Да | Нет |
+
+### Конфигурация
+
+```yaml
+cluster:
+  discovery:
+    enabled: true
+    type: "dns"
+    host: "aqueduct-headless.aqueduct.svc.cluster.local"
+    port: "4242"
+    interval: "10s"
+```
+
+### Масштабирование
+
+```bash
+# Масштаб до 5 реплик
+helm upgrade aqueduct ./deploy/helm/aqueduct --set replicaCount=5
+
+# Сокращение до 2 реплик
+helm upgrade aqueduct ./deploy/helm/aqueduct --set replicaCount=2
+```
+
+DNS-обнаружение автоматически согласовывает P2P mesh — ручная настройка не требуется.
+
+### сырые K8s-манифесты
+
+Для развертывания без Helm, манифесты находятся в `deploy/k8s/`:
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/configmap.yaml
+kubectl apply -f deploy/k8s/services.yaml
+kubectl apply -f deploy/k8s/statefulset.yaml
+```
 
 ---
 

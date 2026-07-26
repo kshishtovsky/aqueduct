@@ -1,0 +1,80 @@
+# Aqueduct Helm Chart Values
+
+replicaCount: 3
+
+image:
+  repository: aqueduct-broker
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  quicPort: 4242
+  metricsPort: 9090
+
+headlessService:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+config:
+  listenAddr: ":4242"
+  metricsAddr: ":9090"
+
+  tls:
+    generate: true
+    requireClientCert: false
+
+  cluster:
+    discovery:
+      enabled: true
+      type: dns
+      host: "" # auto-set to headless service FQDN if empty
+      port: "4242"
+      interval: "10s"
+    peers: []
+
+  broker:
+    queueSize: 1024
+    backpressurePolicy: drop_oldest
+    batchSize: 65536
+    flushInterval: 50us
+    maxRetries: 3
+
+  tracing:
+    enabled: false
+    serviceName: aqueduct-broker
+    endpoint: localhost:4317
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+
+podLabels: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+terminationGracePeriodSeconds: 30

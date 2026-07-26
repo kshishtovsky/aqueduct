@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aqueduct-config
+  namespace: aqueduct
+  labels:
+    app: aqueduct
+data:
+  config.yaml: |
+    listen_addr: ":4242"
+    metrics_addr: ":9090"
+
+    tls:
+      generate: true
+      require_client_cert: false
+
+    aal:
+      enabled: false
+      file_path: ""
+      key: ""
+
+    acl:
+      enabled: false
+      default: "none"
+
+    broker:
+      queue_size: 1024
+      backpressure_policy: "drop_oldest"
+      batch_size: 65536
+      flush_interval: 50us
+      max_retries: 3
+      priority_ttls: ["500ms", "5s", "0", "0"]
+      quotas:
+        default_publish_rate: 0
+        default_burst_size: 1000
+
+    cluster:
+      peers: []
+      discovery:
+        enabled: true
+        type: "dns"
+        host: "aqueduct-headless.aqueduct.svc.cluster.local"
+        port: "4242"
+        interval: "10s"
+
+    transport:
+      max_buf_size: 65536
+      read_buf_size: 1024
+
+    tracing:
+      enabled: false
+      service_name: "aqueduct-broker"
+      endpoint: "localhost:4317"
