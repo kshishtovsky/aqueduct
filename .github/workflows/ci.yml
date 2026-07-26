@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   lint-and-test:
     name: Lint & Test
@@ -57,7 +61,10 @@ jobs:
       - name: Run Fuzz Tests (regression mode)
         continue-on-error: true
         run: |
-          go test -fuzz=Fuzz -fuzztime=30s -run=^$ ./internal/...
+          find internal -name '*_fuzz_test.go' -exec dirname {} \; | sort -u | while read -r pkg; do
+            echo "→ fuzzing $pkg (30s)"
+            go test -fuzz=Fuzz -fuzztime=30s -run='^$' "./$pkg" || true
+          done
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@master
