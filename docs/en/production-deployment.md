@@ -1,4 +1,4 @@
-# How-to: Production Deployment & Security (v1.5.0)
+# How-to: Production Deployment & Security (v1.8.0)
 
 This guide details best practices for deploying Aqueduct securely in enterprise production environments.
 
@@ -52,6 +52,12 @@ Choose backpressure isolation based on application requirements:
 broker:
   queue_size: 2048
   backpressure_policy: "drop_oldest"
+  batch_size: 65536
+  flush_interval: 50us
+  max_retries: 3
+  quotas:
+    default_publish_rate: 100
+    default_burst_size: 1000
 ```
 
 ---
@@ -68,7 +74,7 @@ ulimit -n 65536
 
 ---
 
-## 5. Cluster Deployment (v1.5.0+)
+## 5. Cluster Deployment (v1.8.0+)
 
 Deploy multiple Aqueduct brokers in a direct mesh for horizontal scaling. Each broker connects to all others:
 
@@ -103,3 +109,25 @@ cluster:
 - Each node must be configured with its own TLS certificate/key
 - For 3+ node topologies, each node must list all other peers
 - No ordering guarantees across nodes (fire-and-forget)
+
+---
+
+## 6. NACK/DLQ in Production
+
+Configure NACK redelivery and Dead Letter Queue:
+
+- Set `max_retries` (default 3) in `config.yaml` or via `AQUEDUCT_BROKER_MAX_RETRIES`
+- DLQ topics follow the pattern `__dlq__<original_topic>`
+- Monitor `aqueduct_messages_nacked_total` and `aqueduct_messages_dead_lettered_total`
+- Connect a subscriber to `__dlq__*` topics for offline inspection
+
+---
+
+## 7. Rate Limiting Quotas
+
+Configure per-tenant rate limiting:
+
+- Set `broker.quotas.default_publish_rate` and `broker.quotas.default_burst_size` in `config.yaml`
+- Per-client overrides: `broker.quotas.per_client.<client_id>`
+- Monitor `aqueduct_messages_rate_limited_total` metric
+- The YAML configuration shown in Section 3 includes the full quota block

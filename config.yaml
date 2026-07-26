@@ -1,4 +1,4 @@
-# Aqueduct Message Broker Configuration (v1.0.0)
+# Aqueduct Message Broker Configuration (v1.8.0)
 
 # UDP listen address for QUIC broker
 listen_addr: ":4242"
@@ -40,6 +40,11 @@ broker:
   batch_size: 65536              # Coalesced write batch size in bytes (default 64 KB)
   flush_interval: 50us           # Micro-timer flush interval (default 50 µs)
   max_retries: 3                 # Max NACK retries before moving to DLQ (default 3)
+
+  # Per-tenant rate limiting (Token Bucket)
+  quotas:
+    default_publish_rate: 0    # default publish rate limit (msg/s), 0 = unlimited
+    default_burst_size: 1000   # default burst size
 
 # Transport & Memory Hardening Limits
 transport:
