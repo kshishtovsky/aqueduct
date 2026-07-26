@@ -26,6 +26,13 @@ const (
 	// TraceID (16) + SpanID (8) + TraceFlags (1) = 25 bytes.
 	ExtTraceContextLen = 25
 
+	// ExtRetryOffset is the TLV type for NACK retry offset tracking (internal use).
+	// Value: [OriginalOffset:8] — little-endian uint64.
+	// When present, the delivery loop uses this offset instead of the topic counter
+	// for frame cache key and wire offset, ensuring NACK counters correctly converge
+	// to max_retries and trigger DLQ.
+	ExtRetryOffset ExtensionType = 0xF0
+
 	// ExtHeaderLen is the 2-byte ExtTotalLen prefix before TLV entries.
 	ExtHeaderLen = 2
 

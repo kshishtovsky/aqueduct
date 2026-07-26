@@ -65,5 +65,5 @@ tracing:
 
 # Transport & Memory Hardening Limits
 transport:
-  max_buf_size: 65536     # 64 KB maximum buffer limit per stream
+  max_buf_size: 1048576     # 64 KB maximum buffer limit per stream
   read_buf_size: 1024     # 1 KB initial read buffer per stream
