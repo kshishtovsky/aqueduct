@@ -71,7 +71,7 @@ var (
 			Name: "aqueduct_messages_expired_total",
 			Help: "Total number of messages dropped due to TTL expiry",
 		},
-		[]string{"topic"},
+		[]string{"topic", "priority"},
 	)
 
 	AALRotations = prometheus.NewCounter(

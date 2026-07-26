@@ -90,7 +90,27 @@ type BrokerConfig struct {
 	BatchSize          int           `yaml:"batch_size"`          // coalesced write threshold in bytes (default 64KB)
 	FlushInterval      time.Duration `yaml:"flush_interval"`      // micro-timer flush interval (default 50µs)
 	MaxRetries         int           `yaml:"max_retries"`         // max NACK retries before DLQ (default 3)
+	PriorityTTLs       []string      `yaml:"priority_ttls"`       // per-priority TTL array e.g. ["500ms", "5s", "0", "0"]
 	Quotas             QuotasConfig  `yaml:"quotas"`
+}
+
+// GetPriorityTTLs parses PriorityTTLs strings into a fixed 4-element time.Duration array.
+func (b BrokerConfig) GetPriorityTTLs() [4]time.Duration {
+	var res [4]time.Duration
+	for i, s := range b.PriorityTTLs {
+		if i >= 4 {
+			break
+		}
+		if s == "" || s == "0" || s == "0s" {
+			res[i] = 0
+			continue
+		}
+		d, err := time.ParseDuration(s)
+		if err == nil {
+			res[i] = d
+		}
+	}
+	return res
 }
 
 // CompressionConfig defines payload compression settings for batch forwarding.
