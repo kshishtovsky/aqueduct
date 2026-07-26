@@ -1,16 +1,6 @@
-```
-                                                                                                   
-                                                                                                   
-      db       .g8""8q. `7MMF'   `7MF'`7MM"""YMM  `7MM"""Yb. `7MMF'   `7MF' .g8"""bgd MMP""MM""YMM 
-     ;MM:    .dP'    `YM. MM       M    MM    `7    MM    `Yb. MM       M .dP'     `M P'   MM   `7 
-    ,V^MM.   dM'      `MM MM       M    MM   d      MM     `Mb MM       M dM'       `      MM      
-   ,M  `MM   MM        MM MM       M    MMmmMM      MM      MM MM       M MM               MM      
-   AbmmmqMA  MM.      ,MP MM       M    MM   Y  ,   MM     ,MP MM       M MM.              MM      
-  A'     VML `Mb.    ,dP' YM.     ,M    MM     ,M   MM    ,dP' YM.     ,M `Mb.     ,'      MM      
-.AMA.   .AMMA. `"bmmd"'    `bmmmmd"'  .JMMmmmmMMM .JMMmmmdP'    `bmmmmd"'   `"bmmmd'     .JMML.    
-                   MMb                                                                             
-                    `bood'                                                                         
-```
+<div align="center">
+  <img src="docs/image_readme.png" alt="Aqueduct Banner">
+</div>
 
 # Aqueduct
 
