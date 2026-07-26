@@ -141,31 +141,17 @@ func (pm *PeerManager) Forward(rawBuf []byte, addForwardedBit bool) {
 			continue
 		}
 
-		// Zero-copy forwarding: write the modified frame in one contiguous chunk.
-		// For small frames (<= 256 bytes) we build the modified buffer on the stack
-		// so the entire frame arrives in a single QUIC STREAM frame at the receiver,
-		// preventing header fragmentation. No heap allocation in the common case.
+		// Zero-copy forwarding: set the MeshForwarded bit in-place, write, then
+		// restore the original byte. rawBuf comes from the caller (which releases
+		// it via sync.Pool), so temporary mutation is safe and avoids heap allocation
+		// of a separate buffer. No heap allocation in the common case.
 		if addForwardedBit {
-			totalLen := len(rawBuf)
-			if totalLen <= 256 {
-				var combined [256]byte
-				combined[0] = rawBuf[0]
-				combined[1] = rawBuf[1] | byte(protocol.MeshForwardedBit)
-				copy(combined[2:], rawBuf[2:])
-				if _, err := s.Write(combined[:totalLen]); err != nil {
-					continue
-				}
-			} else {
-				var hdr [protocol.HeaderSize]byte
-				hdr[0] = rawBuf[0]
-				hdr[1] = rawBuf[1] | byte(protocol.MeshForwardedBit)
-				copy(hdr[2:], rawBuf[2:protocol.HeaderSize])
-				if _, err := s.Write(hdr[:]); err != nil {
-					continue
-				}
-				if _, err := s.Write(rawBuf[protocol.HeaderSize:]); err != nil {
-					continue
-				}
+			orig := rawBuf[1]
+			rawBuf[1] = orig | byte(protocol.MeshForwardedBit)
+			_, werr := s.Write(rawBuf)
+			rawBuf[1] = orig
+			if werr != nil {
+				continue
 			}
 		} else {
 			if _, err := s.Write(rawBuf); err != nil {
