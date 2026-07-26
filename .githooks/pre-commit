@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STAGED_GO=$(git diff --cached --name-only --diff-filter=ACMR | grep '\.go$' || true)
+
+if [ -z "$STAGED_GO" ]; then
+    echo "--- Pre-commit: No Go files staged, skipping."
+    exit 0
+fi
+
+echo "--- Pre-commit: Running golangci-lint..."
+if ! go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run ./... 2>&1; then
+    echo "❌ Lint failed. Fix the issues above and try again."
+    exit 1
+fi
+echo "✓ Lint passed."
+
+# Collect unique directories for changed packages
+PKG_DIRS=$(echo "$STAGED_GO" | xargs -I{} dirname {} | sort -u | grep -v '^\.$' || echo ".")
+
+# Build test package list for changed packages only
+TEST_PKGS=""
+for dir in $PKG_DIRS; do
+    if ls "$dir/"*_test.go 2>/dev/null; then
+        TEST_PKGS="$TEST_PKGS ./$dir"
+    fi
+done
+
+if [ -z "$TEST_PKGS" ]; then
+    echo "✓ No test files in changed packages, skipping tests."
+    exit 0
+fi
+
+echo "--- Pre-commit: Running tests with race detector..."
+if ! go test -race $TEST_PKGS 2>&1; then
+    echo "❌ Tests failed in changed packages. Fix the issues above and try again."
+    exit 1
+fi
+echo "✓ Tests passed."
