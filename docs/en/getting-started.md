@@ -1,4 +1,4 @@
-# Tutorial: Getting Started with Aqueduct (v1.5.0)
+# Tutorial: Getting Started with Aqueduct (v1.8.0)
 
 This tutorial guides you through installing, configuring, running, and interacting with the Aqueduct message broker.
 
@@ -6,7 +6,7 @@ This tutorial guides you through installing, configuring, running, and interacti
 
 ## Prerequisites
 
-- **Go 1.22+**
+- **Go 1.23+**
 - **Docker & Docker Compose** (optional)
 
 ---
@@ -60,6 +60,12 @@ acl:
 broker:
   queue_size: 1024
   backpressure_policy: "drop_oldest" # "drop_oldest", "drop_newest", or "disconnect"
+  batch_size: 65536
+  flush_interval: 50us
+  max_retries: 3
+  quotas:
+    default_publish_rate: 0
+    default_burst_size: 1000
 
 transport:
   max_buf_size: 65536
@@ -83,3 +89,9 @@ cluster:
 To publish a message with a 500ms expiration time:
 - Set payload to: `"ttl:500:sensor/room1/temp"`
 - If the subscriber queue is delayed past 500ms, the message is automatically dropped before network transmission.
+
+---
+
+## 4. NACK & Dead Letter Queue (DLQ)
+
+Subscribers can NACK (Negative Acknowledgement) a message by offset using the `CmdNack` (0x05) opcode. The broker automatically redelivers the message (up to `max_retries`), after which the message is routed to the dead letter queue topic `__dlq__<topic>`.
