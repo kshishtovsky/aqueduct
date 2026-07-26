@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -425,6 +426,15 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 					b.router.AckOffset(consumerID, topic, offset)
 				} else {
 					logger.Warn("ack payload error", "err", err)
+				}
+				consumed += totalLen
+				continue
+			case protocol.CmdNack:
+				if len(frame.Payload) >= 8 {
+					nackOffset := binary.LittleEndian.Uint64(frame.Payload[:8])
+					b.router.NackByStream(uint32(stream.StreamID()), nackOffset)
+				} else {
+					logger.Warn("nack payload too short", "len", len(frame.Payload))
 				}
 				consumed += totalLen
 				continue

@@ -39,6 +39,7 @@ broker:
   backpressure_policy: "drop_oldest" # "drop_oldest", "drop_newest", or "disconnect"
   batch_size: 65536              # Coalesced write batch size in bytes (default 64 KB)
   flush_interval: 50us           # Micro-timer flush interval (default 50 µs)
+  max_retries: 3                 # Max NACK retries before moving to DLQ (default 3)
 
 # Transport & Memory Hardening Limits
 transport:
