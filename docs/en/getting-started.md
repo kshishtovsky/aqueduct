@@ -1,4 +1,4 @@
-# Tutorial: Getting Started with Aqueduct (v1.8.0)
+# Tutorial: Getting Started with Aqueduct (v1.11.0)
 
 This tutorial guides you through installing, configuring, running, and interacting with the Aqueduct message broker.
 
@@ -63,6 +63,11 @@ broker:
   batch_size: 65536
   flush_interval: 50us
   max_retries: 3
+  priority_ttls:
+    - "500ms"  # Priority 0 (Highest)
+    - "5s"     # Priority 1 (High)
+    - "0"      # Priority 2 (Normal - no TTL override)
+    - "0"      # Priority 3 (Low - no TTL override)
   quotas:
     default_publish_rate: 0
     default_burst_size: 1000
@@ -79,16 +84,19 @@ cluster:
 
 ---
 
-## 3. Using Message TTL & Wildcards
+## 3. Using QoS Priority Queues, Per-Priority TTL & Wildcards
+
+### Priority TLV Extension (`ExtPriority = 0x03`)
+- Priority levels range from `0` (Highest/Critical) to `3` (Low/Bulk).
+- Critical messages (Priority 0) bypass lower priority messages in subscriber Writer queues.
+
+### Per-Priority TTL
+- Configured via `priority_ttls` in `config.yaml`.
+- Messages published at Priority `P` automatically inherit `priority_ttls[P]`. If subscriber queues are delayed past the TTL, the stale message is lazily dropped on dequeue.
 
 ### Wildcard Subscription Examples
 - `sensor/+/temp`: Matches `sensor/room1/temp` and `sensor/room2/temp`.
 - `sensor/#`: Matches all subtopics under `sensor/`.
-
-### Message TTL Payload Format
-To publish a message with a 500ms expiration time:
-- Set payload to: `"ttl:500:sensor/room1/temp"`
-- If the subscriber queue is delayed past 500ms, the message is automatically dropped before network transmission.
 
 ---
 

@@ -1,4 +1,4 @@
-# How-to: Production Deployment & Security (v1.8.0)
+# How-to: Production Deployment & Security (v1.11.0)
 
 This guide details best practices for deploying Aqueduct securely in enterprise production environments.
 

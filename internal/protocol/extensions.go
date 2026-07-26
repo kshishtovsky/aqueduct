@@ -32,6 +32,21 @@ const (
 	// ExtEntryHeader is the TLV entry overhead: Type (1) + Len (1) = 2 bytes.
 	ExtEntryHeader = 2
 
+	// ExtPriority is the TLV type for message priority QoS.
+	// Value: [PriorityLevel: 1] (1 byte).
+	// Levels: 0 (Highest), 1 (High), 2 (Normal), 3 (Low). Default: 2 (Normal).
+	ExtPriority ExtensionType = 0x03
+
+	// ExtPriorityLen is the fixed value length of a Priority TLV: 1 byte.
+	ExtPriorityLen = 1
+
+	// Message priority levels.
+	PriorityHighest uint8 = 0
+	PriorityHigh    uint8 = 1
+	PriorityNormal  uint8 = 2
+	PriorityLow     uint8 = 3
+	DefaultPriority uint8 = PriorityNormal
+
 	// MaxExtTotalLen limits the total TLV block size to prevent DoS.
 	MaxExtTotalLen = 1024
 )
@@ -121,6 +136,41 @@ func FindExtension(extBlock []byte, typ ExtensionType) ([]byte, bool) {
 		offset = valStart + l
 	}
 	return nil, false
+}
+
+// ExtractPriority extracts the Priority level from extBlock.
+// Returns priority level (0..3). If no priority extension is present or invalid,
+// returns DefaultPriority (2), false. Zero-alloc.
+func ExtractPriority(extBlock []byte) (priority uint8, ok bool) {
+	val, found := FindExtension(extBlock, ExtPriority)
+	if !found || len(val) < ExtPriorityLen {
+		return DefaultPriority, false
+	}
+	p := val[0]
+	if p > PriorityLow {
+		return DefaultPriority, false
+	}
+	return p, true
+}
+
+// BuildPriorityExtension creates a TLV extension block containing a single Priority entry.
+// Uses slab allocator for zero-alloc on hot path.
+func BuildPriorityExtension(priority uint8) []byte {
+	totalLen := ExtEntryHeader + ExtPriorityLen
+	totalSize := ExtHeaderLen + totalLen
+
+	b, err := globalSlab.Acquire(totalSize)
+	if err != nil {
+		b = make([]byte, totalSize)
+	} else {
+		b = b[:totalSize]
+	}
+
+	SetExtTotalLen(b, 0, totalLen)
+	b[ExtHeaderLen] = byte(ExtPriority)
+	b[ExtHeaderLen+1] = ExtPriorityLen
+	b[ExtHeaderLen+2] = priority
+	return b
 }
 
 // ExtractTraceContext extracts a W3C Trace Context from extBlock.
