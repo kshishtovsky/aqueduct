@@ -92,7 +92,22 @@ func main() {
 
 	if cfg.TLS.RequireClientCert {
 		tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
-		logger.Info("mTLS enabled: strict client certificate verification required")
+		if cfg.TLS.ClientCAFile != "" {
+			caPEM, err := os.ReadFile(cfg.TLS.ClientCAFile)
+			if err != nil {
+				logger.Error("failed to read client CA file", "path", cfg.TLS.ClientCAFile, "err", err)
+				os.Exit(1)
+			}
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(caPEM) {
+				logger.Error("failed to parse client CA certificates from PEM", "path", cfg.TLS.ClientCAFile)
+				os.Exit(1)
+			}
+			tlsConf.ClientCAs = caPool
+			logger.Info("loaded client CA pool for mTLS verification", "path", cfg.TLS.ClientCAFile)
+		} else {
+			logger.Info("mTLS enabled: strict client certificate verification required (using system CA pool)")
+		}
 	}
 
 	if err := metrics.StartServer(cfg.MetricsAddr); err != nil {
