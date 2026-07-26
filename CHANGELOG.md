@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-07-26
+
+### Added
+- **Zero-Allocation ZSTD Compression for Batches**: New `internal/compress` package with `ZstdEngine` — slab-backed zero-copy compression using `klauspost/compress/zstd`. Encoder/Decoder pools eliminate allocations on the hot path.
+- **Compression TLV Extension**: `ExtCompression` type (`0x02`) carrying `[Algo:1][UncompressedSize:4]` metadata alongside compressed payload. Merged into existing TLV block during serialization, stripped after decompression.
+- **Cluster Peer Compression**: `Router.PublishBatch` transparently compresses batch payload before peer forwarding (skips batches < 1 KB). Local subscribers receive uncompressed data — zero protocol breakage.
+- **Decompression in Transport**: `dispatchFrames` detects Compression TLV, decompresses via `ZstdEngine`, strips the TLV, and routes the decompressed frame through standard dispatch. Corrupted payloads close the stream with `ProtocolError`.
+- **Compression Configuration**: `CompressionConfig` block in YAML/config with `enabled` (default: `false`), `min_batch_size` (default: `1024`), and `level` (default: `0`) fields + `AQUEDUCT_COMPRESSION_*` env overrides.
+
+### Performance
+- `BenchmarkZSTDEncode` (9 KB random): **2361 ns/op, 0 allocs/op**, 1734 MB/s
+- `BenchmarkZSTDDecode`: **6272 ns/op, 1 allocs/op** (1 alloc from `make` required for async lifecycle safety)
+- `BenchmarkBatchPublishWithCompression` (100 msg × 128 B, with peers): **0 allocs/op**, ~467 MB/s (CPU cost of ZSTD adds ~14 µs per batch)
+- Compression ratio (compressible data): **67:1** (4300 → 64 bytes)
+
+### Security
+- `go test -race ./internal/...`: 0 data races
+- Corrupted compressed payloads return `ErrCorruptedPayload` — no panic, no OOB read, stream closed gracefully
+- Coverage: 82.1% on `internal/compress`, 0/0 lint errors (`go vet`)
+
 ## [1.9.0] - 2026-07-26
 
 ### Added

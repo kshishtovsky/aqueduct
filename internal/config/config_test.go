@@ -29,6 +29,12 @@ func TestConfigDefault(t *testing.T) {
 	if cfg.Transport.MaxBufSize != 64*1024 {
 		t.Errorf("expected default MaxBufSize 64KB, got %d", cfg.Transport.MaxBufSize)
 	}
+	if cfg.Compression.Enabled {
+		t.Errorf("expected default Compression.Enabled false, got true")
+	}
+	if cfg.Compression.MinBatchSize != 1024 {
+		t.Errorf("expected default Compression.MinBatchSize 1024, got %d", cfg.Compression.MinBatchSize)
+	}
 }
 
 func TestConfigLoadYAML(t *testing.T) {

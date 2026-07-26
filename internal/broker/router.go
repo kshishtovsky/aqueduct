@@ -118,6 +118,13 @@ func WithPeerForwarder(f PeerForwarder) RouterOption {
 	}
 }
 
+// CompressionEngine is the interface for batch payload compression.
+type CompressionEngine interface {
+	Compress(src []byte) ([]byte, error)
+	Decompress(src []byte, uncompressedSize int) ([]byte, error)
+	ReleaseBuf(buf []byte)
+}
+
 // WithBatchSize sets the coalesced write batch size in bytes for subscriber writers.
 // Must be > 0. Default: 64 KB.
 func WithBatchSize(n int) RouterOption {
@@ -135,6 +142,16 @@ func WithFlushInterval(d time.Duration) RouterOption {
 		if d > 0 {
 			r.flushInterval = d
 		}
+	}
+}
+
+// WithCompression enables batch payload compression for peer forwarding.
+// engine provides ZSTD compression, minBatchSize is the minimum payload size
+// in bytes before compression is applied (default 1024).
+func WithCompression(engine CompressionEngine, minBatchSize int) RouterOption {
+	return func(r *Router) {
+		r.compression = engine
+		r.compressionMinSize = minBatchSize
 	}
 }
 
@@ -204,6 +221,9 @@ type Router struct {
 	policy        BackpressurePolicy
 	batchSize     int
 	flushInterval time.Duration
+
+	compression        CompressionEngine
+	compressionMinSize int
 
 	wg sync.WaitGroup
 }
@@ -907,6 +927,10 @@ func (r *Router) handleOverflow(idx int, topic string, q chan *MessageRef, msgRe
 // Each sub-frame is a standard frame (Magic, Cmd, StreamID, Len, Payload) whose Payload
 // contains the topic for routing. Sub-frames are NOT copied — they are zero-copy sub-slices
 // of the parent batch buffer.
+//
+// If compression is enabled (via WithCompression) and the batch payload exceeds the minimum
+// size threshold, the peer-forwarded copy is compressed with ZSTD and tagged with a Compression
+// TLV extension. Local subscribers always receive the uncompressed payload.
 func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 	if frame.PayloadLen > maxPayloadSize {
 		return errors.New("batch payload exceeds maximum frame size")
@@ -948,7 +972,6 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 			return nil
 		}
 
-		// Create a child MessageRef pointing into the parent batch buffer
 		child := AcquireChildMessageRef(batchMsgRef, subFrame, 0, 0)
 
 		for _, idx := range subIndices {
@@ -980,7 +1003,23 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 		return nil
 	})
 
-	if hasPeers {
+	// If compression is enabled and the batch is large enough, compress the payload
+	// for peer forwarding. Local subscribers already received uncompressed data above.
+	var forwardBuf *[]byte
+	if hasPeers && r.compression != nil && int(frame.PayloadLen) >= r.compressionMinSize {
+		compressed, err := r.compression.Compress(frame.Payload)
+		if err == nil {
+			mergedExt := protocol.BuildMergedExtensionsWithCompression(frame.Extensions, frame.PayloadLen)
+			forwardBuf = protocol.SerializeFrameWithExtensions(protocol.CmdPublishBatch, 0, mergedExt, compressed)
+			protocol.ReleaseExtensions(mergedExt)
+			r.compression.ReleaseBuf(compressed)
+		}
+	}
+
+	if forwardBuf != nil {
+		r.peerForwarder.Forward(*forwardBuf, true)
+		protocol.ReleaseBuffer(forwardBuf)
+	} else if hasPeers {
 		r.peerForwarder.Forward(*batchBuf, true)
 	}
 
