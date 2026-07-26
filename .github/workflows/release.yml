@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # required for git shortlog to compute contributors
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -23,31 +25,51 @@ jobs:
 
       - name: Cross-Compile Binaries
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          mkdir -p dist
-          
-          # linux/amd64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/aqueduct-broker ./cmd/broker
-          tar -czvf dist/aqueduct-${VERSION}-linux-amd64.tar.gz -C dist aqueduct-broker
-          rm dist/aqueduct-broker
-          
-          # linux/arm64
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/aqueduct-broker ./cmd/broker
-          tar -czvf dist/aqueduct-${VERSION}-linux-arm64.tar.gz -C dist aqueduct-broker
-          rm dist/aqueduct-broker
+          VERSION="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist/staging
 
-          # darwin/amd64
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/aqueduct-broker ./cmd/broker
-          tar -czvf dist/aqueduct-${VERSION}-darwin-amd64.tar.gz -C dist aqueduct-broker
-          rm dist/aqueduct-broker
+          targets=(
+            "linux/amd64/linux-amd64"
+            "linux/arm64/linux-arm64"
+            "darwin/amd64/darwin-amd64"
+            "darwin/arm64/darwin-arm64"
+          )
 
-          # darwin/arm64
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/aqueduct-broker ./cmd/broker
-          tar -czvf dist/aqueduct-${VERSION}-darwin-arm64.tar.gz -C dist aqueduct-broker
-          rm dist/aqueduct-broker
+          for entry in "${targets[@]}"; do
+            IFS="/" read -r goos goarch suffix <<< "$entry"
+            echo "→ Building ${goos}/${goarch}..."
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -ldflags="-s -w" \
+              -o "dist/staging/aqueduct-broker" ./cmd/broker
+            tar -czf "dist/aqueduct-${VERSION}-${suffix}.tar.gz" \
+              -C dist/staging aqueduct-broker
+            rm dist/staging/aqueduct-broker
+          done
+
+          rmdir dist/staging
+
+      - name: Previous Tag
+        id: prevtag
+        run: |
+          PREV=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '2p' || echo "")
+          if [ -z "$PREV" ]; then
+            # fallback: first commit
+            PREV=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "tag=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Previous tag: $PREV"
+
+      - name: Generate Release Body
+        id: release_notes
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          PREVIOUS_TAG="${{ steps.prevtag.outputs.tag }}"
+          bash .github/scripts/release-body.sh "$VERSION" "$PREVIOUS_TAG" dist
+          echo "path=release_body.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.tar.gz
-          generate_release_notes: true
+          body_path: ${{ steps.release_notes.outputs.path }}
+          fail_on_unmatched_files: true
