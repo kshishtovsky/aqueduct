@@ -4,7 +4,7 @@
 
 # Aqueduct
 
-[ [English](README.md) | [Русский](README.ru.md) | 中文 ]
+[ [🇬🇧 English](README.md) | [🇷🇺 Русский](README.ru.md) | 🇨🇳 中文 ]
 
 [![CI](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml/badge.svg)](https://github.com/kshishtovsky/aqueduct/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
