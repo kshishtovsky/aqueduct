@@ -30,7 +30,7 @@ CONTRIBUTORS=$(
   else
     git shortlog -sn HEAD 2>/dev/null
   fi | grep -viE "bot|dependabot|github-actions" | head -20 \
-    | awk '{ $1=""; sub(/^ /, ""); print "- " $0 }' || echo "- No contributors listed."
+    | awk '{ $1=""; sub(/^ /, ""); print "- @" $0 }' || echo "- No contributors listed."
 )
 
 # ── Checksums ──────────────────────────────────────────────────────
