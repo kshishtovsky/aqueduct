@@ -13,13 +13,14 @@ var msgRefPool = sync.Pool{
 	},
 }
 
-// MessageRef wraps a pooled frame buffer (*[]byte) with an atomic reference counter and optional TTL expiry.
+// MessageRef wraps a pooled frame buffer (*[]byte) with an atomic reference counter, offset, and optional TTL expiry.
 // It ensures that buffers recycled into sync.Pool are never reused while queued
 // in another subscriber's pipeline or undergoing network I/O.
 type MessageRef struct {
 	buf       *[]byte
 	ref       atomic.Int32
-	expiresAt int64 // unix nano timestamp, 0 = no expiry
+	expiresAt int64  // unix nano timestamp, 0 = no expiry
+	offset    uint64 // topic offset
 }
 
 // AcquireMessageRef pulls a MessageRef from pool, wraps the frame buffer, and sets ref count to 1.
@@ -27,6 +28,7 @@ func AcquireMessageRef(buf *[]byte) *MessageRef {
 	m := msgRefPool.Get().(*MessageRef)
 	m.buf = buf
 	m.expiresAt = 0
+	m.offset = 0
 	m.ref.Store(1)
 	return m
 }
@@ -36,6 +38,21 @@ func (m *MessageRef) SetExpiresAt(exp int64) {
 	if m != nil {
 		m.expiresAt = exp
 	}
+}
+
+// SetOffset sets the 64-bit monotonic topic offset.
+func (m *MessageRef) SetOffset(offset uint64) {
+	if m != nil {
+		m.offset = offset
+	}
+}
+
+// Offset returns the message topic offset.
+func (m *MessageRef) Offset() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.offset
 }
 
 // IsExpired checks if the message expiration time has passed.
@@ -62,6 +79,7 @@ func (m *MessageRef) Release() {
 			m.buf = nil
 		}
 		m.expiresAt = 0
+		m.offset = 0
 		msgRefPool.Put(m)
 	}
 }

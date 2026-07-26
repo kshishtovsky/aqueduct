@@ -31,10 +31,12 @@ type TLSConfig struct {
 
 // AALConfig defines Append-Only Logging and encryption settings.
 type AALConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	FilePath    string `yaml:"file_path"`
-	Key         string `yaml:"key"` // base64 encoded 32-byte key for AES-256-GCM
-	MaxFileSize int64  `yaml:"max_aal_size"`
+	Enabled         bool   `yaml:"enabled"`
+	FilePath        string `yaml:"file_path"`
+	Key             string `yaml:"key"` // base64 encoded 32-byte key for AES-256-GCM
+	MaxFileSize     int64  `yaml:"max_aal_size"`
+	RetentionPeriod string `yaml:"retention_period"` // e.g. "24h"
+	RetentionSize   int64  `yaml:"retention_size"`   // e.g. 1073741824 (1GB)
 }
 
 // ACLRuleConfig defines a single client permission rule.
@@ -73,10 +75,12 @@ func Default() *Config {
 			RequireClientCert: false,
 		},
 		AAL: AALConfig{
-			Enabled:     false,
-			FilePath:    "",
-			Key:         "",
-			MaxFileSize: 100 * 1024 * 1024, // 100 MB
+			Enabled:         false,
+			FilePath:        "",
+			Key:             "",
+			MaxFileSize:     100 * 1024 * 1024, // 100 MB
+			RetentionPeriod: "24h",
+			RetentionSize:   1024 * 1024 * 1024, // 1 GB
 		},
 		ACL: ACLConfig{
 			Enabled: false,
