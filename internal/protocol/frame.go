@@ -15,6 +15,7 @@ const (
 const (
 	CmdPublish Command = 1 + iota
 	CmdSubscribe
+	CmdUnsubscribe
 	CmdAck
 )
 
