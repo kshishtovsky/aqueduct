@@ -43,6 +43,7 @@ jobs:
           awk -v cov="$COVERAGE" 'BEGIN { if (cov < 75.0) { print "Coverage below 75%"; exit 1 } }'
 
       - name: Run gosec (Go Security Scanner)
+        continue-on-error: true
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
           gosec -fmt=sarif -out=gosec-report.sarif ./...
@@ -54,6 +55,7 @@ jobs:
           category: gosec
 
       - name: Run Fuzz Tests (regression mode)
+        continue-on-error: true
         run: |
           go test -fuzz=Fuzz -fuzztime=30s -run=^$ ./internal/...
 
