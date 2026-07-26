@@ -35,6 +35,14 @@ var (
 			Buckets: prometheus.DefBuckets,
 		},
 	)
+
+	AuthzDenied = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_authz_denied_total",
+			Help: "Total number of authorization denials per client and topic",
+		},
+		[]string{"client", "topic"},
+	)
 )
 
 func init() {
@@ -42,4 +50,5 @@ func init() {
 	prometheus.MustRegister(MessagesDelivered)
 	prometheus.MustRegister(ActiveSubscribers)
 	prometheus.MustRegister(FrameParseDuration)
+	prometheus.MustRegister(AuthzDenied)
 }
