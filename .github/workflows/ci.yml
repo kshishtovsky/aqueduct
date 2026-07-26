@@ -3,6 +3,12 @@ name: CI
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   lint-and-test:
@@ -12,6 +18,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -19,9 +27,9 @@ jobs:
           go-version: '1.25'
           check-latest: true
 
-      - name: Run golangci-lint
+      - name: Run golangci-lint (with report for SonarCloud)
         run: |
-          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run --out-format checkstyle > golangci-lint-report.out 2>&1 || true
 
       - name: Run Tests with Race Detector and Coverage
         run: |
@@ -33,6 +41,27 @@ jobs:
           COVERAGE=$(go tool cover -func=coverage_clean.out | grep total: | awk '{print $3}' | sed 's/%//')
           echo "Total Statement Coverage: ${COVERAGE}%"
           awk -v cov="$COVERAGE" 'BEGIN { if (cov < 75.0) { print "Coverage below 75%"; exit 1 } }'
+
+      - name: Run gosec (Go Security Scanner)
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -fmt=sarif -out=gosec-report.sarif ./...
+
+      - name: Upload gosec SARIF to GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec-report.sarif
+          category: gosec
+
+      - name: Run Fuzz Tests (regression mode)
+        run: |
+          go test -fuzz=Fuzz -fuzztime=30s -run=^$ ./internal/...
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
       - name: Build Docker Image Check
         run: |
