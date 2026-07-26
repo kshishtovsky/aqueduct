@@ -1,80 +1,63 @@
-# 操作指南: 生产环境部署
+# 指南: 生产部署与安全 (v1.3.0)
 
-本指南说明如何在生产环境中部署 Aqueduct，包括配置 TLS 1.3 证书、追加日志（AAL）、systemd 服务管理以及 Prometheus 监控集成。
+本指南说明在生产环境中部署与加固 Aqueduct 消息代理的最佳实践。
 
-## 1. 配置 TLS 1.3 证书
+---
 
-Aqueduct 严格要求 **TLS 1.3** 协议。生产环境中请使用权威 PKI 或 Let's Encrypt 证书。
+## 1. 传输安全与 mTLS 配置
 
-测试证书生成示例：
-
-```bash
-openssl req -x509 -newkey rsa:4090 -keyout key.pem -out cert.pem -sha256 -days 365 -nodes \
-  -subj "/CN=broker.example.com"
-```
-
-## 2. 配置追加日志 (AAL)
-
-开启 AAL 可将发布的帧同步写入磁盘，且不增加堆内存分配（`0 allocs/op`）。
-
-创建日志目录并配置权限：
-
-```bash
-sudo mkdir -p /var/log/aqueduct
-sudo chown -R aqueduct:aqueduct /var/log/aqueduct
-```
-
-## 3. 配置 Systemd 服务
-
-创建服务文件 `/etc/systemd/system/aqueduct.service`:
-
-```ini
-[Unit]
-Description=Aqueduct QUIC Message Broker
-After=network.target
-
-[Service]
-Type=simple
-User=aqueduct
-Group=aqueduct
-ExecStart=/usr/local/bin/aqueduct-broker \
-  -addr :4242 \
-  -metrics-addr :9090 \
-  -cert /etc/aqueduct/cert.pem \
-  -key /etc/aqueduct/key.pem \
-  -aal /var/log/aqueduct/publish.log
-Restart=always
-RestartSec=5s
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
-
-加载 systemd 守护进程并启动服务：
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now aqueduct
-```
-
-## 4. 配置 Prometheus 监控
-
-Aqueduct 在 `:9090/metrics` 暴露 Prometheus 监控指标。
-
-在 `/etc/prometheus/prometheus.yml` 中添加配置：
+在生产环境中强制使用 **mTLS 1.3**:
 
 ```yaml
-scrape_configs:
-  - job_name: 'aqueduct'
-    static_configs:
-      - targets: ['localhost:9090']
+tls:
+  generate: false
+  cert_file: "/etc/certs/server.crt"
+  key_file: "/etc/certs/server.key"
+  require_client_cert: true
+  client_ca_file: "/etc/certs/client_ca.pem"
 ```
 
-### 指标说明
+---
 
-| 指标名称 | 类型 | 描述 |
-| :--- | :--- | :--- |
-| `aqueduct_messages_published_total` | Counter | 各主题发布的消息总数 |
-| `aqueduct_messages_delivered_total` | Counter | 各主题投递成功的消息总数 |
-| `aqueduct_active_subscribers` | Gauge | 当前活跃订阅者总数 |
+## 2. 加密日志 (AAL) 与自动轮转
+
+生成 32 字节 AES-256 加密密钥:
+
+```bash
+openssl rand -base64 32
+```
+
+配置 `config.yaml`:
+```yaml
+aal:
+  enabled: true
+  file_path: "/var/log/aqueduct/aal.log"
+  key: "<BASE64_32_BYTE_KEY>"
+  max_aal_size: 104857600 # 100 MB 触发轮转
+```
+
+代理启动时自动重放 (Replay) 日志记录以恢复状态。
+
+---
+
+## 3. 慢消费者 Backpressure 调优
+
+- `drop_oldest`: 适合实时遥测数据。
+- `drop_newest`: 适合顺序事件流。
+- `disconnect`: 安全严格环境，直接断开慢订阅者。
+
+```yaml
+broker:
+  queue_size: 2048
+  backpressure_policy: "drop_oldest"
+```
+
+---
+
+## 4. 操作系统 UDP 限制
+
+```bash
+sysctl -w net.core.rmem_max=25000000
+sysctl -w net.core.wmem_max=25000000
+ulimit -n 65536
+```

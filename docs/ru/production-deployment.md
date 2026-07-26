@@ -1,80 +1,67 @@
-# Руководство: Развертывание в Production
+# Руководство: Безопасность и развертывание в Production (v1.3.0)
 
-В данном руководстве описан процесс развертывания Aqueduct в продуктивной среде с сертификатами TLS 1.3, логированием AAL, службой systemd и мониторингом Prometheus.
+Настоящее руководство описывает лучшие практики безопасного развертывания Aqueduct в промышленной среде.
 
-## 1. Подготовка TLS 1.3 сертификатов
+---
 
-Aqueduct строго требует протокол **TLS 1.3**.
+## 1. Безопасность транспорта и настройка mTLS
 
-Пример генерации сертификата для тестирования:
-
-```bash
-openssl req -x509 -newkey rsa:4090 -keyout key.pem -out cert.pem -sha256 -days 365 -nodes \
-  -subj "/CN=broker.example.com"
-```
-
-## 2. Настройка Append-Only Logging (AAL)
-
-AAL сбрасывает публикуемые фреймы на диск с нулевыми аллокациями памяти (`0 allocs/op`).
-
-Создайте директорию для логов и настройте права доступа:
-
-```bash
-sudo mkdir -p /var/log/aqueduct
-sudo chown -R aqueduct:aqueduct /var/log/aqueduct
-```
-
-## 3. Создание службы Systemd
-
-Создайте файл `/etc/systemd/system/aqueduct.service`:
-
-```ini
-[Unit]
-Description=Aqueduct QUIC Message Broker
-After=network.target
-
-[Service]
-Type=simple
-User=aqueduct
-Group=aqueduct
-ExecStart=/usr/local/bin/aqueduct-broker \
-  -addr :4242 \
-  -metrics-addr :9090 \
-  -cert /etc/aqueduct/cert.pem \
-  -key /etc/aqueduct/key.pem \
-  -aal /var/log/aqueduct/publish.log
-Restart=always
-RestartSec=5s
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Перезагрузите демон systemd и запустите службу:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now aqueduct
-```
-
-## 4. Мониторинг Prometheus
-
-Aqueduct экспортирует метрики на порту `:9090/metrics`.
-
-Добавьте секцию в `/etc/prometheus/prometheus.yml`:
+В боевой среде обязательно используйте **mTLS 1.3** с проверкой сертификатов клиентов:
 
 ```yaml
-scrape_configs:
-  - job_name: 'aqueduct'
-    static_configs:
-      - targets: ['localhost:9090']
+tls:
+  generate: false
+  cert_file: "/etc/certs/server.crt"
+  key_file: "/etc/certs/server.key"
+  require_client_cert: true
+  client_ca_file: "/etc/certs/client_ca.pem"
 ```
 
-### Экспортируемые метрики
+---
 
-| Метрика | Тип | Описание |
-| :--- | :--- | :--- |
-| `aqueduct_messages_published_total` | Counter | Общее количество опубликованных сообщений по топикам |
-| `aqueduct_messages_delivered_total` | Counter | Общее количество доставленных сообщений по топикам |
-| `aqueduct_active_subscribers` | Gauge | Текущее количество активных подписчиков |
+## 2. Шифрование логов (AAL) и Ротация
+
+Генерация 32-байтового ключа AES-256:
+
+```bash
+openssl rand -base64 32
+```
+
+Настройка `config.yaml`:
+```yaml
+aal:
+  enabled: true
+  file_path: "/var/log/aqueduct/aal.log"
+  key: "<BASE64_32_BYTE_KEY>"
+  max_aal_size: 104857600 # 100 МБ до запуска ротации
+```
+
+При старте брокер выполняет Replay кадра из AAL для полного восстановления состояния до открытия UDP-порта.
+
+---
+
+## 3. Настройка Backpressure и очередей
+
+Выбор политики при медленных потребителях:
+
+- `drop_oldest`: Для систем реального времени (телеметрия).
+- `drop_newest`: Для последовательных событий.
+- `disconnect`: Отключение зависших подписчиков.
+
+```yaml
+broker:
+  queue_size: 2048
+  backpressure_policy: "drop_oldest"
+```
+
+---
+
+## 4. Системные лимиты ОС (`sysctl`)
+
+Увеличение буферов UDP:
+
+```bash
+sysctl -w net.core.rmem_max=25000000
+sysctl -w net.core.wmem_max=25000000
+ulimit -n 65536
+```
