@@ -9,27 +9,28 @@
 Aqueduct is an ultra-high performance, zero-allocation message broker built in Go on top of **QUIC** (via `quic-go`). Engineered for extreme low latency (< 1.5 µs), zero-copy binary framing, and Data-Oriented Design (DoD), Aqueduct delivers predictable performance with zero heap allocations on the hot path.
 
 > [!IMPORTANT]
-> **Production Ready (v1.8.0)**
-> Aqueduct features **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **message TTL**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching**, **coalesced subscriber writes**, **NACK-based redelivery** and **Dead Letter Queues**.
+> **Production Ready (v1.11.0)**
+> Aqueduct features **Hard Real-Time Lazy Priority Queues (QoS)**, **Per-Priority TTL**, **Strict Prioritization**, **mTLS 1.3 transport authentication**, **zero-allocation ACL authorization**, **encrypted AES-256-GCM append-only logging (AAL)** with **startup state replay**, **async fan-out with backpressure isolation**, **zero-allocation ZSTD payload compression**, **MQTT wildcard topic routing**, **Direct Mesh Clustering**, **zero-copy protocol batching**, **coalesced subscriber writes**, **NACK-based redelivery** and **Dead Letter Queues**.
 
 ---
 
 ## Features
 
 - **QUIC Transport Layer**: Multiplexed QUIC connection handling with 0-RTT connection establishment, stream isolation, and amplification protection.
-- **Zero-Copy Binary Protocol**: Flat 10-byte binary header parser (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) using zero-allocation pointer arithmetic and cross-platform Little-Endian safety.
+- **Zero-Copy Binary Protocol**: Flat 10-byte binary header parser (`[Magic:1] [Cmd:1] [StreamID:4] [PayloadLen:4]`) with optional TLV extension region using zero-allocation pointer arithmetic.
+- **Lazy Priority Queues (QoS)**: 4 message priority levels (`0` Highest, `1` High, `2` Normal, `3` Low) carried in TLV `ExtPriority` (`0x03`). Subscriber priority queues are lazily acquired from `sync.Pool` on first use (`0 allocs/op`). Single-priority subscribers consume memory for 1 queue only.
+- **Strict Prioritization & Starvation Prevention**: Dedicated Writer goroutines poll priority queues in strict priority order (`0 -> 1 -> 2 -> 3`), ensuring critical alerts bypass low-priority traffic.
+- **Per-Priority TTL**: Configurable `priority_ttls` (`["500ms", "5s", "0", "0"]`) forcing per-priority expiration timestamps. Stale critical messages are lazily dropped on dequeue (`aqueduct_messages_expired_total{topic, priority}`).
+- **Memory Cleanup & Recycling**: Empty priority queues (`len(q) == 0`) are automatically returned to `sync.Pool` and reset to `nil` under per-subscriber mutex protection.
+- **Zero-Allocation Payload Compression**: ZSTD batch compression (`internal/compress`) with `ExtCompression` (`0x02`) TLV extension — compresses batch payloads before peer forwarding.
 - **Structure of Arrays (SoA) Router**: In-memory direct mesh pub/sub routing using flat arrays for CPU L1/L2 cache locality.
 - **Async Fan-Out & Ring Queues**: Per-subscriber non-blocking bounded channels and Writer goroutines eliminating Head-of-Line blocking.
-- **Slow Consumer Isolation (Backpressure)**: Configurable queue overflow handling (`drop_oldest`, `drop_newest`, `disconnect`).
+- **Slow Consumer Isolation (Backpressure)**: Per-priority queue overflow handling (`drop_oldest`, `drop_newest`, `disconnect`).
 - **Atomic Reference Counting (`MessageRef`)**: Safe zero-allocation buffer recycling into `sync.Pool` when count drops to zero (`0 allocs/op`).
 - **Zero-Copy Protocol Batching**: `CmdPublishBatch` (0x04) command with zero-copy bulk publish — sub-frames unpack via `unsafe.Slice` directly into the batch buffer (< 4 ns/frame, `0 allocs/op`).
 - **Coalesced Subscriber Writes**: Per-subscriber micro-batching with configurable 64 KB threshold and 50 µs micro-timer flush. Achieves 6.67M msg/s throughput.
-- **Nested Reference Counting**: Parent-child `MessageRef` hierarchy for batch buffer lifetime management — all `atomic.Int32`, zero locks on hot path.
 - **MQTT Wildcard Topic Routing**: Zero-allocation single-level (`+`) and multi-level (`#`) pattern matching (< 51 ns/op, `0 allocs/op`).
-- **Message Time-To-Live (TTL)**: Lazy message expiration on dequeue (`ttl:<ms>:<payload>` format).
-- **Encrypted Append-Only Logging (AAL)**: AES-256-GCM encrypted persistence with cryptographically unique 12-byte nonces (4-byte random session prefix) and streaming length-prefixed records.
-- **AAL Replay on Startup**: Restores state before opening the QUIC UDP listener socket, preventing message loss on restart.
-- **AAL File Rotation**: Automatic log compaction when file size exceeds `max_aal_size`.
+- **Encrypted Append-Only Logging (AAL)**: AES-256-GCM encrypted persistence with cryptographically unique 12-byte nonces and streaming length-prefixed records.
 - **mTLS & Zero-Allocation ACL**: Dual-side TLS 1.3 authentication and non-commutative FNV-1a composite hash matrix permission engine.
 - **NACK-Based Redelivery & Dead Letter Queues**: `CmdNack` (0x05) opcode with automatic redelivery (up to `max_retries`), bounded per-subscriber frame cache (256 entries FIFO), and poison pill routing to `__dlq__<topic>`.
 - **Prometheus Observability**: Comprehensive metrics (`/metrics`) and ready-to-run Docker Compose stack with Grafana dashboard.

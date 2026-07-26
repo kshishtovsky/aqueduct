@@ -84,7 +84,11 @@
     * `go test -fuzz ./...` (Хотя бы 10 секунд на каждый парсер).
     * `go test -bench=. -benchmem ./...`
     * `go vet`, `golangci-lint run`.
-4. **Отчёт:** Сформируй структурированный отчёт (см. раздел 8).
+4. **Обновление документации на всех языках (ОБЯЗАТЕЛЬНЫЙ ЭТАП):**
+    * При добавлении нового функционала, изменениях в протоколе, архитектуре или конфигурации **ОБЯЗАТЕЛЬНО** синхронно обновлять документацию на ВСЕХ поддерживаемых языках:
+      - `README.md` (EN), `README.ru.md` (RU), `README.zh.md` (ZH)
+      - `docs/en/*`, `docs/ru/*`, `docs/zh/*` (`architecture.md`, `getting-started.md`, `production-deployment.md`, `protocol-spec.md`)
+5. **Отчёт:** Сформируй структурированный отчёт (см. раздел 8).
 
 ## 6. Тестовая стратегия и Coverage Gate
 
@@ -100,7 +104,7 @@
 * Одна задача — одна ветка (`feature/...`, `security/...`, `perf/...`).
 * Коммиты атомарны. Conventional Commits (`feat:`, `fix(security):`, `perf:`).
 * Не пушь в `main`. Создавай PR с зеленым CI (включая `-race` и `-fuzz`).
-* При мерже новой версии: создай тэг (`git tag vX.Y.Z main && git push origin vX.Y.Z`), обнови CHANGELOG.md.
+* При мерже новой версии: создай тэг (`git tag vX.Y.Z main && git push origin vX.Y.Z`), обнови `CHANGELOG.md` и ВСЮ документацию (`README*.md`, `docs/*/*`).
 * В конце сессии: `git push origin --all` (все ветки) + `git push origin --tags`.
 * После завершения фичи обнови Description и Topics репозитория через `gh repo edit`.
 * **Pre-commit hooks:** activated with `git config core.hooksPath .githooks` — runs `golangci-lint` + `go test -race` on changed packages before every commit.

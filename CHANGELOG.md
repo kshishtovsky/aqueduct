@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-07-26
+
+### Added
+- **Priority Flag TLV Extension (`Type 0x03`)**: Added `ExtPriority` TLV extension type carrying a 1-byte priority level (`0` Highest, `1` High, `2` Normal, `3` Low, default `2`). Supported zero-alloc parsing via `ExtractPriority` and `BuildPriorityExtension`.
+- **Lazy Priority Queues (DoD)**: Refactored subscriber queues in `Router` to `[]*[4]chan *MessageRef`. Queue instances are lazily acquired from a global `r.queuePool` (`0 allocs/op`) only when messages of priority `P` arrive. Subscribers using single priority consume memory for 1 queue only.
+- **Per-Priority TTL Override**: Added `priority_ttls` configuration (`["500ms", "5s", "0", "0"]`). Enforced per-priority expiration timestamp `expiresAt` on enqueueing, overwriting publisher TTL. Lazy expiration check drops stale messages upon dequeue (`aqueduct_messages_expired_total{topic, priority}`).
+- **Strict Priority Sending**: Writer goroutines process subscriber priority queues in strict order (`0 -> 1 -> 2 -> 3`). Higher priority messages bypass lower priority traffic without starvation.
+- **Empty Queue Memory Cleanup**: Empty priority channels (`len(q) == 0`) are automatically returned to `r.queuePool` and reset to `nil` under per-subscriber `subMu`.
+
+### Performance & Security
+- `BenchmarkPriorityPublish`: **1882 ns/op, 0 B/op, 0 allocs/op** on hot path.
+- `go test -race ./...`: **0 data races** across all packages.
+- Statement coverage: **82.0%** (`internal/broker`), **82.2%** (`internal/protocol`).
+
 ## [1.10.0] - 2026-07-26
 
 ### Added
