@@ -390,6 +390,17 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 
 		// Route pub/sub commands through the built-in router.
 		if b.router != nil {
+			// If the MeshForwarded bit is set, deliver only to local subscribers (no re-forwarding).
+			if protocol.IsForwarded(frame.Command) {
+				if protocol.OpcodeOf(frame.Command) == protocol.CmdPublish {
+					if err := b.router.PublishFromPeer(jig, frame); err != nil {
+						logger.Warn("peer publish error", "err", err)
+					}
+				}
+				consumed += totalLen
+				continue
+			}
+
 			switch frame.Command {
 			case protocol.CmdSubscribe:
 				if err := b.router.Subscribe(jig, stream, frame); err != nil {
