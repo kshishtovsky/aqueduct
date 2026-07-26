@@ -80,6 +80,28 @@ var (
 			Help: "Total number of AAL log rotations performed",
 		},
 	)
+
+	DurableSubscribersActive = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "aqueduct_durable_subscriptions_active",
+			Help: "Current number of active durable subscribers across all topics",
+		},
+	)
+
+	ConsumerOffset = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "aqueduct_consumer_offset",
+			Help: "Current acknowledged consumer offset per consumer and topic",
+		},
+		[]string{"consumer", "topic"},
+	)
+
+	AALBackfillFrames = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "aqueduct_aal_backfill_frames_total",
+			Help: "Total number of historical AAL frames replayed during subscriber backfill",
+		},
+	)
 )
 
 func init() {
@@ -93,4 +115,7 @@ func init() {
 	prometheus.MustRegister(AALReplayDuration)
 	prometheus.MustRegister(MessagesExpired)
 	prometheus.MustRegister(AALRotations)
+	prometheus.MustRegister(DurableSubscribersActive)
+	prometheus.MustRegister(ConsumerOffset)
+	prometheus.MustRegister(AALBackfillFrames)
 }
