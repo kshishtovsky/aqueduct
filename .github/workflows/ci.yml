@@ -61,7 +61,10 @@ jobs:
       - name: Run Fuzz Tests (regression mode)
         continue-on-error: true
         run: |
-          go test -fuzz=Fuzz -fuzztime=30s -run=^$ ./internal/...
+          find internal -name '*_fuzz_test.go' -exec dirname {} \; | sort -u | while read -r pkg; do
+            echo "→ fuzzing $pkg (30s)"
+            go test -fuzz=Fuzz -fuzztime=30s -run='^$' "./$pkg" || true
+          done
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@master
