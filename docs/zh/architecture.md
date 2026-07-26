@@ -1,4 +1,4 @@
-# 解释: 架构与内存模型 (v1.11.0)
+# 解释: 架构与内存模型 (v1.14.0)
 
 本文档说明 Aqueduct 的架构设计、面向数据设计 (DoD)、安全机制以及零内存分配策略。
 
@@ -86,16 +86,48 @@ type MessageRef struct {
 
 ---
 
-## 6. 直接网格集群 (P2P 联邦)
+## 6. 直接网格集群 (P2P 联邦) 与 DNS 发现
 
 Aqueduct 支持通过直接 P2P QUIC 网格连接多个代理实例形成集群。没有中央协调器或共识协议（无 Raft/Paxos）。消息转发采用 fire-and-forget 模式。
 
-### PeerManager
+### PeerManager (RCU 模式, v1.14.0)
 
-每个代理维护到静态对等列表的出站 QUIC 连接。PeerManager：
-- 启动时使用 mTLS 1.3 拨号每个对等地址
-- 运行后台重连循环，断连时使用指数退避
-- 暴露 `Forward()` 方法用于零拷贝帧转发到所有已连接对等节点
+PeerManager 使用 **Read-Copy-Update (RCU)** 模式实现热路径无锁读取：
+
+```go
+type PeerManager struct {
+    peers   atomic.Pointer[peerSlice]   // 无锁原子快照
+    mu      sync.Mutex                  // 仅用于写路径
+    addrSet map[string]int              // 快速地址查找
+}
+```
+
+- **读取** (`Forward()`, `PeerCount()`): 获取原子指针 — 零锁，零竞争
+- **写入** (`AddPeer()`, `RemovePeer()`): 创建新切片，原子替换。写路径互斥锁仅保护 `addrSet` map
+- **动态对等管理** (v1.14.0):
+  - `AddPeer(ctx, addr)` — 拨号新对等节点，添加到原子快照，启动重连循环
+  - `RemovePeer(addr)` — 取消上下文，关闭流，从原子快照移除
+  - `PeerCount()` — 当前对等节点数（原子读取）
+
+### DNS 发现 (v1.14.0)
+
+对于 Kubernetes StatefulSet 部署，`Discovery` 模块轮询 Headless Service DNS 记录：
+
+```go
+type Discovery struct {
+    manager     *PeerManager
+    resolver    Resolver            // 可注入接口用于测试
+    hostname    string
+    port        int
+    interval    time.Duration
+    knownIPs    map[string]struct{} // 快速变更跟踪
+}
+```
+
+- 每 `interval`（默认 10s）轮询 `net.LookupHost(hostname)`
+- 与 `knownIPs` 计算差集 → 仅在变化时调用 `AddPeer()`/`RemovePeer()`
+- `normalize()` 去重 IP 并过滤链路本地 (`169.254.x.x`) 地址
+- `Resolver` 接口支持测试中模拟 DNS
 
 ### MeshForwarded Bit
 
@@ -103,7 +135,7 @@ Aqueduct 支持通过直接 P2P QUIC 网格连接多个代理实例形成集群�
 
 ### 零拷贝转发
 
-`Forward()` 方法在原地修改共享缓冲区的 MeshForwarded 位（0 堆分配，0 allocs/op），并将修改后的帧直接写入每个对等节点的 QUIC 流。
+`Forward()` 方法读取原子对等快照，然后在原地修改共享缓冲区的 MeshForwarded 位（0 堆分配，0 allocs/op），并将修改后的帧直接写入每个对等节点的 QUIC 流。写入后恢复位以保留缓冲区用于本地投递。
 
 ### 路由器集成
 

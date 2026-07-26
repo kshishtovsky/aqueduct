@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aqueduct
+  namespace: aqueduct
+  labels:
+    app: aqueduct
+spec:
+  serviceName: aqueduct-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: aqueduct
+  template:
+    metadata:
+      labels:
+        app: aqueduct
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: broker
+          image: aqueduct-broker:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-config"
+            - "/etc/aqueduct/config.yaml"
+          ports:
+            - name: quic
+              containerPort: 4242
+              protocol: UDP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: AQUEDUCT_LISTEN_ADDR
+              value: ":4242"
+            - name: AQUEDUCT_TLS_REQUIRE_CLIENT_CERT
+              value: "false"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aqueduct/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/aqueduct
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "cat /dev/udp/127.0.0.1/4242 || exit 0"
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "cat /dev/udp/127.0.0.1/4242 || exit 0"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: aqueduct-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aqueduct
+  labels:
+    app.kubernetes.io/name: aqueduct
+    app.kubernetes.io/part-of: aqueduct

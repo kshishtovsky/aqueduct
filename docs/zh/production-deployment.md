@@ -1,4 +1,4 @@
-# 指南: 生产部署与安全 (v1.11.0)
+# 指南: 生产部署与安全 (v1.14.0)
 
 本指南说明在生产环境中部署与加固 Aqueduct 消息代理的最佳实践。
 
@@ -108,7 +108,93 @@ cluster:
 
 ---
 
-## 6. NACK/DLQ 生产配置
+## 6. Kubernetes 部署 (v1.14.0+)
+
+### 为什么选择 Kubernetes？
+
+静态对等列表 (`cluster.peers`) 需要手动协调。StatefulSet 配合 Headless Service 提供**基于 DNS 的动态对等发现**，无需外部依赖（Consul、etcd）。
+
+### Helm Chart（推荐）
+
+```bash
+helm install aqueduct deploy/helm/aqueduct \
+  --set replicaCount=3 \
+  --set config.cluster.peers[0]="aqueduct-0.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.peers[1]="aqueduct-1.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.peers[2]="aqueduct-2.aqueduct-headless.default.svc.cluster.local:4242" \
+  --set config.cluster.discovery.enabled=true \
+  --set config.cluster.discovery.host="aqueduct-headless.default.svc.cluster.local" \
+  --set config.cluster.discovery.port=4242 \
+  --set config.cluster.discovery.interval="10s"
+```
+
+### Headless Service（DNS 发现必需）
+
+Headless Service (`clusterIP: None`) 为每个 StatefulSet Pod 返回 A 记录：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: aqueduct-headless
+spec:
+  clusterIP: None
+  ports:
+    - name: quic
+      port: 4242
+  selector:
+    app.kubernetes.io/name: aqueduct
+```
+
+Pod DNS 模式：
+- `aqueduct-0.aqueduct-headless.<namespace>.svc.cluster.local`
+- `aqueduct-1.aqueduct-headless.<namespace>.svc.cluster.local`
+- 等。
+
+### DNS 发现
+
+启用发现后，代理以 `interval` 间隔轮询 Headless Service DNS 记录并与已知 IP 进行对比：
+
+```go
+ips, err := net.LookupHost("aqueduct-headless.default.svc.cluster.local")
+```
+
+- **扩容**: 新 Pod IP 通过 `AddPeer()` 自动连接
+- **缩容**: 移除的 IP 通过 `RemovePeer()` 断开
+- **零停机时间**: 使用指数退避重连
+
+### 配置
+
+```yaml
+cluster:
+  peers: []  # 空 — discovery 自动填充
+  discovery:
+    enabled: true
+    type: "dns"
+    host: "aqueduct-headless.default.svc.cluster.local"
+    port: 4242
+    interval: "10s"
+```
+
+### 扩缩容
+
+```bash
+kubectl scale statefulset aqueduct --replicas=5
+kubectl rollout restart statefulset aqueduct
+```
+
+### 原始 Kubernetes 清单
+
+```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/configmap.yaml
+kubectl apply -f deploy/k8s/services.yaml
+kubectl apply -f deploy/k8s/statefulset.yaml
+```
+
+---
+
+## 7. NACK/DLQ 生产配置
 
 配置 NACK 重投递和死信队列:
 
@@ -119,7 +205,7 @@ cluster:
 
 ---
 
-## 7. 速率限制配额
+## 8. 速率限制配额
 
 配置按租户的速率限制:
 
