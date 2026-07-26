@@ -43,6 +43,21 @@ var (
 		},
 		[]string{"client", "topic"},
 	)
+
+	MessagesDropped = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_dropped_total",
+			Help: "Total number of messages dropped due to slow consumer backpressure",
+		},
+		[]string{"topic", "policy"},
+	)
+
+	SlowConsumersDisconnected = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "aqueduct_slow_consumers_disconnected_total",
+			Help: "Total number of slow consumers disconnected due to queue overflow",
+		},
+	)
 )
 
 func init() {
@@ -51,4 +66,6 @@ func init() {
 	prometheus.MustRegister(ActiveSubscribers)
 	prometheus.MustRegister(FrameParseDuration)
 	prometheus.MustRegister(AuthzDenied)
+	prometheus.MustRegister(MessagesDropped)
+	prometheus.MustRegister(SlowConsumersDisconnected)
 }
