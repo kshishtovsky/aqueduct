@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-07-26
+
+### Added
+- **TLV Protocol Extensions**: New bit 6 (HasExtensions) in Command byte enables variable-length metadata block between header and payload. Zero-copy TLV parser via `unsafe.Slice` with strict bounds checking. Unknown TLV types silently skipped (forward compatibility guaranteed).
+- **W3C Trace Context Propagation**: `ExtTraceContext` TLV type (`0x01`) carries [`TraceID:16`][`SpanID:8`][`TraceFlags:1`] for OpenTelemetry distributed tracing. Extracted via zero-copy `unsafe.Pointer` cast — 4 ns/op, 0 allocs.
+- **OpenTelemetry Tracer (`internal/tracing/`)**: Config-gated OTLP gRPC exporter. When `tracing.enabled: false` (default), the tracer is nil — all span operations are inlined no-ops at ~3.4 ns/op, 0 allocs. When enabled: batched OTLP export, lazy init via `sync.Once`.
+- **Tracing in Dispatch**: `dispatchFrames` extracts trace context from published frames (single + batch), creates child spans `aqueduct.process` for local publish and `aqueduct.forward` for mesh-forwarded frames. Context propagated through `Router.Publish`.
+- **TLV Block Preservation**: Router preserves the original TLV extension block when serializing frames for subscriber delivery and peer forwarding via `SerializeFrameWithExtensions`.
+- **Tracing Metrics**: `aqueduct_tracing_spans_total` counter tracks total spans created by the broker.
+
+### Performance
+- `BenchmarkParseFrameWithExtensions`: **5.2 ns/op, 0 allocs/op**
+- `BenchmarkExtractTraceContext`: **4.1 ns/op, 0 allocs/op**
+- `BenchmarkFindExtension`: **3.1 ns/op, 0 allocs/op**
+- `BenchmarkTracerDisabled`: **3.4 ns/op, 0 allocs/op** (zero overhead when disabled)
+- `BenchmarkParseFrameBackwardCompat`: **4.6 ns/op, 0 allocs/op** (regression-free)
+
+### Security
+- Strict OOB validation in `ParseTLVEntry`, `FindExtension`, `ExtractTraceContext` before any unsafe pointer operation
+- `MaxExtTotalLen` (1024 bytes) prevents TLV-based DoS amplification
+- Fuzz test `FuzzParseFrame` (2.3M execs in 10s): 0 crashes, 0 panics
+
 ## [1.8.0] - 2026-07-26
 
 ### Added
