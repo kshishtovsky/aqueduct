@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/kshishtovsky/aqueduct/internal/aal"
 	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
@@ -80,10 +82,26 @@ func WithBackpressurePolicy(p BackpressurePolicy) RouterOption {
 	}
 }
 
+// WithAALPath provides path and key for AAL backfill replay workers.
+func WithAALPath(path string, key []byte) RouterOption {
+	return func(r *Router) {
+		r.aalPath = path
+		r.aalKey = key
+	}
+}
+
 // WildcardSub stores a wildcard pattern registration and subscriber index.
 type WildcardSub struct {
 	pattern []byte
 	idx     int
+}
+
+// SubscriptionSpec holds parsed parameters from a Subscribe command.
+type SubscriptionSpec struct {
+	Topic           string
+	IsDurable       bool
+	ConsumerID      string
+	RequestedOffset uint64
 }
 
 // Router implements In-Memory Direct Mesh Routing using Structure of Arrays (SoA).
@@ -105,6 +123,15 @@ type Router struct {
 	// wildcardSubs holds wildcard topic patterns (+ and #).
 	wildcardSubs []WildcardSub
 
+	// topicOffsets tracks 64-bit monotonic sequence counter per topic.
+	topicOffsets map[uint64]*atomic.Uint64
+
+	// durableOffsets tracks acknowledged consumer offset per (consumerID + topic).
+	durableOffsets map[uint64]uint64
+
+	aalPath string
+	aalKey  []byte
+
 	metrics   RouterMetrics
 	queueSize int
 	policy    BackpressurePolicy
@@ -115,10 +142,12 @@ type Router struct {
 // NewRouter creates a Router with optional metrics collector and configuration options.
 func NewRouter(m RouterMetrics, opts ...RouterOption) *Router {
 	r := &Router{
-		topicIndex: make(map[uint64][]int),
-		metrics:    m,
-		queueSize:  defaultQueueSize,
-		policy:     PolicyDropOldest,
+		topicIndex:     make(map[uint64][]int),
+		topicOffsets:   make(map[uint64]*atomic.Uint64),
+		durableOffsets: make(map[uint64]uint64),
+		metrics:        m,
+		queueSize:      defaultQueueSize,
+		policy:         PolicyDropOldest,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -127,35 +156,42 @@ func NewRouter(m RouterMetrics, opts ...RouterOption) *Router {
 }
 
 // Subscribe registers a QUIC stream as a subscriber for the topic parsed from
-// frame.Payload and spawns a dedicated Writer goroutine. Expected payload format: "topic:<name>".
+// frame.Payload and spawns a dedicated Writer goroutine. Expected payload format: "topic:<name>[:durable:<consumerID>:<offset>]".
 func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame protocol.Frame) error {
 	if stream == nil {
 		return errors.New("nil stream")
 	}
-	topic, err := extractTopic(frame.Payload)
+	spec, err := parseSubscriptionPayload(frame.Payload)
 	if err != nil {
 		return err
 	}
 
 	q := make(chan *MessageRef, r.queueSize)
 	subCtx, cancel := context.WithCancel(ctx)
-	topicHash := authz.CombineHashStrings("topic", topic)
+	topicHash := authz.CombineHashStrings("topic", spec.Topic)
 
 	r.mu.Lock()
 	idx := len(r.streamIDs)
 	r.streamIDs = append(r.streamIDs, frame.StreamID)
 	r.streams = append(r.streams, stream)
-	r.topics = append(r.topics, topic)
+	r.topics = append(r.topics, spec.Topic)
 	r.active = append(r.active, true)
 	r.queues = append(r.queues, q)
 	r.cancels = append(r.cancels, cancel)
 	r.topicIndex[topicHash] = append(r.topicIndex[topicHash], idx)
 
-	if IsWildcardTopic(topic) {
+	if IsWildcardTopic(spec.Topic) {
 		r.wildcardSubs = append(r.wildcardSubs, WildcardSub{
-			pattern: []byte(topic),
+			pattern: []byte(spec.Topic),
 			idx:     idx,
 		})
+	}
+
+	if spec.IsDurable {
+		durableKey := authz.CombineHashStrings(spec.ConsumerID, spec.Topic)
+		r.durableOffsets[durableKey] = spec.RequestedOffset
+		metrics.DurableSubscribersActive.Inc()
+		metrics.ConsumerOffset.WithLabelValues(spec.ConsumerID, spec.Topic).Set(float64(spec.RequestedOffset))
 	}
 
 	if r.metrics != nil {
@@ -163,13 +199,94 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	}
 	r.mu.Unlock()
 
+	// Check if backfill replay is required for reconnecting durable subscriber
+	latestOffset := r.GetTopicOffset(spec.Topic)
+	if spec.IsDurable && spec.RequestedOffset < latestOffset && r.aalPath != "" {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			r.runBackfillWorker(subCtx, spec.Topic, spec.ConsumerID, spec.RequestedOffset, latestOffset, q)
+		}()
+	}
+
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.runSubscriberWriter(subCtx, stream, topic, q)
+		r.runSubscriberWriter(subCtx, stream, spec.Topic, q)
 	}()
 
 	return nil
+}
+
+// AckOffset updates the acknowledged consumer offset for a durable subscriber.
+func (r *Router) AckOffset(consumerID, topic string, offset uint64) {
+	durableKey := authz.CombineHashStrings(consumerID, topic)
+	r.mu.Lock()
+	r.durableOffsets[durableKey] = offset
+	r.mu.Unlock()
+
+	metrics.ConsumerOffset.WithLabelValues(consumerID, topic).Set(float64(offset))
+}
+
+// GetTopicOffset returns the current monotonic offset for topic.
+func (r *Router) GetTopicOffset(topic string) uint64 {
+	tHash := authz.CombineHashStrings("topic", topic)
+	r.mu.RLock()
+	counter, exists := r.topicOffsets[tHash]
+	r.mu.RUnlock()
+	if !exists || counter == nil {
+		return 0
+	}
+	return counter.Load()
+}
+
+// GetConsumerOffset returns the acknowledged offset for consumerID on topic.
+func (r *Router) GetConsumerOffset(consumerID, topic string) uint64 {
+	durableKey := authz.CombineHashStrings(consumerID, topic)
+	r.mu.RLock()
+	offset := r.durableOffsets[durableKey]
+	r.mu.RUnlock()
+	return offset
+}
+
+// runBackfillWorker streams historical AAL records from disk into the subscriber queue.
+func (r *Router) runBackfillWorker(ctx context.Context, topic, consumerID string, startOffset, endOffset uint64, q chan *MessageRef) {
+	if r.aalPath == "" {
+		return
+	}
+	var currentMsgOffset uint64 = 0
+	_, _ = aal.Replay(r.aalPath, r.aalKey, func(frameBytes []byte) error {
+		select {
+		case <-ctx.Done():
+			return errors.New("backfill cancelled")
+		default:
+		}
+		frame, parseErr := protocol.ParseFrame(frameBytes)
+		if parseErr != nil {
+			return nil
+		}
+		if frame.Command == protocol.CmdPublish {
+			tExp, cleanPayload := parseTTL(frame.Payload)
+			if string(cleanPayload) == topic {
+				currentMsgOffset++
+				if currentMsgOffset > startOffset && currentMsgOffset <= endOffset {
+					buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+					msgRef := AcquireMessageRef(buf)
+					msgRef.SetExpiresAt(tExp)
+					msgRef.SetOffset(currentMsgOffset)
+					msgRef.Retain()
+					select {
+					case q <- msgRef:
+						metrics.AALBackfillFrames.Inc()
+					case <-ctx.Done():
+						msgRef.Release()
+						return errors.New("backfill cancelled")
+					}
+				}
+			}
+		}
+		return nil
+	})
 }
 
 // runSubscriberWriter drains the subscriber's queue, checks TTL expiration lazily,
@@ -232,6 +349,23 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 	topicHash := authz.CombineHashes("topic", cleanPayload)
 
 	r.mu.RLock()
+	counter, exists := r.topicOffsets[topicHash]
+	if !exists {
+		r.mu.RUnlock()
+		r.mu.Lock()
+		counter, exists = r.topicOffsets[topicHash]
+		if !exists {
+			counter = &atomic.Uint64{}
+			r.topicOffsets[topicHash] = counter
+		}
+		r.mu.Unlock()
+		r.mu.RLock()
+	}
+	r.mu.RUnlock()
+
+	msgOffset := counter.Add(1)
+
+	r.mu.RLock()
 	indices := r.topicIndex[topicHash]
 	hasWildcards := len(r.wildcardSubs) > 0
 
@@ -248,6 +382,7 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 	buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
 	msgRef := AcquireMessageRef(buf)
 	msgRef.SetExpiresAt(expiresAt)
+	msgRef.SetOffset(msgOffset)
 
 	var inlineDC [4]int
 	disconnectIndices := inlineDC[:0]
@@ -411,15 +546,43 @@ func (r *Router) countActiveLocked() int {
 	return count
 }
 
-func extractTopic(payload []byte) (string, error) {
+func parseSubscriptionPayload(payload []byte) (SubscriptionSpec, error) {
 	if len(payload) < 6 || string(payload[:6]) != "topic:" {
-		return "", errTopicRequired
+		return SubscriptionSpec{}, errTopicRequired
 	}
-	topic := string(payload[6:])
-	if topic == "" {
-		return "", errTopicEmpty
+	raw := string(payload[6:])
+	if raw == "" {
+		return SubscriptionSpec{}, errTopicEmpty
 	}
-	return topic, nil
+
+	parts := strings.Split(raw, ":durable:")
+	if len(parts) == 1 {
+		return SubscriptionSpec{Topic: parts[0]}, nil
+	}
+
+	topic := parts[0]
+	durParts := strings.Split(parts[1], ":")
+	if len(durParts) < 2 {
+		return SubscriptionSpec{Topic: topic, IsDurable: true, ConsumerID: parts[1]}, nil
+	}
+
+	consumerID := durParts[0]
+	offset, _ := strconv.ParseUint(durParts[1], 10, 64)
+
+	return SubscriptionSpec{
+		Topic:           topic,
+		IsDurable:       true,
+		ConsumerID:      consumerID,
+		RequestedOffset: offset,
+	}, nil
+}
+
+func extractTopic(payload []byte) (string, error) {
+	spec, err := parseSubscriptionPayload(payload)
+	if err != nil {
+		return "", err
+	}
+	return spec.Topic, nil
 }
 
 // parseTTL parses optional "ttl:<ms>:<payload>" format and returns unix nanosecond expiration.
