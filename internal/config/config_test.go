@@ -182,3 +182,55 @@ func TestConfigLoadInvalidFile(t *testing.T) {
 		t.Error("expected error unmarshaling invalid yaml, got nil")
 	}
 }
+
+func TestConfigPriorityTTLs(t *testing.T) {
+	b := BrokerConfig{
+		PriorityTTLs: []string{"500ms", "5s", "0", "invalid"},
+	}
+	ttls := b.GetPriorityTTLs()
+	if ttls[0] != 500*1000*1000 || ttls[1] != 5*1000*1000*1000 || ttls[2] != 0 || ttls[3] != 0 {
+		t.Errorf("unexpected PriorityTTLs result: %v", ttls)
+	}
+}
+
+func TestConfigAllEnvOverrides(t *testing.T) {
+	t.Setenv("AQUEDUCT_BROKER_QUEUE_SIZE", "2048")
+	t.Setenv("AQUEDUCT_BROKER_BACKPRESSURE_POLICY", "disconnect")
+	t.Setenv("AQUEDUCT_BROKER_MAX_RETRIES", "5")
+	t.Setenv("AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE", "500")
+	t.Setenv("AQUEDUCT_BROKER_DEFAULT_BURST_SIZE", "2000")
+	t.Setenv("AQUEDUCT_ADMIN_ENABLED", "true")
+	t.Setenv("AQUEDUCT_ADMIN_ADDR", ":9095")
+	t.Setenv("AQUEDUCT_TRACING_ENABLED", "true")
+	t.Setenv("AQUEDUCT_TRACING_SERVICE_NAME", "custom-tracer")
+	t.Setenv("AQUEDUCT_TRACING_ENDPOINT", "localhost:4318")
+	t.Setenv("AQUEDUCT_AAL_MAX_SIZE", "52428800")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.Broker.QueueSize != 2048 {
+		t.Errorf("expected QueueSize 2048, got %d", cfg.Broker.QueueSize)
+	}
+	if cfg.Broker.BackpressurePolicy != "disconnect" {
+		t.Errorf("expected BackpressurePolicy disconnect, got %q", cfg.Broker.BackpressurePolicy)
+	}
+	if cfg.Broker.MaxRetries != 5 {
+		t.Errorf("expected MaxRetries 5, got %d", cfg.Broker.MaxRetries)
+	}
+	if cfg.Broker.Quotas.DefaultPublishRate != 500 || cfg.Broker.Quotas.DefaultBurstSize != 2000 {
+		t.Errorf("unexpected Quotas: %+v", cfg.Broker.Quotas)
+	}
+	if !cfg.Admin.Enabled || cfg.Admin.Addr != ":9095" {
+		t.Errorf("unexpected Admin: %+v", cfg.Admin)
+	}
+	if !cfg.Tracing.Enabled || cfg.Tracing.ServiceName != "custom-tracer" || cfg.Tracing.Endpoint != "localhost:4318" {
+		t.Errorf("unexpected Tracing: %+v", cfg.Tracing)
+	}
+	if cfg.AAL.MaxFileSize != 52428800 {
+		t.Errorf("expected MaxFileSize 52428800, got %d", cfg.AAL.MaxFileSize)
+	}
+}
+
