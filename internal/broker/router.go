@@ -1,10 +1,13 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
@@ -77,6 +80,12 @@ func WithBackpressurePolicy(p BackpressurePolicy) RouterOption {
 	}
 }
 
+// WildcardSub stores a wildcard pattern registration and subscriber index.
+type WildcardSub struct {
+	pattern []byte
+	idx     int
+}
+
 // Router implements In-Memory Direct Mesh Routing using Structure of Arrays (SoA).
 // Each subscriber has a dedicated non-blocking bounded queue and Writer goroutine.
 type Router struct {
@@ -92,6 +101,9 @@ type Router struct {
 
 	// topicIndex maps FNV-1a hash of topic name to slice of indices in flat arrays.
 	topicIndex map[uint64][]int
+
+	// wildcardSubs holds wildcard topic patterns (+ and #).
+	wildcardSubs []WildcardSub
 
 	metrics   RouterMetrics
 	queueSize int
@@ -139,6 +151,13 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	r.cancels = append(r.cancels, cancel)
 	r.topicIndex[topicHash] = append(r.topicIndex[topicHash], idx)
 
+	if IsWildcardTopic(topic) {
+		r.wildcardSubs = append(r.wildcardSubs, WildcardSub{
+			pattern: []byte(topic),
+			idx:     idx,
+		})
+	}
+
 	if r.metrics != nil {
 		r.metrics.SetActiveSubscribers(float64(r.countActiveLocked()))
 	}
@@ -153,8 +172,8 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	return nil
 }
 
-// runSubscriberWriter drains the subscriber's queue, writes frames to the QUIC stream,
-// and releases MessageRef reference counts upon completion.
+// runSubscriberWriter drains the subscriber's queue, checks TTL expiration lazily,
+// writes frames to the QUIC stream, and releases MessageRef reference counts upon completion.
 func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, topic string, q chan *MessageRef) {
 	for {
 		select {
@@ -165,6 +184,13 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 			if !ok {
 				return
 			}
+			nowNano := time.Now().UnixNano()
+			if msgRef.IsExpired(nowNano) {
+				msgRef.Release()
+				metrics.MessagesExpired.WithLabelValues(topic).Inc()
+				continue
+			}
+
 			buf := msgRef.Buf()
 			if len(buf) > 0 {
 				if _, err := stream.Write(buf); err != nil {
@@ -195,33 +221,38 @@ func (r *Router) drainQueue(q chan *MessageRef) {
 	}
 }
 
-// Publish non-blockingly dispatches a message to all active subscriber queues for topic.
+// Publish non-blockingly dispatches a message to all matching subscriber queues (exact & wildcard).
 // Operates with 0 heap allocations and nano-second publisher latency.
 func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 	if frame.PayloadLen > maxPayloadSize {
 		return errors.New("payload exceeds maximum frame size")
 	}
 
-	topicHash := authz.CombineHashes("topic", frame.Payload)
+	expiresAt, cleanPayload := parseTTL(frame.Payload)
+	topicHash := authz.CombineHashes("topic", cleanPayload)
 
 	r.mu.RLock()
 	indices := r.topicIndex[topicHash]
-	if len(indices) == 0 {
+	hasWildcards := len(r.wildcardSubs) > 0
+
+	if len(indices) == 0 && !hasWildcards {
 		r.mu.RUnlock()
 		return nil
 	}
 
 	if r.metrics != nil {
-		r.metrics.OnPublish(string(frame.Payload))
+		r.metrics.OnPublish(string(cleanPayload))
 	}
 
 	// Create single frame buffer pooled via sync.Pool
-	buf := protocol.SerializeFrame(protocol.CmdPublish, 0, frame.Payload)
+	buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
 	msgRef := AcquireMessageRef(buf)
+	msgRef.SetExpiresAt(expiresAt)
 
 	var inlineDC [4]int
 	disconnectIndices := inlineDC[:0]
 
+	// 1. Dispatch to exact topic match subscribers
 	for _, idx := range indices {
 		if idx < len(r.active) && r.active[idx] {
 			q := r.queues[idx]
@@ -231,11 +262,33 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 			case q <- msgRef:
 				// Successfully enqueued
 			default:
-				// Queue overflow! Apply backpressure policy
 				topicName := r.topics[idx]
 				dc := r.handleOverflow(idx, topicName, q, msgRef)
 				if dc >= 0 {
 					disconnectIndices = append(disconnectIndices, dc)
+				}
+			}
+		}
+	}
+
+	// 2. Dispatch to matching wildcard subscribers (+ and #)
+	if hasWildcards {
+		for _, wSub := range r.wildcardSubs {
+			idx := wSub.idx
+			if idx < len(r.active) && r.active[idx] {
+				if MatchWildcard(wSub.pattern, cleanPayload) {
+					q := r.queues[idx]
+					msgRef.Retain()
+
+					select {
+					case q <- msgRef:
+					default:
+						topicName := r.topics[idx]
+						dc := r.handleOverflow(idx, topicName, q, msgRef)
+						if dc >= 0 {
+							disconnectIndices = append(disconnectIndices, dc)
+						}
+					}
 				}
 			}
 		}
@@ -367,4 +420,19 @@ func extractTopic(payload []byte) (string, error) {
 		return "", errTopicEmpty
 	}
 	return topic, nil
+}
+
+// parseTTL parses optional "ttl:<ms>:<payload>" format and returns unix nanosecond expiration.
+func parseTTL(payload []byte) (int64, []byte) {
+	if bytes.HasPrefix(payload, []byte("ttl:")) {
+		idx := bytes.IndexByte(payload[4:], ':')
+		if idx > 0 {
+			msStr := string(payload[4 : 4+idx])
+			if ms, err := strconv.ParseInt(msStr, 10, 64); err == nil {
+				exp := time.Now().Add(time.Duration(ms) * time.Millisecond).UnixNano()
+				return exp, payload[4+idx+1:]
+			}
+		}
+	}
+	return 0, payload
 }
