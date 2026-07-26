@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
@@ -512,6 +513,9 @@ func TestBrokerWithAAL(t *testing.T) {
 	var totalExpectedBytes []byte
 	for i, msg := range messages {
 		buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i+1), msg)
+		lenPrefix := make([]byte, 4)
+		binary.LittleEndian.PutUint32(lenPrefix, uint32(len(*buf)))
+		totalExpectedBytes = append(totalExpectedBytes, lenPrefix...)
 		totalExpectedBytes = append(totalExpectedBytes, (*buf)...)
 		if _, err := stream.Write(*buf); err != nil {
 			t.Fatalf("write msg %d: %v", i, err)

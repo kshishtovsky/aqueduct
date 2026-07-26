@@ -698,3 +698,254 @@ func BenchmarkRouterPublishWithAAL(b *testing.B) {
 		_ = router.Publish(context.Background(), frame)
 	}
 }
+
+// TestWildcardRouting verifies + and # wildcard pattern matching in router.
+func TestWildcardRouting(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func(s *quic.Stream) {
+						buf := make([]byte, 1024)
+						n, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						frame, err := protocol.ParseFrame(buf[:n])
+						if err != nil {
+							return
+						}
+						if frame.Command == protocol.CmdSubscribe {
+							_ = router.Subscribe(ctx, s, frame)
+						}
+					}(stream)
+				}
+			}()
+		}
+	}()
+
+	// Sub 1: Wildcard "+" pattern (sensor/+/temp)
+	conn1 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub1, err := conn1.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub1: %v", err)
+	}
+	sendFrame(t, sub1, protocol.CmdSubscribe, 1, []byte("topic:sensor/+/temp"))
+
+	// Sub 2: Wildcard "#" pattern (sensor/#)
+	conn2 := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub2, err := conn2.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub2: %v", err)
+	}
+	sendFrame(t, sub2, protocol.CmdSubscribe, 2, []byte("topic:sensor/#"))
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Publish to sensor/room1/temp (matches both "+" and "#")
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: 17,
+		Payload:    []byte("sensor/room1/temp"),
+	})
+
+	// Sub 1 must receive message
+	sub1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf1 := make([]byte, 1024)
+	n1, err := sub1.Read(buf1)
+	if err != nil {
+		t.Fatalf("sub1 (+) read: %v", err)
+	}
+	f1, _ := protocol.ParseFrame(buf1[:n1])
+	if string(f1.Payload) != "sensor/room1/temp" {
+		t.Errorf("sub1 (+): expected 'sensor/room1/temp', got %q", f1.Payload)
+	}
+
+	// Sub 2 must receive message
+	sub2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf2 := make([]byte, 1024)
+	n2, err := sub2.Read(buf2)
+	if err != nil {
+		t.Fatalf("sub2 (#) read: %v", err)
+	}
+	f2, _ := protocol.ParseFrame(buf2[:n2])
+	if string(f2.Payload) != "sensor/room1/temp" {
+		t.Errorf("sub2 (#): expected 'sensor/room1/temp', got %q", f2.Payload)
+	}
+
+	// Publish to sensor/room1/humidity (matches "#" but NOT "+")
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: 21,
+		Payload:    []byte("sensor/room1/humidity"),
+	})
+
+	// Sub 2 (#) must receive humidity
+	n2, err = sub2.Read(buf2)
+	if err != nil {
+		t.Fatalf("sub2 (#) read humidity: %v", err)
+	}
+	f2, _ = protocol.ParseFrame(buf2[:n2])
+	if string(f2.Payload) != "sensor/room1/humidity" {
+		t.Errorf("sub2 (#): expected 'sensor/room1/humidity', got %q", f2.Payload)
+	}
+}
+
+// TestMessageTTLExpiration verifies lazy expiration of messages in queue.
+func TestMessageTTLExpiration(t *testing.T) {
+	sTLS, cTLS := genTLS(t)
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 1024)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		frame, err := protocol.ParseFrame(buf[:n])
+		if err != nil {
+			return
+		}
+		_ = router.Subscribe(ctx, stream, frame)
+	}()
+
+	conn := dialQUIC(t, ln.Addr().String(), cTLS)
+	sub, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open sub: %v", err)
+	}
+	sendFrame(t, sub, protocol.CmdSubscribe, 1, []byte("topic:ttl-topic"))
+	time.Sleep(300 * time.Millisecond)
+
+	// Publish message with expired TTL (-50ms)
+	ttlPayload := []byte("ttl:-50:ttl-topic")
+	_ = router.Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(ttlPayload)),
+		Payload:    ttlPayload,
+	})
+
+	sub.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 1024)
+	_, err = sub.Read(buf)
+	if err == nil {
+		t.Error("expected deadline exceeded for expired TTL message, but read succeeded")
+	}
+}
+
+// BenchmarkRouterPublishWithWildcards measures publish latency with 10 wildcard subscribers.
+func BenchmarkRouterPublishWithWildcards(b *testing.B) {
+	sTLS, cTLS := genTLS(b)
+	quicConf := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
+	if err != nil {
+		b.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				for {
+					stream, err := conn.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func(s *quic.Stream) {
+						buf := make([]byte, 1024)
+						n, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						frame, err := protocol.ParseFrame(buf[:n])
+						if err != nil {
+							return
+						}
+						if frame.Command == protocol.CmdSubscribe {
+							_ = router.Subscribe(ctx, s, frame)
+						}
+					}(stream)
+				}
+			}()
+		}
+	}()
+
+	// Register 10 wildcard subscribers
+	for i := range 10 {
+		conn := dialQUIC(b, ln.Addr().String(), cTLS)
+		stream, err := conn.OpenStreamSync(ctx)
+		if err != nil {
+			b.Fatalf("open wildcard sub %d: %v", i, err)
+		}
+		sendFrame(b, stream, protocol.CmdSubscribe, uint32(i+1), []byte("topic:sensor/+/temp/#"))
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	topic := []byte("sensor/room1/temp/sub1")
+	pubFrame := protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(topic)),
+		Payload:    topic,
+	}
+
+	b.SetBytes(int64(protocol.FrameSize(uint32(len(topic)))))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = router.Publish(ctx, pubFrame)
+	}
+}
