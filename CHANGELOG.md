@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-07-26
+
+### Added
+- **Slab Allocator (`internal/mem/`)**: Replaces `sync.Pool` for `*[]byte` frame buffers on the hot path. Uses pre-allocated 64 MB arenas per size class (128B, 256B, 512B, 2KB, 8KB, 32KB) with lock-free free-list (atomic CAS). Zero GC pressure — arena memory is never scanned.
+- **Per-Tenant Rate Limiting (`internal/quotas/`)**: Lock-free Token Bucket with background refill goroutine. Uncontended check: 2.1 ns/op, 0 allocs/op. Configurable via `broker.quotas.default_publish_rate` and per-client overrides.
+- **Quota Integration**: `Router.Publish` checks quota before message dispatch. Rate-limited messages are silently dropped (with `aqueduct_messages_rate_limited_total` counter). Config via `config.yaml` and `AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE` env var.
+
+### Performance
+- `BenchmarkSlabAcquireRelease`: **15.1 ns/op, 0 allocs/op** (lock-free, uncontended)
+- `BenchmarkSlabAcquireReleaseContended`: ~55 ns/op, 0 allocs/op
+- `BenchmarkTokenBucketCheck`: **2.1 ns/op, 0 allocs/op** (< 5 ns target, 1000× headroom)
+- `BenchmarkBatchPublish`: **0 allocs/op** (regression-free, same as v1.6.0)
+- GC isolation: arena memory bypasses Go GC scan phase, reducing STW pause risk at 6M msg/s
+
 ## [1.7.0] - 2026-07-26
 
 ### Added
@@ -17,7 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - `BenchmarkNackHandling`: **0 allocs/op** on `NackByStream` hot path (non-blocking channel send).
-
 ## [1.6.0] - 2026-07-26
 
 ### Added
