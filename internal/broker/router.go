@@ -762,6 +762,16 @@ func (r *Router) Publish(ctx context.Context, frame protocol.Frame) error {
 	return r.publishWithClientID(ctx, frame, "")
 }
 
+// QuotaManager returns the quota manager associated with the router.
+func (r *Router) QuotaManager() *quotas.Manager {
+	return r.quotaManager
+}
+
+// PublishWithClientID routes a published frame and checks rate limits for the given clientID.
+func (r *Router) PublishWithClientID(ctx context.Context, frame protocol.Frame, clientID string) error {
+	return r.publishWithClientID(ctx, frame, clientID)
+}
+
 func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, clientID string) error {
 	if frame.PayloadLen > maxPayloadSize {
 		return errors.New("payload exceeds maximum frame size")
