@@ -1,4 +1,4 @@
-# Объяснение: Архитектура и модель памяти (v1.14.0)
+# Объяснение: Архитектура и модель памяти (v1.15.0)
 
 В данном документе описаны архитектурные принципы, Data-Oriented Design (DoD), механизмы безопасности и стратегии управления памятью с нулевыми аллокациями в Aqueduct.
 
@@ -306,3 +306,122 @@ broker:
 - Проверка в `Router.Publish()` перед отправкой сообщения
 - При превышении лимита сообщение отбрасывается, счетчик увеличивается
 - Метрика: `aqueduct_messages_rate_limited_total`
+
+---
+
+## 11. Дедупликация Idempotent Producer (Sliding Window)
+
+Aqueduct v1.15.0 добавляет поддержку идемпотентных продюсеров с broker-side дедупликацией, обеспечивая exactly-once семантику поверх существующего at-least-once pub/sub. Идемпотентный продюсер прикрепляет TLV-пару `ProducerID` + `SeqNum` к каждой публикации; брокер хранит скользящее окно последних 2048 sequence numbers на каждого продюсера и тихо дропает дубликаты.
+
+### Зачем нужен Exactly-Once?
+
+At-Least-Once (через Durable Subscriptions + CmdAck) достаточно, когда продюсер получает ACK от брокера. Но в сетях с потерями продюсер может повторно отправить сообщение после потери ACK, и брокер не может отличить новую копию от ретрая. База данных потребителя, обработавшая обе копии (например, платёжный ledger), выполнит двойное списание. Решение Kafka — `enable.idempotence=true`; Aqueduct обеспечивает ту же гарантию на уровне протокола.
+
+### Формат на проводе
+
+TLV-блок несёт две записи (zero-copy, парсятся через `FindExtension`):
+
+```text
+[ ExtProducerID (0x04) | Len: 8 | ID: 8B ] [ ExtSeqNum (0x05) | Len: 8 | Seq: 8B ]
+```
+
+20 байт суммарно. Обе записи должны присутствовать, чтобы дедупликация включилась; иначе фрейм обрабатывается как обычная публикация.
+
+### Sliding Window Ring Buffer
+
+Каждый продюсер отслеживается через `Window` из 256 байт (32 × `uint64`):
+
+```go
+type Window struct {
+    bitmap       [32]uint64     // 2048 бит, по 1 биту на seq
+    advanceMu    sync.Mutex     // защищает highSeqNum + clearing
+    highSeqNum   uint64         // максимальный seq, который мы видели
+    lastUsedNs   atomic.Int64   // unix-nano, для LRU eviction
+    producerID   uint64
+}
+```
+
+Слот для `SeqNum` — `SeqNum % 2048`. Проверка и установка бита — это `atomic.LoadUint64` + `atomic.CompareAndSwapUint64`, полностью lock-free на горячем пути. Только продвижение `highSeqNum` требует короткого мьютекса.
+
+### Lock-Free Bit Check-and-Set
+
+```go
+// Index math
+idx   := seqNum % 2048         // 0..2047
+word  := idx / 64               // 0..31
+bit   := uint64(1) << (idx%64)  // 0..63
+
+// CAS loop (без мьютекса)
+for {
+    old := atomic.LoadUint64(&w.bitmap[word])
+    if old & bit != 0 { return Duplicate }
+    if atomic.CompareAndSwapUint64(&w.bitmap[word], old, old|bit) {
+        return New
+    }
+    // CAS проиграл гонку; повтор.
+}
+```
+
+Когда новый `SeqNum` продвигает окно за его пределы, устаревшие биты в диапазоне переиспользованных слотов `(highSeqNum, seqNum - 2048]` очищаются **до** CAS, поэтому коллизия wrap-around на том же слоте не может быть ошибочно прочитана как дубликат.
+
+### Жизненный цикл продюсера (LRU + TTL)
+
+```go
+type Store struct {
+    entries   map[uint64]*storeEntry  // ProducerID → entry
+    lru       *list.List              // порядок LRU eviction
+    capacity  int                     // максимум окон (по умолчанию 65536)
+    idleTTL   time.Duration           // reap окон, idle дольше этого (по умолчанию 5m)
+}
+```
+
+- **LRU**: когда `len(entries) >= capacity`, самое старое окно вытесняется.
+- **TTL**: фоновая горутина reaps окна, чей `lastUsedNs` старше `now - idleTTL`, каждые `evictInterval` (по умолчанию 30s).
+- **Общая память**: `capacity × 256 B` плюс накладные расходы map — 16 MB при capacity по умолчанию.
+
+### Интеграция с диспетчером
+
+```text
+QUIC stream → dispatchFrames()
+                 ↓
+            1. ParseFrame
+            2. Decompress (Compression TLV)
+            3. Dedup check  ← НОВОЕ в v1.15.0
+                 ├─ New          → продолжить в router.Publish
+                 ├─ Duplicate    → отправить синтетический dedup_ack, дропнуть
+                 └─ Too Old      → закрыть стрим (ProtocolError)
+            4. Authorization
+            5. AAL
+            6. Router.Publish
+```
+
+Дубликат дропается с синтетическим `dedup_ack:<id>:<seq>` ACK, чтобы retry-петля продюсера завершилась. `TooOld` вызывает `stream.CancelRead(1)/CancelWrite(1)`, так как у клиента серьёзный баг (clock skew, restart-with-reset, застрявший retry).
+
+### Производительность
+
+| Бенчмарк | ns/op | allocs/op |
+|----------|-------|-----------|
+| `BenchmarkDedupCheck_InWindow` (в окне, дубликат) | 3.7 | 0 |
+| `BenchmarkDedupCheck_DuplicatePath` (повтор того же seq) | 3.7 | 0 |
+| `BenchmarkDedupCheck` (продвижение highSeqNum) | 12.4 | 0 |
+| `BenchmarkDedupCheck_Parallel` (32 ядра, lock-free) | 72.7 | 0 |
+| `BenchmarkStoreCheck_HotProducer` (1 продюсер, hot) | 9.4 | 0 |
+| `BenchmarkStoreCheck` (256 продюсеров, mixed) | 375 | 0 |
+
+Горячий путь — случай в окне / дубликат: 3.7 ns/op, 0 аллокаций. Полный dedup check (advance + clearing + CAS) — 12.4 ns/op из-за мьютекса `highSeqNum` — это укладывается в бюджет 5–10% для end-to-end publish (~30 ns baseline).
+
+### Конфигурация
+
+```yaml
+broker:
+  idempotent_producers:
+    enabled: true
+    window_capacity: 65536
+    idle_ttl: 5m
+```
+
+### Метрики
+
+| Метрика | Тип | Описание |
+|---------|-----|----------|
+| `aqueduct_messages_deduplicated_total` | Counter | Всего сообщений, отброшенных окном дедупликации. |
