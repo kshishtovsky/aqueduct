@@ -18,7 +18,6 @@ import (
 	"github.com/kshishtovsky/aqueduct/internal/aal"
 	"github.com/kshishtovsky/aqueduct/internal/authz"
 	"github.com/kshishtovsky/aqueduct/internal/broker"
-	"github.com/kshishtovsky/aqueduct/internal/dedup"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/kshishtovsky/aqueduct/internal/tracing"
@@ -68,9 +67,6 @@ type Broker struct {
 
 	compression        broker.CompressionEngine
 	compressionMinSize int
-
-	dedupStore   *dedup.Store
-	dedupEnabled bool
 }
 
 // Option configures the Broker.
@@ -128,23 +124,6 @@ func WithCompression(engine broker.CompressionEngine, minBatchSize int) Option {
 	return func(b *Broker) {
 		b.compression = engine
 		b.compressionMinSize = minBatchSize
-	}
-}
-
-// WithDedup enables Idempotent Producer deduplication. When set, every
-// CmdPublish / CmdPublishBatch frame carrying both ExtProducerID and
-// ExtSeqNum TLVs is checked against a per-producer sliding window. Frames
-// whose (ProducerID, SeqNum) pair is already in the window are dropped
-// silently and a synthetic ACK is sent to the producer; frames whose
-// SeqNum is far behind the window are treated as a protocol error and
-// the offending stream is closed. Frames without the TLVs are unaffected.
-func WithDedup(store *dedup.Store) Option {
-	return func(b *Broker) {
-		if store == nil {
-			return
-		}
-		b.dedupStore = store
-		b.dedupEnabled = true
 	}
 }
 
@@ -442,20 +421,6 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 			defer protocol.ReleaseExtensions(extToRelease)
 		}
 
-		// Idempotent Producer dedup check. Only applies to PUBLISH commands
-		// (single + batch) carrying the (ProducerID, SeqNum) TLV pair.
-		if b.dedupEnabled && b.dedupStore != nil && frame.HasExtensions() {
-			if handled, dedupErr := b.handleDedup(logger, stream, frame); handled {
-				if dedupErr != nil {
-					stream.CancelRead(1)
-					stream.CancelWrite(1)
-					return 0, dedupErr
-				}
-				consumed += totalLen
-				continue
-			}
-		}
-
 		// Authorization check
 		if b.authz != nil {
 			var requiredPerm authz.Permission
@@ -670,10 +635,6 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	if b.dedupEnabled && b.dedupStore != nil {
-		b.dedupStore.Stop()
-	}
-
 	if b.cancel != nil {
 		b.cancel()
 	}
@@ -752,65 +713,3 @@ func (b *Broker) decompressFrame(frame protocol.Frame) (protocol.Frame, []byte, 
 		Extensions: cleanExt,
 	}, cleanExt, nil
 }
-
-// handleDedup runs the Idempotent Producer check on a frame.
-// Returns (true, nil) when the frame was processed (either forwarded normally,
-// or dropped as a duplicate), in which case the caller must consume the frame.
-// Returns (true, err) when the frame must be rejected as a protocol violation
-// (ErrSequenceTooOld) and the stream must be closed.
-// Returns (false, nil) when the frame does not carry the (ProducerID, SeqNum)
-// TLV pair and must fall through to standard dispatch.
-//
-// Only PUBLISH-class opcodes (CmdPublish, CmdPublishBatch) participate in
-// dedup. The TLV pair must be present AFTER decompression stripping.
-func (b *Broker) handleDedup(logger *slog.Logger, stream *quic.Stream, frame protocol.Frame) (bool, error) {
-	// Only publish-class frames are subject to dedup.
-	opcode := protocol.OpcodeOf(frame.Command)
-	if opcode != protocol.CmdPublish && opcode != protocol.CmdPublishBatch {
-		return false, nil
-	}
-
-	producerID, hasID := protocol.ExtractProducerID(frame.Extensions)
-	seqNum, hasSeq := protocol.ExtractSeqNum(frame.Extensions)
-	if !hasID || !hasSeq {
-		return false, nil
-	}
-
-	result, err, _ := b.dedupStore.Check(producerID, seqNum)
-	if err != nil {
-		// Sequence number has fallen out of the window — protocol violation.
-		logger.Warn("idempotent producer sequence too old, closing stream",
-			"producer_id", producerID,
-			"seq_num", seqNum,
-		)
-		return true, errDedupSequenceTooOld
-	}
-
-	if result == dedup.Duplicate {
-		metrics.MessagesDeduplicated.Inc()
-		// Synthetic ACK so the producer stops retrying. We use the same
-		// CmdAck opcode with a `dedup_ack:<id>:<seq>` payload to clearly
-		// signal the cause of the ACK.
-		payload := make([]byte, 0, 32)
-		payload = append(payload, "dedup_ack:"...)
-		var idBuf [20]byte
-		idStr := strconv.FormatUint(producerID, 10)
-		seqStr := strconv.FormatUint(seqNum, 10)
-		payload = append(payload, idBuf[:0]...)
-		payload = append(payload, idStr...)
-		payload = append(payload, ':')
-		payload = append(payload, seqStr...)
-
-		ackBuf := protocol.SerializeFrame(protocol.CmdAck, frame.StreamID, payload)
-		if _, werr := stream.Write(*ackBuf); werr != nil {
-			logger.Debug("dedup ack write error", "err", werr)
-		}
-		protocol.ReleaseBuffer(ackBuf)
-		return true, nil
-	}
-
-	// result == dedup.New: fall through to standard dispatch.
-	return false, nil
-}
-
-var errDedupSequenceTooOld = errors.New("idempotent producer sequence too old")

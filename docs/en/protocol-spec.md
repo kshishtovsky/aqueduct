@@ -1,4 +1,4 @@
-# Reference: Binary Protocol Specification (v1.15.0)
+# Reference: Binary Protocol Specification (v1.13.0)
 
 This document provides the formal technical specification for Aqueduct's zero-copy binary wire protocol.
 
@@ -68,8 +68,6 @@ When `Command & 0x40 != 0`, the payload region begins with a 2-byte `ExtTotalLen
 | `ExtTraceContext` | `0x01` | 25 Bytes | OpenTelemetry Trace Context `[TraceID: 16B][SpanID: 8B][TraceFlags: 1B]` |
 | `ExtCompression` | `0x02` | 5 Bytes | Payload Compression Metadata `[Algo: 1B][UncompressedSize: 4B]` |
 | `ExtPriority` | `0x03` | 1 Byte | QoS Message Priority Level (`0` Highest, `1` High, `2` Normal, `3` Low) |
-| `ExtProducerID` | `0x04` | 8 Bytes | Idempotent Producer ID `[ID: 8B]` (Little-Endian uint64) |
-| `ExtSeqNum` | `0x05` | 8 Bytes | Idempotent Producer Sequence Number `[Seq: 8B]` (Little-Endian uint64) |
 
 ---
 
@@ -82,52 +80,7 @@ Messages can specify TTL and Priority:
 
 ---
 
-## 5. Idempotent Producer Dedup (Exactly-Once Semantics)
-
-Producers operating over unreliable networks may resend a message after losing the ACK. To prevent duplicate delivery to subscribers, an Idempotent Producer attaches two TLV entries to every `CmdPublish` / `CmdPublishBatch` frame:
-
-- `ExtProducerID (0x04)`: A stable 64-bit producer identifier, assigned on producer initialisation.
-- `ExtSeqNum (0x05)`: A monotonically increasing 64-bit sequence number, per-producer.
-
-When the broker sees a frame carrying both TLVs, it partitions the dedup state by `ProducerID` and runs a sliding-window check. The frame's on-wire layout does not change for old (non-idempotent) producers; the TLV block is silently skipped by parsers that do not understand the new types.
-
-### Sliding Window Algorithm
-
-For each `ProducerID`, the broker keeps a 2048-bit ring buffer (32 × `uint64` = 256 bytes per producer). The slot for a `SeqNum` is `SeqNum % 2048`. A sequence is treated as:
-
-| Case | Detection | Action |
-| :--- | :--- | :--- |
-| **New** | bit at slot is clear | Set the bit atomically (CAS), forward the frame, advance `highSeqNum`, clear any recycled bits. |
-| **Duplicate** | bit at slot is set | Silently drop the frame. Increment `aqueduct_messages_deduplicated_total`. Emit a synthetic `dedup_ack:<id>:<seq>` ACK so the producer stops retrying. |
-| **Too Old** | `highSeqNum ≥ SeqNum + WindowSize` | Treat as a protocol error. Cancel the offending stream (`CancelRead(1) / CancelWrite(1)`) to surface client bugs. |
-
-The bit check-and-set is **lock-free** (`atomic.LoadUint64` + `atomic.CompareAndSwapUint64`). The high-watermark bookkeeping is held under a short mutex only when the window slides forward. Duplicates never touch the mutex; they are a single load + branch.
-
-### Producer ID Lifecycle
-
-The `Store` is an LRU + TTL cache mapping `ProducerID → *Window`. When the population exceeds `capacity` (default 65536), the least-recently-used window is evicted. A background goroutine reaps windows whose `lastUsedNs` timestamp is older than `idle_ttl` (default 5 minutes). Per-producer memory is therefore bounded by `capacity × 256 B` plus map overhead.
-
-### Configuration
-
-```yaml
-broker:
-  idempotent_producers:
-    enabled: true          # opt-in (default: false)
-    window_capacity: 65536 # max tracked producers (LRU eviction)
-    idle_ttl: 5m           # per-producer idle eviction timeout
-```
-
-Environment overrides: `AQUEDUCT_BROKER_IDEMPOTENT_ENABLED`, `AQUEDUCT_BROKER_IDEMPOTENT_CAPACITY`, `AQUEDUCT_BROKER_IDEMPOTENT_IDLE_TTL`.
-
-### Metrics
-
-| Metric | Type | Description |
-| :--- | :--- | :--- |
-| `aqueduct_messages_deduplicated_total` | Counter | Total messages dropped by the dedup window (silent ACK to producer). |
-
----
-
-## 6. AAL Log Record Binary Framing
+## 5. AAL Log Record Binary Framing
 
 When stored in Append-Only Log files (encrypted or raw), records are framed as:
 
