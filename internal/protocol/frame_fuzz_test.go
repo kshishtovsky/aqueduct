@@ -112,3 +112,22 @@ func FuzzSerializeFrame(f *testing.F) {
 		}
 	})
 }
+
+// FuzzExtractProducerID ensures the zero-copy extractor never panics on
+// arbitrary TLV input. Unknown TLV types are silently skipped.
+func FuzzExtractProducerID(f *testing.F) {
+	// Valid 8-byte block.
+	f.Add([]byte{0, 0, byte(ExtProducerID), ExtProducerIDLen, 1, 2, 3, 4, 5, 6, 7, 8})
+	// Truncated header.
+	f.Add([]byte{byte(ExtProducerID)})
+	// Truncated value.
+	f.Add([]byte{byte(ExtProducerID), 8, 1, 2})
+	// Wrong type.
+	f.Add([]byte{0, 0, 0xFF, 8, 1, 2, 3, 4, 5, 6, 7, 8})
+
+	f.Fuzz(func(t *testing.T, extBlock []byte) {
+		// Must NEVER panic regardless of input.
+		_, _ = ExtractProducerID(extBlock)
+		_, _ = ExtractSeqNum(extBlock)
+	})
+}
