@@ -2475,3 +2475,92 @@ func BenchmarkGroupRouting(b *testing.B) {
 	}
 }
 
+// BenchmarkPublishBaseline mirrors BenchmarkGroupRouting but for a single
+// subscriber with no consumer group. It measures the "v1.6.0 baseline" cost
+// of a Publish call (no dedup, no extensions, no compression) so we can
+// compute the overhead of adding the Idempotent Producer dedup path.
+func BenchmarkPublishBaseline(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	topic := "bench-baseline"
+	router.mu.Lock()
+	subQueues := &[4]chan *MessageRef{}
+	subMu := &sync.RWMutex{}
+	router.streamIDs = append(router.streamIDs, 1)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, topic)
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, subQueues)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, subMu)
+	router.nackChs = append(router.nackChs, make(chan uint64, 8))
+	router.cancels = append(router.cancels, func() {})
+	router.subGroups = append(router.subGroups, "")
+	router.mu.Unlock()
+
+	payload := []byte(topic)
+	frame := protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: uint32(len(payload)),
+		Payload:    payload,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = router.Publish(ctx, frame)
+	}
+}
+
+// BenchmarkPublishWithDedup measures the cost of a Publish call when the
+// frame carries a (ProducerID, SeqNum) TLV pair. The TLV is pre-built once
+// so the benchmark isolates the broker-side dedup check overhead (TLV
+// extraction + dedup.Check) from the producer-side TLV encoding cost.
+// To compare against the no-dedup baseline, run BenchmarkPublishBaseline.
+func BenchmarkPublishWithDedup(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	router := NewRouter(nil)
+	defer router.Close()
+
+	topic := "bench-dedup"
+	router.mu.Lock()
+	subQueues := &[4]chan *MessageRef{}
+	subMu := &sync.RWMutex{}
+	router.streamIDs = append(router.streamIDs, 1)
+	router.streams = append(router.streams, nil)
+	router.topics = append(router.topics, topic)
+	router.active = append(router.active, true)
+	router.queues = append(router.queues, subQueues)
+	router.notifyChs = append(router.notifyChs, make(chan struct{}, 1))
+	router.subMus = append(router.subMus, subMu)
+	router.nackChs = append(router.nackChs, make(chan uint64, 8))
+	router.cancels = append(router.cancels, func() {})
+	router.subGroups = append(router.subGroups, "")
+	router.mu.Unlock()
+
+	payload := []byte(topic)
+	// Pre-build the TLV block once and reuse. This represents the
+	// wire-format TLV that the broker extracts and feeds to dedup.
+	ext := protocol.BuildIdempotentExtension(1, 1)
+	defer protocol.ReleaseExtensions(ext)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		frame := protocol.Frame{
+			Command:    protocol.CmdPublish | protocol.HasExtensionsBit,
+			PayloadLen: uint32(len(payload)),
+			Payload:    payload,
+			Extensions: ext,
+		}
+		_ = router.Publish(ctx, frame)
+	}
+}

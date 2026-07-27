@@ -155,6 +155,13 @@ var (
 		},
 	)
 
+	MessagesDeduplicated = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "aqueduct_messages_deduplicated_total",
+			Help: "Total number of messages dropped by the Idempotent Producer dedup window (duplicates silently ACK'd)",
+		},
+	)
+
 	AdminRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "aqueduct_admin_requests_total",
@@ -185,5 +192,6 @@ func init() {
 	prometheus.MustRegister(MessagesDeadLettered)
 	prometheus.MustRegister(MessagesRateLimited)
 	prometheus.MustRegister(TracingSpansTotal)
+	prometheus.MustRegister(MessagesDeduplicated)
 	prometheus.MustRegister(AdminRequestsTotal)
 }
