@@ -250,153 +250,132 @@ func applyEnvOverrides(cfg *Config) {
 }
 
 func applyListenEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_LISTEN_ADDR"); v != "" {
-		cfg.ListenAddr = v
-	}
-	if v := os.Getenv("AQUEDUCT_METRICS_ADDR"); v != "" {
-		cfg.MetricsAddr = v
-	}
+	envString("AQUEDUCT_LISTEN_ADDR", &cfg.ListenAddr)
+	envString("AQUEDUCT_METRICS_ADDR", &cfg.MetricsAddr)
 }
 
 func applyTLSEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_TLS_GENERATE"); v != "" {
-		cfg.TLS.Generate = parseBool(v, cfg.TLS.Generate)
-	}
-	if v := os.Getenv("AQUEDUCT_TLS_CERT_FILE"); v != "" {
-		cfg.TLS.CertFile = v
-	}
-	if v := os.Getenv("AQUEDUCT_TLS_KEY_FILE"); v != "" {
-		cfg.TLS.KeyFile = v
-	}
-	if v := os.Getenv("AQUEDUCT_TLS_REQUIRE_CLIENT_CERT"); v != "" {
-		cfg.TLS.RequireClientCert = parseBool(v, cfg.TLS.RequireClientCert)
-	}
-	if v := os.Getenv("AQUEDUCT_TLS_CLIENT_CA_FILE"); v != "" {
-		cfg.TLS.ClientCAFile = v
-	}
+	envBool("AQUEDUCT_TLS_GENERATE", &cfg.TLS.Generate)
+	envString("AQUEDUCT_TLS_CERT_FILE", &cfg.TLS.CertFile)
+	envString("AQUEDUCT_TLS_KEY_FILE", &cfg.TLS.KeyFile)
+	envBool("AQUEDUCT_TLS_REQUIRE_CLIENT_CERT", &cfg.TLS.RequireClientCert)
+	envString("AQUEDUCT_TLS_CLIENT_CA_FILE", &cfg.TLS.ClientCAFile)
 }
 
 func applyAALEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_AAL_ENABLED"); v != "" {
-		cfg.AAL.Enabled = parseBool(v, cfg.AAL.Enabled)
-	}
-	if v := os.Getenv("AQUEDUCT_AAL_FILE_PATH"); v != "" {
-		cfg.AAL.FilePath = v
-	}
-	if v := os.Getenv("AQUEDUCT_AAL_KEY"); v != "" {
-		cfg.AAL.Key = v
-	}
-	if v := os.Getenv("AQUEDUCT_AAL_MAX_SIZE"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			cfg.AAL.MaxFileSize = n
-		}
-	}
+	envBool("AQUEDUCT_AAL_ENABLED", &cfg.AAL.Enabled)
+	envString("AQUEDUCT_AAL_FILE_PATH", &cfg.AAL.FilePath)
+	envString("AQUEDUCT_AAL_KEY", &cfg.AAL.Key)
+	envInt64("AQUEDUCT_AAL_MAX_SIZE", &cfg.AAL.MaxFileSize)
 }
 
 func applyACLEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_ACL_ENABLED"); v != "" {
-		cfg.ACL.Enabled = parseBool(v, cfg.ACL.Enabled)
-	}
-	if v := os.Getenv("AQUEDUCT_ACL_DEFAULT"); v != "" {
-		cfg.ACL.Default = v
-	}
+	envBool("AQUEDUCT_ACL_ENABLED", &cfg.ACL.Enabled)
+	envString("AQUEDUCT_ACL_DEFAULT", &cfg.ACL.Default)
 }
 
 func applyAdminEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_ADMIN_ENABLED"); v != "" {
-		cfg.Admin.Enabled = parseBool(v, cfg.Admin.Enabled)
-	}
-	if v := os.Getenv("AQUEDUCT_ADMIN_ADDR"); v != "" {
-		cfg.Admin.Addr = v
+	envBool("AQUEDUCT_ADMIN_ENABLED", &cfg.Admin.Enabled)
+	envString("AQUEDUCT_ADMIN_ADDR", &cfg.Admin.Addr)
+}
+
+// applyBrokerEnv reads AQUEDUCT_BROKER_* env vars into cfg.Broker.
+// Cognitive complexity is bounded by extracting each env-var pair into a
+// dedicated helper (envString, envPositiveInt, envNonNegativeInt, envDuration).
+func applyBrokerEnv(cfg *Config) {
+	envString("AQUEDUCT_BROKER_BACKPRESSURE_POLICY", &cfg.Broker.BackpressurePolicy)
+	envPositiveInt("AQUEDUCT_BROKER_QUEUE_SIZE", &cfg.Broker.QueueSize)
+	envPositiveInt("AQUEDUCT_BROKER_BATCH_SIZE", &cfg.Broker.BatchSize)
+	envDuration("AQUEDUCT_BROKER_FLUSH_INTERVAL", &cfg.Broker.FlushInterval)
+	envPositiveInt("AQUEDUCT_BROKER_MAX_RETRIES", &cfg.Broker.MaxRetries)
+	envNonNegativeInt("AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE", &cfg.Broker.Quotas.DefaultPublishRate)
+	envPositiveInt("AQUEDUCT_BROKER_DEFAULT_BURST_SIZE", &cfg.Broker.Quotas.DefaultBurstSize)
+}
+
+// envString sets *dst to the value of the given env var if non-empty.
+func envString(name string, dst *string) {
+	if v := os.Getenv(name); v != "" {
+		*dst = v
 	}
 }
 
-func applyBrokerEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_BROKER_QUEUE_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Broker.QueueSize = n
-		}
+// envPositiveInt parses the env var as int and writes it to *dst if > 0.
+func envPositiveInt(name string, dst *int) {
+	v := os.Getenv(name)
+	if v == "" {
+		return
 	}
-	if v := os.Getenv("AQUEDUCT_BROKER_BACKPRESSURE_POLICY"); v != "" {
-		cfg.Broker.BackpressurePolicy = v
+	n, err := strconv.Atoi(v)
+	if err == nil && n > 0 {
+		*dst = n
 	}
-	if v := os.Getenv("AQUEDUCT_BROKER_BATCH_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Broker.BatchSize = n
-		}
+}
+
+// envNonNegativeInt parses the env var as int and writes it to *dst if >= 0.
+func envNonNegativeInt(name string, dst *int) {
+	v := os.Getenv(name)
+	if v == "" {
+		return
 	}
-	if v := os.Getenv("AQUEDUCT_BROKER_FLUSH_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.Broker.FlushInterval = d
-		}
+	n, err := strconv.Atoi(v)
+	if err == nil && n >= 0 {
+		*dst = n
 	}
-	if v := os.Getenv("AQUEDUCT_BROKER_MAX_RETRIES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Broker.MaxRetries = n
-		}
+}
+
+// envDuration parses the env var as time.Duration and writes it to *dst if > 0.
+func envDuration(name string, dst *time.Duration) {
+	v := os.Getenv(name)
+	if v == "" {
+		return
 	}
-	if v := os.Getenv("AQUEDUCT_BROKER_DEFAULT_PUBLISH_RATE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			cfg.Broker.Quotas.DefaultPublishRate = n
-		}
+	d, err := time.ParseDuration(v)
+	if err == nil && d > 0 {
+		*dst = d
 	}
-	if v := os.Getenv("AQUEDUCT_BROKER_DEFAULT_BURST_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Broker.Quotas.DefaultBurstSize = n
-		}
+}
+
+// envInt64 parses the env var as int64 and writes it to *dst if > 0.
+func envInt64(name string, dst *int64) {
+	v := os.Getenv(name)
+	if v == "" {
+		return
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err == nil && n > 0 {
+		*dst = n
+	}
+}
+
+// envBool parses the env var via parseBool and writes it to *dst.
+func envBool(name string, dst *bool) {
+	if v := os.Getenv(name); v != "" {
+		*dst = parseBool(v, *dst)
 	}
 }
 
 func applyTransportEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_TRANSPORT_MAX_BUF_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Transport.MaxBufSize = n
-		}
-	}
-	if v := os.Getenv("AQUEDUCT_TRANSPORT_READ_BUF_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Transport.ReadBufSize = n
-		}
-	}
+	envPositiveInt("AQUEDUCT_TRANSPORT_MAX_BUF_SIZE", &cfg.Transport.MaxBufSize)
+	envPositiveInt("AQUEDUCT_TRANSPORT_READ_BUF_SIZE", &cfg.Transport.ReadBufSize)
 }
 
 func applyTracingEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_TRACING_ENABLED"); v != "" {
-		cfg.Tracing.Enabled = parseBool(v, cfg.Tracing.Enabled)
-	}
-	if v := os.Getenv("AQUEDUCT_TRACING_SERVICE_NAME"); v != "" {
-		cfg.Tracing.ServiceName = v
-	}
-	if v := os.Getenv("AQUEDUCT_TRACING_ENDPOINT"); v != "" {
-		cfg.Tracing.Endpoint = v
-	}
+	envBool("AQUEDUCT_TRACING_ENABLED", &cfg.Tracing.Enabled)
+	envString("AQUEDUCT_TRACING_SERVICE_NAME", &cfg.Tracing.ServiceName)
+	envString("AQUEDUCT_TRACING_ENDPOINT", &cfg.Tracing.Endpoint)
 }
 
 func applyClusterEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_ENABLED"); v != "" {
-		cfg.Cluster.Discovery.Enabled = parseBool(v, cfg.Cluster.Discovery.Enabled)
-	}
-	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_HOST"); v != "" {
-		cfg.Cluster.Discovery.Host = v
-	}
-	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_PORT"); v != "" {
-		cfg.Cluster.Discovery.Port = v
-	}
-	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL"); v != "" {
-		cfg.Cluster.Discovery.Interval = v
-	}
-	if v := os.Getenv("AQUEDUCT_CLUSTER_MESH_INSECURE_SKIP_VERIFY"); v != "" {
-		cfg.Cluster.Mesh.InsecureSkipVerify = parseBool(v, cfg.Cluster.Mesh.InsecureSkipVerify)
-	}
-	if v := os.Getenv("AQUEDUCT_CLUSTER_MESH_CA_FILE"); v != "" {
-		cfg.Cluster.Mesh.CAFile = v
-	}
+	envBool("AQUEDUCT_CLUSTER_DISCOVERY_ENABLED", &cfg.Cluster.Discovery.Enabled)
+	envString("AQUEDUCT_CLUSTER_DISCOVERY_HOST", &cfg.Cluster.Discovery.Host)
+	envString("AQUEDUCT_CLUSTER_DISCOVERY_PORT", &cfg.Cluster.Discovery.Port)
+	envString("AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL", &cfg.Cluster.Discovery.Interval)
+	envBool("AQUEDUCT_CLUSTER_MESH_INSECURE_SKIP_VERIFY", &cfg.Cluster.Mesh.InsecureSkipVerify)
+	envString("AQUEDUCT_CLUSTER_MESH_CA_FILE", &cfg.Cluster.Mesh.CAFile)
 }
 
 func applyCompressionEnv(cfg *Config) {
-	if v := os.Getenv("AQUEDUCT_COMPRESSION_ENABLED"); v != "" {
-		cfg.Compression.Enabled = parseBool(v, cfg.Compression.Enabled)
-	}
+	envBool("AQUEDUCT_COMPRESSION_ENABLED", &cfg.Compression.Enabled)
 }
 
 func parseBool(str string, fallback bool) bool {

@@ -105,11 +105,11 @@ jobs:
 
       - name: Run gosec (Go Security Scanner)
         continue-on-error: true
-        # Pin gosec to a specific release tag (mutable tag, but scoped and intentional)
-        # so CI fetches a deterministic version rather than rolling @latest.
+        # Use `go run` against the locked version in tools.go (// +build tools)
+        # instead of `go install @tag`, so the dependency is tracked in go.sum
+        # per SonarQube rule S8545 (lock-file enforcing command).
         run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
-          gosec -fmt=sarif -out=gosec-report.sarif ./...
+          go run github.com/securego/gosec/v2/cmd/gosec -fmt=sarif -out=gosec-report.sarif ./...
 
       - name: Upload gosec SARIF to GitHub
         uses: github/codeql-action/upload-sarif@v3
