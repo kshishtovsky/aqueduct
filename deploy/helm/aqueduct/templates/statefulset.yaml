@@ -42,7 +42,8 @@ spec:
             - ALL
       containers:
         - name: broker
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          # image tag is set via .Values.image.tag and defaults to .Chart.AppVersion (NOT latest). NOSONAR S6596: Helm templating is not recognized by Sonar.
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}" # NOSONAR S6596
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "-config"

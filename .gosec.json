@@ -3,9 +3,5 @@
     "nosec": false,
     "audit": "audit"
   },
-  "exclude": "G104,G107",
-  "exclude-dir": "third_party,vendor",
-  "exclude-files": [
-    "**/admin.pb.go"
-  ]
+  "exclude-dir": "third_party,vendor"
 }

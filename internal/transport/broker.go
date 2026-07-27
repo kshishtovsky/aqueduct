@@ -295,86 +295,123 @@ func runHandleConn(b *Broker, jig context.Context, conn *quic.Conn) {
 
 // processStream reads frames from a single QUIC stream and dispatches them.
 func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *quic.Stream, clientIDStr string) {
-	streamID := stream.StreamID()
-	span := b.logger.With(
-		"stream_id", streamID,
-		"remote", conn.RemoteAddr(),
-		"client_id", clientIDStr,
-	)
+	span := b.newStreamSpan(stream, conn, clientIDStr)
 
 	// Ensure cleanup on stream close.
 	defer func() {
 		if b.router != nil {
 			// #nosec G115 -- StreamID is bounded by the QUIC stream ID space (<<2^63); the router keys by uint32 hash of the low bits.
-			b.router.Unsubscribe(uint32(streamID))
+			b.router.Unsubscribe(uint32(stream.StreamID()))
 		}
 	}()
 
 	buf := _rp.GetBuf(b.readBufSize)
 	defer _rp.PutBuf(buf)
 
-	off := 0
+	b.runStreamReadLoop(jig, span, stream, clientIDStr, buf)
+}
 
+// runStreamReadLoop drives the read-dispatch-grow cycle. Each iteration:
+//  1. dispatch any complete frames already buffered;
+//  2. grow the buffer if it filled up after dispatch;
+//  3. read more bytes from the QUIC stream.
+//
+// Errors from dispatch (oversized payload, unauthorized) cause a CancelRead/Write
+// and return. Errors from stream.Read on a closed stream are silent.
+func (b *Broker) runStreamReadLoop(jig context.Context, span *slog.Logger, stream *quic.Stream, clientIDStr string, buf []byte) {
+	off := 0
 	for {
 		if off == cap(buf) {
-			var err error
-			off, err = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr)
-			if err != nil {
-				if errors.Is(err, errUnauthorized) {
-					stream.CancelRead(401)
-					stream.CancelWrite(401)
-					return
-				}
-				span.Warn("oversized payload or memory limit exceeded", "err", err)
-				stream.CancelRead(1)
-				stream.CancelWrite(1)
+			if !b.drainAndMaybeGrow(jig, span, stream, clientIDStr, &buf, &off) {
 				return
-			}
-			if off == cap(buf) {
-				if cap(buf) >= b.maxBufSize {
-					span.Warn("unread buffer size exceeded maxBufSize", "off", off, "max_buf_size", b.maxBufSize)
-					stream.CancelRead(1)
-					stream.CancelWrite(1)
-					return
-				}
-				newCap := cap(buf) * 2
-				if newCap > b.maxBufSize {
-					newCap = b.maxBufSize
-				}
-				newBuf := make([]byte, newCap)
-				copy(newBuf, buf[:off])
-				buf = newBuf
 			}
 		}
 
 		n, err := stream.Read(buf[off:])
 		if n > 0 {
 			off += n
-			var dispatchErr error
-			off, dispatchErr = b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr)
+			newOff, dispatchErr := b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr)
 			if dispatchErr != nil {
-				if errors.Is(dispatchErr, errUnauthorized) {
-					stream.CancelRead(401)
-					stream.CancelWrite(401)
-					return
-				}
-				span.Warn("oversized payload or memory limit exceeded", "err", dispatchErr)
-				stream.CancelRead(1)
-				stream.CancelWrite(1)
+				b.handleDispatchError(span, stream, dispatchErr)
 				return
 			}
+			off = newOff
 		}
 		if err != nil {
-			if b.stopped.Load() || errors.Is(err, quic.ErrServerClosed) {
-				return
-			}
-			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+			if b.isExpectedStreamReadError(err) {
 				return
 			}
 			span.Warn("stream read error", "err", err)
 			return
 		}
 	}
+}
+
+// drainAndMaybeGrow dispatches the buffered complete frames and, if the buffer
+// is still full, doubles its capacity up to b.maxBufSize. Returns false when
+// the stream must be torn down (oversized payload, unauthorized, hit max).
+func (b *Broker) drainAndMaybeGrow(jig context.Context, span *slog.Logger, stream *quic.Stream, clientIDStr string, buf *[]byte, off *int) bool {
+	newOff, err := b.dispatchFrames(jig, span, (*buf)[:*off], *off, stream, clientIDStr)
+	if err != nil {
+		b.handleDispatchError(span, stream, err)
+		return false
+	}
+	*off = newOff
+	if *off != cap(*buf) {
+		return true
+	}
+	if cap(*buf) >= b.maxBufSize {
+		span.Warn("unread buffer size exceeded maxBufSize", "off", *off, "max_buf_size", b.maxBufSize)
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		return false
+	}
+	b.growBuffer(buf)
+	return true
+}
+
+// growBuffer doubles *buf's capacity up to b.maxBufSize, copying the live data.
+func (b *Broker) growBuffer(buf *[]byte) {
+	newCap := cap(*buf) * 2
+	if newCap > b.maxBufSize {
+		newCap = b.maxBufSize
+	}
+	newBuf := make([]byte, newCap)
+	copy(newBuf, (*buf)[:cap(*buf)])
+	*buf = newBuf
+}
+
+// handleDispatchError centralizes the dispatch-error paths: unauthorized
+// uses stream error 401, oversized / memory uses 1. Both cancel read+write
+// and rely on the loop caller to return.
+func (b *Broker) handleDispatchError(span *slog.Logger, stream *quic.Stream, err error) {
+	if errors.Is(err, errUnauthorized) {
+		stream.CancelRead(401)
+		stream.CancelWrite(401)
+		return
+	}
+	span.Warn("oversized payload or memory limit exceeded", "err", err)
+	stream.CancelRead(1)
+	stream.CancelWrite(1)
+}
+
+// isExpectedStreamReadError returns true for errors that are normal during
+// shutdown (server closed, conn closed, EOF) and do not warrant a log line.
+func (b *Broker) isExpectedStreamReadError(err error) bool {
+	if b.stopped.Load() || errors.Is(err, quic.ErrServerClosed) {
+		return true
+	}
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF)
+}
+
+// newStreamSpan builds the per-stream logger pre-bound with the standard
+// stream_id / remote / client_id fields.
+func (b *Broker) newStreamSpan(stream *quic.Stream, conn *quic.Conn, clientIDStr string) *slog.Logger {
+	return b.logger.With(
+		"stream_id", stream.StreamID(),
+		"remote", conn.RemoteAddr(),
+		"client_id", clientIDStr,
+	)
 }
 
 // dispatchFrames splits buf[:off] into complete frames and invokes handlers
@@ -547,13 +584,13 @@ func (b *Broker) handleLocalFrame(jig context.Context, logger *slog.Logger, stre
 		}
 		return true
 	case protocol.CmdNack:
-		if len(frame.Payload) >= 8 {
-			nackOffset := binary.LittleEndian.Uint64(frame.Payload[:8])
-			// #nosec G115 -- stream.StreamID() is a quic int64; the router hashes low 32 bits which is sufficient for the per-stream map.
-			b.router.NackByStream(uint32(stream.StreamID()), nackOffset)
-		} else {
+		if len(frame.Payload) < 8 {
 			logger.Warn("nack payload too short", "len", len(frame.Payload))
+			return true
 		}
+		nackOffset := binary.LittleEndian.Uint64(frame.Payload[:8])
+		// #nosec G115 -- stream.StreamID() is a quic int64; the router hashes low 32 bits which is sufficient for the per-stream map.
+		b.router.NackByStream(uint32(stream.StreamID()), nackOffset)
 		return true
 	}
 	return false
