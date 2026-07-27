@@ -126,6 +126,9 @@ func (l *Log) WriteFrame(frameBytes []byte) error {
 
 // Replay reads an AAL file sequentially chunk-by-chunk using a pooled buffer,
 // decrypting records if key is provided and executing handler for each frame.
+//
+// Refactored into setup + per-chunk helpers so each function stays well
+// under Sonar's 15-cognitive-complexity threshold.
 func Replay(path string, key []byte, handler func(frameBytes []byte) error) (int, error) {
 	if path == "" {
 		return 0, nil
@@ -144,19 +147,9 @@ func Replay(path string, key []byte, handler func(frameBytes []byte) error) (int
 		return 0, nil
 	}
 
-	var gcm cipher.AEAD
-	if len(key) > 0 {
-		if len(key) != 32 {
-			return 0, ErrInvalidKeySize
-		}
-		block, err := aes.NewCipher(key)
-		if err != nil {
-			return 0, fmt.Errorf("aal: replay cipher: %w", err)
-		}
-		gcm, err = cipher.NewGCM(block)
-		if err != nil {
-			return 0, fmt.Errorf("aal: replay gcm: %w", err)
-		}
+	gcm, err := newReplayCipher(key)
+	if err != nil {
+		return 0, err
 	}
 
 	buf := make([]byte, 64*1024)
@@ -164,66 +157,103 @@ func Replay(path string, key []byte, handler func(frameBytes []byte) error) (int
 	count := 0
 
 	for {
-		n, err := f.Read(buf[off:])
+		n, rerr := f.Read(buf[off:])
 		if n > 0 {
 			off += n
 		}
 
-		consumed := 0
-		for consumed < off {
-			remaining := off - consumed
-			if remaining < 4 {
-				break
-			}
-			recLen := int(binary.LittleEndian.Uint32(buf[consumed : consumed+4]))
-			if recLen <= 0 || recLen > 10*1024*1024 {
-				// Corrupt record length, skip 1 byte
-				consumed++
-				continue
-			}
-			if remaining < 4+recLen {
-				break
-			}
-
-			recBytes := buf[consumed+4 : consumed+4+recLen]
-			if gcm != nil {
-				if len(recBytes) < 12+16 {
-					consumed += 4 + recLen
-					continue
-				}
-				nonce := recBytes[:12]
-				ciphertext := recBytes[12:]
-				plain, err := gcm.Open(nil, nonce, ciphertext, nil)
-				if err != nil {
-					consumed += 4 + recLen
-					continue
-				}
-				if err := handler(plain); err != nil {
-					return count, err
-				}
-			} else {
-				if err := handler(recBytes); err != nil {
-					return count, err
-				}
-			}
-			count++
-			consumed += 4 + recLen
+		consumed, newCount, handlerErr := decodeReplayChunk(buf[:off], gcm, handler, count)
+		count = newCount
+		if handlerErr != nil {
+			return count, handlerErr
 		}
-
 		if consumed > 0 {
 			copy(buf, buf[consumed:off])
 			off -= consumed
 		}
 
-		if err != nil {
-			if errors.Is(err, io.EOF) {
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
 				break
 			}
-			return count, err
+			return count, rerr
 		}
 	}
 
 	return count, nil
+}
+
+// newReplayCipher returns a fresh AES-256-GCM AEAD for the given key, or nil
+// when encryption is disabled.
+func newReplayCipher(key []byte) (cipher.AEAD, error) {
+	if len(key) == 0 {
+		return nil, nil
+	}
+	if len(key) != 32 {
+		return nil, ErrInvalidKeySize
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("aal: replay cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("aal: replay gcm: %w", err)
+	}
+	return gcm, nil
+}
+
+// decodeReplayChunk consumes as many complete records as possible from buf,
+// invoking handler for each. Returns (consumed, count, handlerErr).
+// handlerErr is non-nil only when the handler returned an error — replay
+// must then abort.
+func decodeReplayChunk(buf []byte, gcm cipher.AEAD, handler func([]byte) error, count int) (int, int, error) {
+	consumed := 0
+	for consumed < len(buf) {
+		remaining := len(buf) - consumed
+		if remaining < 4 {
+			break
+		}
+		recLen := int(binary.LittleEndian.Uint32(buf[consumed : consumed+4]))
+		if recLen <= 0 || recLen > 10*1024*1024 {
+			// Corrupt record length; recover by advancing 1 byte and
+			// continuing (best-effort resync).
+			consumed++
+			continue
+		}
+		if remaining < 4+recLen {
+			break
+		}
+
+		plain, ok, err := decryptReplayRecord(buf[consumed+4:consumed+4+recLen], gcm)
+		if err != nil || !ok {
+			consumed += 4 + recLen
+			continue
+		}
+		if err := handler(plain); err != nil {
+			return consumed, count, err
+		}
+		count++
+		consumed += 4 + recLen
+	}
+	return consumed, count, nil
+}
+
+// decryptReplayRecord decrypts one AAL record. Returns (plaintext, ok, err).
+// ok=false means the record was malformed and should be skipped silently;
+// err!=nil means a handler-level error that should abort replay.
+func decryptReplayRecord(recBytes []byte, gcm cipher.AEAD) ([]byte, bool, error) {
+	if gcm == nil {
+		return recBytes, true, nil
+	}
+	if len(recBytes) < 12+16 {
+		return nil, false, nil
+	}
+	plain, err := gcm.Open(nil, recBytes[:12], recBytes[12:], nil)
+	if err != nil {
+		return nil, false, nil
+	}
+	return plain, true, nil
 }
 
 // Rotate rewrites the AAL file if file size exceeds maxSize.

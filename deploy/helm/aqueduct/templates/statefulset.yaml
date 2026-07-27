@@ -28,12 +28,21 @@ spec:
         {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
-      {{- if .Values.serviceAccount.create }}
+      {{- if or (.Values.serviceAccount.create) (.Values.serviceAccount.name) }}
       serviceAccountName: {{ .Values.serviceAccount.name | default (include "aqueduct.fullname" .) }}
+      automountServiceAccountToken: false
       {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
       containers:
         - name: broker
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "-config"
@@ -55,7 +64,9 @@ spec:
               mountPath: /var/lib/aqueduct
             {{- end }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- $reqs := default (dict "ephemeral-storage" "1Gi") .Values.resources.requests -}}
+            {{- $lims := default (dict "ephemeral-storage" "2Gi") .Values.resources.limits -}}
+            {{- toYaml (dict "requests" $reqs "limits" $lims) | nindent 12 }}
           livenessProbe:
             exec:
               command:
