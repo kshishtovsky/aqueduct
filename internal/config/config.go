@@ -42,6 +42,16 @@ type TracingConfig struct {
 type ClusterConfig struct {
 	Peers     []string        `yaml:"peers"`     // Static peer addresses e.g. ["node-b:4242", "node-c:4242"]
 	Discovery DiscoveryConfig `yaml:"discovery"` // Dynamic peer discovery settings
+	Mesh      MeshConfig      `yaml:"mesh"`      // Cluster mesh TLS verification settings
+}
+
+// MeshConfig configures TLS verification for cluster mesh peer connections.
+// InsecureSkipVerify defaults to false (secure by default). Set to true ONLY
+// for self-signed dev meshes. Production deployments should keep it false and
+// either provide a CAFile or rely on the system CA pool.
+type MeshConfig struct {
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"` // G402 default false; set true ONLY for self-signed dev mesh
+	CAFile             string `yaml:"ca_file"`              // PEM file with CA certs for peer verification
 }
 
 // DiscoveryConfig defines DNS-based peer discovery for Kubernetes deployments.
@@ -115,15 +125,18 @@ type BrokerConfig struct {
 func (b BrokerConfig) GetPriorityTTLs() [4]time.Duration {
 	var res [4]time.Duration
 	for i, s := range b.PriorityTTLs {
+		// #nosec G602 -- bounds-check `if i >= 4 { break }` is below; gosec's data-flow analyzer misses the early-exit.
 		if i >= 4 {
 			break
 		}
 		if s == "" || s == "0" || s == "0s" {
+			// #nosec G602 -- same as above; i < 4 is guaranteed here.
 			res[i] = 0
 			continue
 		}
 		d, err := time.ParseDuration(s)
 		if err == nil {
+			// #nosec G602 -- same as above.
 			res[i] = d
 		}
 	}
@@ -204,6 +217,7 @@ func Load(path string) (*Config, error) {
 	cfg := Default()
 
 	if path != "" {
+		// #nosec G304 -- path is operator-controlled (-config flag / AQUEDUCT_* env), not from untrusted input.
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("config: read file %q: %w", path, err)
@@ -370,6 +384,12 @@ func applyClusterEnv(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL"); v != "" {
 		cfg.Cluster.Discovery.Interval = v
+	}
+	if v := os.Getenv("AQUEDUCT_CLUSTER_MESH_INSECURE_SKIP_VERIFY"); v != "" {
+		cfg.Cluster.Mesh.InsecureSkipVerify = parseBool(v, cfg.Cluster.Mesh.InsecureSkipVerify)
+	}
+	if v := os.Getenv("AQUEDUCT_CLUSTER_MESH_CA_FILE"); v != "" {
+		cfg.Cluster.Mesh.CAFile = v
 	}
 }
 

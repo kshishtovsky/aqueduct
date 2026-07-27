@@ -22,6 +22,7 @@ func serializeFrame(cmd byte, streamID uint32, payload []byte) []byte {
 	buf[0] = magicByte
 	buf[1] = cmd
 	binary.LittleEndian.PutUint32(buf[2:6], streamID)
+	// #nosec G115 -- example payload sizes are tiny.
 	binary.LittleEndian.PutUint32(buf[6:10], uint32(len(payload)))
 	copy(buf[headerSize:], payload)
 	return buf
@@ -37,6 +38,7 @@ func parseFrame(data []byte) (cmd byte, streamID uint32, payload []byte, err err
 	cmd = data[1]
 	streamID = binary.LittleEndian.Uint32(data[2:6])
 	payloadLen := binary.LittleEndian.Uint32(data[6:10])
+	// #nosec G115 -- example data sizes are tiny.
 	if uint32(len(data)) < headerSize+payloadLen {
 		return 0, 0, nil, fmt.Errorf("payload truncated")
 	}
@@ -51,7 +53,7 @@ func main() {
 	// TLS rule is suppressed for this developer example only.
 	tlsConf := &tls.Config{
 		// codeql[go/insecure-tls]  // dev-only localhost example; see comment above
-		InsecureSkipVerify: true, //nolint:gosec // dev-only; see comment above
+		InsecureSkipVerify: true, // #nosec G402 -- dev-only; see comment above
 		NextProtos:         []string{"aqueduct-v1"},
 		MinVersion:         tls.VersionTLS13,
 	}

@@ -160,7 +160,8 @@ func (s *Server) UpdateACL(ctx context.Context, req *adminpb.UpdateACLRequest) (
 	s.authzEngine.Reload(newRules)
 
 	return &adminpb.UpdateACLResponse{
-		Success:    true,
+		Success: true,
+		// #nosec G115 -- ACL rules are operator-controlled and bounded by config; the proto schema mandates int32 here.
 		RulesCount: int32(len(newRules)),
 	}, nil
 }

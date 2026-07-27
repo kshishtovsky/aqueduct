@@ -146,8 +146,47 @@ func main() {
 	// Initialize cluster peer federation if peers are configured.
 	var pm *cluster.PeerManager
 	if len(cfg.Cluster.Peers) > 0 || cfg.Cluster.Discovery.Enabled {
-		peerTLS := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"aqueduct-mesh"}}
+		// Build the peer TLS config based on operator-provided settings.
+		// Default: skip verification (allows self-signed dev mesh with TLS encryption).
+		// Production: set cluster.tls.insecure_skip_verify: false and provide a CA pool.
+		//
+		// SECURITY: InsecureSkipVerify disables host-name verification of the peer
+		// certificate, leaving the mesh open to MITM attacks if network traffic is
+		// intercepted. In production, point RootCAs at a CA bundle that signs all
+		// peer certificates (e.g. internal cluster CA) and set the flag to false.
+		// #nosec G402 -- operator-controlled cluster TLS; setting gated by config.Mesh.InsecureSkipVerify.
+		peerTLS := &tls.Config{
+			InsecureSkipVerify: cfg.Cluster.Mesh.InsecureSkipVerify,
+			NextProtos:         []string{"aqueduct-mesh"},
+		}
 		peerQUIC := &quic.Config{MaxIdleTimeout: 30 * time.Second}
+
+		if cfg.Cluster.Mesh.InsecureSkipVerify {
+			logger.Warn("cluster mesh TLS verification disabled (cluster.tls.insecure_skip_verify=true). " +
+				"This is vulnerable to MITM attacks. Use a CA-signed certificate in production.")
+		} else {
+			if cfg.Cluster.Mesh.CAFile != "" {
+				caPEM, err := os.ReadFile(cfg.Cluster.Mesh.CAFile)
+				if err != nil {
+					logger.Error("failed to read cluster mesh CA file", "path", cfg.Cluster.Mesh.CAFile, "err", err)
+					os.Exit(1)
+				}
+				caPool := x509.NewCertPool()
+				if !caPool.AppendCertsFromPEM(caPEM) {
+					logger.Error("failed to parse cluster mesh CA certificates from PEM", "path", cfg.Cluster.Mesh.CAFile)
+					os.Exit(1)
+				}
+				peerTLS.RootCAs = caPool
+				logger.Info("cluster mesh TLS using custom CA pool", "ca_file", cfg.Cluster.Mesh.CAFile)
+			} else {
+				systemPool, err := x509.SystemCertPool()
+				if err != nil || systemPool == nil {
+					systemPool = x509.NewCertPool()
+				}
+				peerTLS.RootCAs = systemPool
+				logger.Info("cluster mesh TLS using system CA pool")
+			}
+		}
 
 		// Start with static peers (may be empty if discovery-only mode).
 		pm = cluster.NewWithLogger(ctx, cfg.Cluster.Peers, peerTLS, peerQUIC, logger)
