@@ -26,7 +26,6 @@ import (
 	"github.com/kshishtovsky/aqueduct/internal/broker"
 	"github.com/kshishtovsky/aqueduct/internal/cluster"
 	"github.com/kshishtovsky/aqueduct/internal/config"
-	"github.com/kshishtovsky/aqueduct/internal/dedup"
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/kshishtovsky/aqueduct/internal/transport"
@@ -197,27 +196,6 @@ func main() {
 		transport.WithRouter(router),
 		transport.WithMaxBufSize(cfg.Transport.MaxBufSize),
 		transport.WithReadBufSize(cfg.Transport.ReadBufSize),
-	}
-
-	if cfg.Broker.IdempotentProducers.Enabled {
-		dedupCapacity := cfg.Broker.IdempotentProducers.WindowCapacity
-		if dedupCapacity <= 0 {
-			dedupCapacity = 65536
-		}
-		dedupIdleTTL, errParse := time.ParseDuration(cfg.Broker.IdempotentProducers.IdleTTL)
-		if errParse != nil || dedupIdleTTL <= 0 {
-			dedupIdleTTL = 5 * time.Minute
-		}
-		dedupStore := dedup.NewStore(
-			dedup.WithCapacity(dedupCapacity),
-			dedup.WithIdleTTL(dedupIdleTTL),
-		)
-		dedupStore.Start()
-		opts = append(opts, transport.WithDedup(dedupStore))
-		logger.Info("idempotent producer dedup enabled",
-			"window_capacity", dedupCapacity,
-			"idle_ttl", dedupIdleTTL,
-		)
 	}
 
 	var authzEngine *authz.Engine
