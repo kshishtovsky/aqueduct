@@ -20,7 +20,6 @@ Aqueduct — это сверхвысокопроизводительный бр�
 
 ## Возможности
 
-- **Idempotent Producers (Exactly-Once)**: Sliding-window дедупликация на основе кольцевого буфера 2048 бит (32 × `uint64` = 256 B) с lock-free проверкой/установкой бита (`3.7 ns/op`, `0 allocs/op`). Продюсер прикрепляет TLV-пару `(ProducerID, SeqNum)`; дубликаты тихо дропаются с синтетическим `dedup_ack`, а сильно отставшие SeqNum закрывают стрим как ошибку протокола.
 - **Consumer Groups & Atomic Round-Robin Routing**: Конкурирующие подписчики (Competing Consumers) объединяются в группы (например `topic:orders:group:payment-workers`). Сообщения балансируются за **`0 allocs/op`** и **`< 10 ns/op`** без мьютексов (`atomic.AddUint64` + modulo). Групповые Durable Offset'ы сохраняются и восстанавливаются на уровне всей группы при фейловере воркеров.
 - **Dynamic Control Plane (gRPC Admin API)**: Выделенный gRPC Admin сервер (`:9091`) с валидацией mTLS ролей (`admin-*` CN) для Lock-Free RCU Hot-Reload квот пользователей и правил авторизации ACL без перезапуска брокера и без блокировок горячего пути.
 - **Транспортный слой QUIC**: Мультиплексирование QUIC с поддержкой 0-RTT, изоляцией стримов и защитой от Amplification атак.

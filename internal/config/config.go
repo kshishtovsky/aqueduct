@@ -102,21 +102,13 @@ type ClientQuota struct {
 // BrokerConfig defines async queue size, backpressure isolation policies,
 // and coalesced write batching configuration.
 type BrokerConfig struct {
-	QueueSize           int                      `yaml:"queue_size"`
-	BackpressurePolicy  string                   `yaml:"backpressure_policy"` // "drop_oldest", "drop_newest", "disconnect"
-	BatchSize           int                      `yaml:"batch_size"`          // coalesced write threshold in bytes (default 64KB)
-	FlushInterval       time.Duration            `yaml:"flush_interval"`      // micro-timer flush interval (default 50µs)
-	MaxRetries          int                      `yaml:"max_retries"`         // max NACK retries before DLQ (default 3)
-	PriorityTTLs        []string                 `yaml:"priority_ttls"`       // per-priority TTL array e.g. ["500ms", "5s", "0", "0"]
-	Quotas              QuotasConfig             `yaml:"quotas"`
-	IdempotentProducers IdempotentProducerConfig `yaml:"idempotent_producers"`
-}
-
-// IdempotentProducerConfig toggles the Idempotent Producer dedup engine.
-type IdempotentProducerConfig struct {
-	Enabled        bool   `yaml:"enabled"`         // enable sliding-window dedup
-	WindowCapacity int    `yaml:"window_capacity"` // max tracked producers (LRU eviction)
-	IdleTTL        string `yaml:"idle_ttl"`        // per-producer idle eviction timeout
+	QueueSize          int           `yaml:"queue_size"`
+	BackpressurePolicy string        `yaml:"backpressure_policy"` // "drop_oldest", "drop_newest", "disconnect"
+	BatchSize          int           `yaml:"batch_size"`          // coalesced write threshold in bytes (default 64KB)
+	FlushInterval      time.Duration `yaml:"flush_interval"`      // micro-timer flush interval (default 50µs)
+	MaxRetries         int           `yaml:"max_retries"`         // max NACK retries before DLQ (default 3)
+	PriorityTTLs       []string      `yaml:"priority_ttls"`       // per-priority TTL array e.g. ["500ms", "5s", "0", "0"]
+	Quotas             QuotasConfig  `yaml:"quotas"`
 }
 
 // GetPriorityTTLs parses PriorityTTLs strings into a fixed 4-element time.Duration array.
@@ -338,17 +330,6 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL"); v != "" {
 		cfg.Cluster.Discovery.Interval = v
-	}
-	if v := os.Getenv("AQUEDUCT_BROKER_IDEMPOTENT_ENABLED"); v != "" {
-		cfg.Broker.IdempotentProducers.Enabled = parseBool(v, cfg.Broker.IdempotentProducers.Enabled)
-	}
-	if v := os.Getenv("AQUEDUCT_BROKER_IDEMPOTENT_CAPACITY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Broker.IdempotentProducers.WindowCapacity = n
-		}
-	}
-	if v := os.Getenv("AQUEDUCT_BROKER_IDEMPOTENT_IDLE_TTL"); v != "" {
-		cfg.Broker.IdempotentProducers.IdleTTL = v
 	}
 }
 

@@ -28,7 +28,6 @@ Aqueduct is an ultra-high performance, zero-allocation message broker built in G
 
 ## Features
 
-- **Idempotent Producers (Exactly-Once)**: Per-producer sliding-window dedup via 2048-bit ring buffer (32 × `uint64` = 256 B) with lock-free bit check-and-set (`3.7 ns/op`, `0 allocs/op`). Producers attach a `(ProducerID, SeqNum)` TLV pair; duplicates are silently dropped with a synthetic `dedup_ack` and out-of-window seqs close the stream as a protocol error.
 - **Consumer Groups & Atomic Round-Robin Routing**: Competing consumers join named groups (e.g. `topic:orders:group:payment-workers`). Messages published to a topic are load-balanced across active group workers via **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`). Group Durable Offsets persist and recover at the group level across worker failovers.
 - **Dynamic Control Plane (gRPC Admin API)**: Dedicated gRPC Admin server (`:9091`) with mTLS role validation (`admin-*` CN) for lock-free RCU Hot-Reload of client rate quotas and ACL authorization rules without restarting or lock contention.
 - **QUIC Transport Layer**: Multiplexed QUIC connection handling with 0-RTT connection establishment, stream isolation, and amplification protection.
