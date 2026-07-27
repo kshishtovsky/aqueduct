@@ -20,7 +20,6 @@ Aqueduct 是一个基于 **QUIC**（通过 `quic-go`）使用 Go 语言构建的
 
 ## 核心特性
 
-- **Idempotent Producers (Exactly-Once)**: 基于 2048 位环形缓冲区 (32 × `uint64` = 256 B) 的生产者级滑动窗口去重，使用 lock-free 位检查/设置 (`3.7 ns/op`, `0 allocs/op`)。生产者附加 `(ProducerID, SeqNum)` TLV 对；重复消息被静默丢弃并发送合成的 `dedup_ack`，严重过期的 SeqNum 则作为协议错误关闭流。
 - **Consumer Groups & Atomic Round-Robin Routing**: 竞争消费者 (Competing Consumers) 可加入指定消费组 (如 `topic:orders:group:payment-workers`)。消息在组内成员间通过 **Lock-Free Atomic Round-Robin** (`0 allocs/op`, `< 10 ns/op`) 实现无锁负载均衡。Group Durable Offset 在 Worker 故障转移时维持组级别的断点续传。
 - **Dynamic Control Plane (gRPC Admin API)**: 独立 gRPC Admin 服务器 (`:9091`)，支持 mTLS 角色验证 (`admin-*` CN)，实现无锁 RCU 动态热重载限额与 ACL 规则。
 - **QUIC 传输层**: 具备 0-RTT 连接建立、流隔离和放大攻击保护。

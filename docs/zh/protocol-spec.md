@@ -1,4 +1,4 @@
-# 参考: 二进制协议规范 (v1.15.0)
+# 参考: 二进制协议规范 (v1.13.0)
 
 本规范为 Aqueduct Zero-Copy 二进制网络协议的正式技术文档。
 
@@ -68,8 +68,6 @@ Aqueduct 使用 10 字节扁平二进制标头，后跟可选 TLV 扩展块与�
 | `ExtTraceContext` | `0x01` | 25 字节 | OpenTelemetry 上下文 `[TraceID: 16B][SpanID: 8B][TraceFlags: 1B]` |
 | `ExtCompression` | `0x02` | 5 字节 | ZSTD 压缩元数据 `[Algo: 1B][UncompressedSize: 4B]` |
 | `ExtPriority` | `0x03` | 1 字节 | QoS 消息优先级 (`0` 最高, `1` 高, `2` 普通, `3` 低) |
-| `ExtProducerID` | `0x04` | 8 字节 | 幂等生产者 ID `[ID: 8B]` (uint64 Little-Endian) |
-| `ExtSeqNum` | `0x05` | 8 字节 | 幂等生产者序列号 `[Seq: 8B]` (uint64 Little-Endian) |
 
 ---
 
@@ -81,52 +79,7 @@ Aqueduct 使用 10 字节扁平二进制标头，后跟可选 TLV 扩展块与�
 
 ---
 
-## 5. 幂等生产者去重 (Exactly-Once 语义)
-
-在不稳定的网络上，生产者可能在丢失 ACK 后重新发送消息。为了防止订阅者收到重复消息，幂等生产者在每个 `CmdPublish` / `CmdPublishBatch` 帧上附加两个 TLV：
-
-- `ExtProducerID (0x04)`: 生产者初始化时分配的稳定 64 位标识符。
-- `ExtSeqNum (0x05)`: 每个生产者内单调递增的 64 位序列号。
-
-当 Broker 看到同时携带两个 TLV 的帧时，它按 `ProducerID` 划分去重状态，并执行滑动窗口检查。对于旧的（非幂等）生产者，帧的线缆格式不变；无法识别新类型的解析器会静默跳过 TLV 块。
-
-### 滑动窗口算法
-
-对每个 `ProducerID`，Broker 维护一个 2048 位的环形缓冲区 (32 × `uint64` = 每生产者 256 字节)。`SeqNum` 对应的槽位是 `SeqNum % 2048`。序列号处理如下：
-
-| 情况 | 检测 | 动作 |
-| :--- | :--- | :--- |
-| **New** | 槽位 bit 为 0 | 原子地设置该 bit (CAS)，转发帧，推进 `highSeqNum`，清理回收的 bit。 |
-| **Duplicate** | 槽位 bit 为 1 | 静默丢弃帧。递增 `aqueduct_messages_deduplicated_total`。发送合成的 `dedup_ack:<id>:<seq>` ACK，使生产者停止重试。 |
-| **Too Old** | `highSeqNum ≥ SeqNum + WindowSize` | 视为协议错误。取消违规的流 (`CancelRead(1) / CancelWrite(1)`)，以暴露客户端 bug。 |
-
-位检查和设置是 **lock-free** 的 (`atomic.LoadUint64` + `atomic.CompareAndSwapUint64`)。`highSeqNum` 推进的簿记仅在窗口向前滑动时由短互斥锁保护。重复消息从不触及互斥锁——它们只是一次原子加载加分支。
-
-### ProducerID 生命周期
-
-`Store` 是一个 LRU + TTL 缓存，映射 `ProducerID → *Window`。当生产者数量超过 `capacity` (默认 65536) 时，最近最少使用的窗口被淘汰。后台 goroutine 回收 `lastUsedNs` 早于 `idle_ttl` (默认 5 分钟) 的窗口。因此每个生产者的内存上限为 `capacity × 256 B` 加上 map 开销。
-
-### 配置
-
-```yaml
-broker:
-  idempotent_producers:
-    enabled: true          # opt-in (默认: false)
-    window_capacity: 65536 # 最大跟踪生产者数 (LRU 淘汰)
-    idle_ttl: 5m           # 每生产者空闲淘汰超时
-```
-
-环境变量覆盖: `AQUEDUCT_BROKER_IDEMPOTENT_ENABLED`, `AQUEDUCT_BROKER_IDEMPOTENT_CAPACITY`, `AQUEDUCT_BROKER_IDEMPOTENT_IDLE_TTL`。
-
-### 指标
-
-| 指标 | 类型 | 描述 |
-| :--- | :--- | :--- |
-| `aqueduct_messages_deduplicated_total` | Counter | 被去重窗口丢弃的消息总数 (向生产者静默 ACK)。 |
-
----
-
-## 6. AAL 日志记录线缆格式
+## 5. AAL 日志记录线缆格式
 
 ```text
 +-------------------+-------------------+-------------------+

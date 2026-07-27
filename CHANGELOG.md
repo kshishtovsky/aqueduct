@@ -5,28 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.15.0] - 2026-07-27
-
-### Added
-- **Idempotent Producer (Exactly-Once Semantics)**: New `internal/dedup` package implementing sliding-window deduplication for Idempotent Producers. Producers attach a `ProducerID` + `SeqNum` TLV pair to every publish; the broker keeps a per-producer 2048-bit ring buffer (32 × `uint64` = 256 B) of seen sequence numbers and silently drops duplicates while emitting a synthetic `dedup_ack` so the producer's retry loop terminates. Out-of-window sequences are treated as a protocol error (stream closed).
-- **Lock-Free Bit Check-and-Set**: Per-producer dedup state uses `atomic.LoadUint64` + `atomic.CompareAndSwapUint64` for the hot path. Only the high-watermark advance takes a short mutex. In-window / duplicate path: **3.7 ns/op, 0 allocs/op**.
-- **ProducerID Lifecycle Management**: New `dedup.Store` is an LRU + TTL cache mapping `ProducerID → *Window`. Capacity (default 65536) bounds total memory to ~16 MB. Background goroutine reaps windows idle for `idle_ttl` (default 5 min).
-- **New TLV Extensions**: `ExtProducerID (0x04)` and `ExtSeqNum (0x05)` (20 bytes total per frame) — zero-copy parse via `FindExtension`/`ExtractProducerID`/`ExtractSeqNum`. Builders `BuildIdempotentExtension` and `BuildIdempotentExtensionFromExisting` merge into existing TLV blocks.
-- **Dispatch Integration**: `dispatchFrames` runs the dedup check immediately after decompression, before authorization / AAL / Router. Duplicates get a synthetic `CmdAck` frame containing `dedup_ack:<id>:<seq>` so producers stop retrying. `TooOld` errors cancel the stream.
-- **Configuration**: New `broker.idempotent_producers.{enabled,window_capacity,idle_ttl}` block with env overrides `AQUEDUCT_BROKER_IDEMPOTENT_ENABLED`, `AQUEDUCT_BROKER_IDEMPOTENT_CAPACITY`, `AQUEDUCT_BROKER_IDEMPOTENT_IDLE_TTL`.
-- **Metrics**: New `aqueduct_messages_deduplicated_total` counter.
-- **Documentation**: Protocol spec, architecture doc updated in EN / RU / ZH.
-
-### Performance & Security
-- `BenchmarkDedupCheck_InWindow` (in-window duplicate): **3.7 ns/op, 0 allocs/op** (well under 5 ns target).
-- `BenchmarkDedupCheck` (advancing highSeqNum): 12.4 ns/op, 0 allocs/op.
-- `BenchmarkDedupCheck_Parallel` (32 cores, lock-free): 72.7 ns/op.
-- `BenchmarkStoreCheck_HotProducer`: 9.4 ns/op, 0 allocs/op.
-- `BenchmarkPublishWithDedup` vs `BenchmarkPublishBaseline`: ~17% overhead on a 27 ns baseline, dominated by the TLV scan in `Router.Publish` (priority extraction).
-- `go test -race ./internal/...`: **0 data races**.
-- Fuzz `FuzzExtractProducerID` (10s): ~9.8M execs, 0 crashes, 0 panics.
-- Statement coverage: **98.2%** on `internal/dedup` (target ≥ 75%).
-
 ## [1.14.0] - 2026-07-26
 
 ### Added
