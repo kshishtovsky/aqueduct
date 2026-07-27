@@ -200,6 +200,7 @@ func (pm *PeerManager) RemovePeer(addr string) {
 	if !exists {
 		return
 	}
+	// #nosec G104 -- context.CancelFunc has no error return; cancellation is idempotent.
 	cancel()
 	delete(pm.addrSet, addr)
 
@@ -209,7 +210,7 @@ func (pm *PeerManager) RemovePeer(addr string) {
 			if p.addr == addr {
 				p.mu.Lock()
 				if p.stream != nil {
-					p.stream.Close()
+					_ = p.stream.Close() // #nosec G104 -- stream close errors during peer removal are non-actionable.
 					p.stream = nil
 				}
 				p.mu.Unlock()
@@ -294,6 +295,7 @@ func (pm *PeerManager) Close() {
 
 	pm.mu.Lock()
 	for _, cancel := range pm.addrSet {
+		// #nosec G104 -- context.CancelFunc has no error return; cancellation is idempotent.
 		cancel()
 	}
 	pm.addrSet = make(map[string]context.CancelFunc)
@@ -303,7 +305,7 @@ func (pm *PeerManager) Close() {
 	for _, p := range snap.refs {
 		p.mu.Lock()
 		if p.stream != nil {
-			p.stream.Close()
+			_ = p.stream.Close() // #nosec G104 -- stream close errors during shutdown are non-actionable.
 			p.stream = nil
 		}
 		p.mu.Unlock()

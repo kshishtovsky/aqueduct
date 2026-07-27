@@ -75,7 +75,10 @@ func ExtTotalLen(buf []byte, offset int) int {
 }
 
 // SetExtTotalLen writes the total TLV block length at buf[offset:offset+2].
+// SAFE: caller must ensure len(buf) >= offset+2 and n < 65536 (block is
+// bounded by MaxExtTotalLen=1024 by the wire protocol).
 func SetExtTotalLen(buf []byte, offset int, n int) {
+	// #nosec G115 -- ExtTotalLen is bounded by MaxExtTotalLen (1024) by the wire protocol.
 	binary.LittleEndian.PutUint16(buf[offset:offset+2], uint16(n))
 }
 
@@ -102,6 +105,7 @@ func ParseTLVEntry(buf []byte, offset int) (typ ExtensionType, value []byte, nex
 		return typ, nil, valStart, nil
 	}
 	// SAFE: valStart+valLen bounds-checked above.
+	// #nosec G103 -- unsafe.Slice is used to construct a zero-copy view of an already-bounds-checked sub-slice of buf (valStart+valLen <= len(buf) verified above).
 	value = unsafe.Slice(&buf[valStart], valLen)
 	return typ, value, valStart + valLen, nil
 }
@@ -138,6 +142,7 @@ func FindExtension(extBlock []byte, typ ExtensionType) ([]byte, bool) {
 			return nil, false
 		}
 		if t == typ {
+			// #nosec G103 -- unsafe.Slice is used to construct a zero-copy view of an already-bounds-checked sub-slice of extBlock (valStart+l <= end verified above).
 			return unsafe.Slice(&extBlock[valStart], l), true
 		}
 		offset = valStart + l
@@ -176,6 +181,7 @@ func BuildPriorityExtension(priority uint8) []byte {
 	SetExtTotalLen(b, 0, totalLen)
 	b[ExtHeaderLen] = byte(ExtPriority)
 	b[ExtHeaderLen+1] = ExtPriorityLen
+	// #nosec G115 -- priority level is a 0..3 enum; conversion to byte is always safe.
 	b[ExtHeaderLen+2] = priority
 	return b
 }
@@ -335,6 +341,7 @@ func StripExtension(extBlock []byte, typ ExtensionType) []byte {
 		l := int(src[srcOff+1])
 		if t != typ {
 			dst[dstOff] = byte(t)
+			// #nosec G115 -- l is bounded by TLV entry length (uint8 max 255) before reaching here.
 			dst[dstOff+1] = byte(l)
 			if l > 0 {
 				copy(dst[dstOff+2:dstOff+2+l], src[srcOff+2:srcOff+2+l])

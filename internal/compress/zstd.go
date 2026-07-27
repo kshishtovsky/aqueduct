@@ -80,6 +80,7 @@ func sameBacking(a, b []byte) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
 	}
+	// #nosec G103 -- unsafe.SliceData is used to compare backing array pointers (no GC escape, no read).
 	return unsafe.SliceData(a) == unsafe.SliceData(b)
 }
 

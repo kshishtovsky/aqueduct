@@ -67,6 +67,7 @@ type Frame struct {
 // data segment for both old (no extensions) and new frames.
 func (f Frame) DataLen() uint32 {
 	if len(f.Extensions) > 0 {
+		// #nosec G115 -- Extensions size is bounded by MaxExtTotalLen (1024) and payload by MaxFrameSize, so len(f.Extensions) + f.PayloadLen < 2^32.
 		return uint32(len(f.Extensions)) + f.PayloadLen
 	}
 	return f.PayloadLen
@@ -123,8 +124,10 @@ func ParseFrame(buf []byte) (Frame, error) {
 			return Frame{}, errors.New("extensions exceed declared data length")
 		}
 		// SAFE: bounds verified above.
+		// #nosec G103 -- unsafe.Slice is used to construct a zero-copy view of an already-bounds-checked sub-slice of buf (extBlockEnd <= HeaderSize+int(dataLen) verified above).
 		extBlock = unsafe.Slice(&buf[HeaderSize], ExtBlockSize(extTotal))
 		payloadStart = extBlockEnd
+		// #nosec G115 -- both operands are bounded by MaxFrameSize (uint32) so the subtraction is safe.
 		payloadLen = dataLen - uint32(ExtBlockSize(extTotal))
 	} else {
 		payloadStart = HeaderSize
@@ -146,6 +149,7 @@ func ParseFrame(buf []byte) (Frame, error) {
 
 	// SAFE: We verified len(buf) >= headerSize + int(dataLen) above,
 	// and payloadStart + payloadLen <= headerSize + dataLen.
+	// #nosec G103 -- unsafe.Slice is used to construct a zero-copy view of an already-bounds-checked sub-slice of buf (payloadStart + payloadLen <= HeaderSize+int(dataLen) verified above).
 	payload := unsafe.Slice(&buf[payloadStart], payloadLen)
 
 	return Frame{
@@ -184,6 +188,7 @@ var (
 )
 
 func serializeFrameSlab(cmd Command, streamID uint32, payload []byte) *[]byte {
+	// #nosec G115 -- payload length is bounded by MaxFrameSize (set at the transport layer to 64KB default), so len(payload) < 2^32.
 	payloadLen := uint32(len(payload))
 	totalSize := HeaderSize + int(payloadLen)
 
@@ -207,6 +212,7 @@ func serializeFrameSlab(cmd Command, streamID uint32, payload []byte) *[]byte {
 }
 
 func serializeFramePool(cmd Command, streamID uint32, payload []byte) *[]byte {
+	// #nosec G115 -- payload length is bounded by MaxFrameSize.
 	payloadLen := uint32(len(payload))
 	totalSize := HeaderSize + int(payloadLen)
 
@@ -243,6 +249,7 @@ func SerializeFrame(cmd Command, streamID uint32, payload []byte) *[]byte {
 }
 
 func serializeFrameWithExtensionsSlab(cmd Command, streamID uint32, extensions []byte, payload []byte) *[]byte {
+	// #nosec G115 -- payload length is bounded by MaxFrameSize.
 	payloadLen := uint32(len(payload))
 	extLen := len(extensions)
 	totalSize := HeaderSize + extLen + int(payloadLen)
@@ -254,6 +261,7 @@ func serializeFrameWithExtensionsSlab(cmd Command, streamID uint32, extensions [
 		b = b[:totalSize]
 	}
 
+	// #nosec G115 -- extLen <= MaxExtTotalLen (1024), payloadLen <= MaxFrameSize; sum < 2^32.
 	dataLen := uint32(extLen) + payloadLen
 	b[0] = MagicByte
 	b[1] = uint8(cmd | HasExtensionsBit)

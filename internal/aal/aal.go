@@ -38,8 +38,12 @@ func Open(path string) (*Log, error) {
 
 // OpenEncrypted opens or creates an append-only log file with optional AES-256-GCM encryption.
 // key must be 32 bytes if provided. If key is nil/empty, encryption is disabled.
+//
+// The file is created with mode 0600 (G302) because the log may carry sensitive
+// publish payloads and, when encryption is enabled, sits next to the AES key
+// in the operator's config.
 func OpenEncrypted(path string, key []byte) (*Log, error) {
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) // #nosec G304 G302
 	if err != nil {
 		return nil, fmt.Errorf("aal: open file: %w", err)
 	}
@@ -102,6 +106,7 @@ func (l *Log) WriteFrame(frameBytes []byte) error {
 
 		// Encrypt in-place using pool buffer starting at offset 16
 		out := l.aead.Seal(buf[16:16], nonce, frameBytes, nil)
+		// #nosec G115 -- out is bounded by maxBufSize (64KB default) so 12+len(out) < 2^32.
 		cipherLen := uint32(12 + len(out))
 
 		// 4-byte length prefix + 12-byte nonce + encrypted ciphertext
@@ -114,6 +119,7 @@ func (l *Log) WriteFrame(frameBytes []byte) error {
 	}
 
 	// Unencrypted mode: 4-byte length prefix + raw frameBytes
+	// #nosec G115 -- frameBytes is bounded by maxBufSize (64KB default) so len(frameBytes) < 2^32.
 	frameLen := uint32(len(frameBytes))
 	binary.LittleEndian.PutUint32(buf[0:4], frameLen)
 	copy(buf[4:4+len(frameBytes)], frameBytes)
@@ -133,6 +139,7 @@ func Replay(path string, key []byte, handler func(frameBytes []byte) error) (int
 	if path == "" {
 		return 0, nil
 	}
+	// #nosec G304 -- path is operator-controlled (config/yaml/CLI flag).
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return 0, nil
@@ -291,7 +298,8 @@ func (l *Log) Rotate(maxSize int64, key []byte) error {
 		return err
 	}
 
-	newFile, err := os.OpenFile(origPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	//nolint:gosec // G304 + G302: path is operator-controlled; 0600 matches OpenEncrypted.
+	newFile, err := os.OpenFile(origPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) // #nosec G304 G302
 	if err != nil {
 		return err
 	}

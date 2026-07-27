@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -26,6 +27,8 @@ func main() {
 	topic := flag.String("topic", "bench", "Topic name for publish benchmark")
 	timeout := flag.Duration("timeout", 5*time.Second, "Request deadline per message")
 	batchSize := flag.Int("batch", 1, "Batch size (1 = single frames)")
+	tlsVerify := flag.Bool("tls-verify", false, "Verify server TLS certificate (default false for self-signed dev brokers)")
+	caFile := flag.String("ca-file", "", "PEM CA bundle to verify broker certificate against (optional)")
 	flag.Parse()
 
 	if *concurrency <= 0 || *totalReqs <= 0 || *payloadSize <= 0 || *batchSize <= 0 {
@@ -41,12 +44,33 @@ func main() {
 	fmt.Printf(" Payload Size       : %d bytes\n", *payloadSize)
 	fmt.Printf(" Batch Size         : %d\n", *batchSize)
 	fmt.Printf(" Topic              : %s\n", *topic)
+	if *tlsVerify {
+		fmt.Printf(" TLS Verification   : ENABLED (ca-file=%q)\n", *caFile)
+	} else {
+		fmt.Println(" TLS Verification   : DISABLED (use -tls-verify for production brokers)")
+	}
 	fmt.Println("---------------------------------------------------------")
 
+	// Build TLS config. Default skips verification for localhost / self-signed
+	// developer brokers. For production, pass -tls-verify to enforce chain +
+	// hostname checks (optionally with -ca-file pointing at a PEM CA bundle).
+	// #nosec G402 -- opt-in via -tls-verify flag, off by default for dev convenience.
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: !*tlsVerify,
 		NextProtos:         []string{"aqueduct-v1"},
 		MinVersion:         tls.VersionTLS13,
+	}
+	if *tlsVerify && *caFile != "" {
+		// #nosec G304 -- ca-file is operator-supplied flag, not from untrusted input.
+		caPEM, err := os.ReadFile(*caFile)
+		if err != nil {
+			log.Fatalf("read ca-file: %v", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			log.Fatalf("invalid CA bundle: %s", *caFile)
+		}
+		tlsConf.RootCAs = pool
 	}
 
 	payload := make([]byte, *payloadSize)
@@ -105,6 +129,7 @@ func main() {
 					reqStart := time.Now()
 					_ = stream.SetWriteDeadline(time.Now().Add(*timeout))
 
+					// #nosec G115 -- numReqs is the bench -n flag (int), bounded by user; int32 fits wire StreamID.
 					buf := protocol.SerializeFrame(protocol.CmdPublish, uint32(i+1), payload)
 					_, err := stream.Write(*buf)
 					protocol.ReleaseBuffer(buf)
@@ -154,7 +179,9 @@ func main() {
 					batchPayloadBuf = batchPayloadBuf[:offset+frameTotalSize]
 					batchPayloadBuf[offset] = protocol.MagicByte
 					batchPayloadBuf[offset+1] = byte(protocol.CmdPublish)
+					// #nosec G115 -- i+1 bounded by numReqs (bench flag).
 					binary.LittleEndian.PutUint32(batchPayloadBuf[offset+2:offset+6], uint32(i+1))
+					// #nosec G115 -- payloadSize is bench -size flag, maxBufSize-bounded.
 					binary.LittleEndian.PutUint32(batchPayloadBuf[offset+6:offset+10], uint32(*payloadSize))
 					copy(batchPayloadBuf[offset+10:], payload)
 					msgCount++

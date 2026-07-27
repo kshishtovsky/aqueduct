@@ -64,6 +64,7 @@ func (sc *sizeClass) Acquire() ([]byte, error) {
 			}
 			continue
 		}
+		// #nosec G115 -- head holds a slot index < len(sc.next) (verified in check below); converting to int is safe.
 		idx := int(head)
 		if idx < 0 || idx >= len(sc.next) {
 			return nil, ErrOutOfMemory
@@ -81,7 +82,9 @@ func (sc *sizeClass) Release(buf []byte) {
 	if len(sc.arena) == 0 {
 		return
 	}
+	// #nosec G103 -- unsafe.Pointer/uintptr used here only for address arithmetic on a live Go slice header, not for GC escape.
 	arenaStart := uintptr(unsafe.Pointer(unsafe.SliceData(sc.arena)))
+	// #nosec G103 -- same as above; buf comes from a previous Acquire and is still live.
 	bufStart := uintptr(unsafe.Pointer(unsafe.SliceData(buf)))
 	if bufStart < arenaStart {
 		return
@@ -90,6 +93,7 @@ func (sc *sizeClass) Release(buf []byte) {
 	if delta >= uintptr(len(sc.arena)) {
 		return
 	}
+	// #nosec G115 -- delta < len(arena) and blockSize > 0, so the index is bounded by sc.blocks (verified below).
 	idx := int(delta / uintptr(sc.blockSize))
 	if idx >= sc.blocks {
 		return

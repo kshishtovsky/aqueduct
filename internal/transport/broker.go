@@ -305,6 +305,7 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 	// Ensure cleanup on stream close.
 	defer func() {
 		if b.router != nil {
+			// #nosec G115 -- StreamID is bounded by the QUIC stream ID space (<<2^63); the router keys by uint32 hash of the low bits.
 			b.router.Unsubscribe(uint32(streamID))
 		}
 	}()
@@ -548,6 +549,7 @@ func (b *Broker) handleLocalFrame(jig context.Context, logger *slog.Logger, stre
 	case protocol.CmdNack:
 		if len(frame.Payload) >= 8 {
 			nackOffset := binary.LittleEndian.Uint64(frame.Payload[:8])
+			// #nosec G115 -- stream.StreamID() is a quic int64; the router hashes low 32 bits which is sufficient for the per-stream map.
 			b.router.NackByStream(uint32(stream.StreamID()), nackOffset)
 		} else {
 			logger.Warn("nack payload too short", "len", len(frame.Payload))
@@ -696,12 +698,13 @@ func (b *Broker) decompressFrame(frame protocol.Frame) (protocol.Frame, []byte, 
 	}
 
 	algo := extVal[0]
+	// #nosec G115 -- uncompressedSize is a wire uint32 from the TLV; the max-batch-size check below bounds it before further use.
 	uncompressedSize := binary.LittleEndian.Uint32(extVal[1:5])
 
 	if algo != protocol.AlgoZSTD || uncompressedSize == 0 {
 		return frame, nil, nil
 	}
-	if uncompressedSize > uint32(b.maxBufSize)*16 {
+	if uncompressedSize > uint32(b.maxBufSize)*16 { // #nosec G115 -- maxBufSize is operator-configured and bounded (< 2^28 default 64KB).
 		return frame, nil, errors.New("decompressed size exceeds max limit")
 	}
 
