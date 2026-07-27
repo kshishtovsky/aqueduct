@@ -46,16 +46,12 @@ func parseFrame(data []byte) (cmd byte, streamID uint32, payload []byte, err err
 }
 
 func main() {
-	// Server certificate validation is intentionally disabled in this
-	// example so the client can talk to a self-signed developer broker on
-	// 127.0.0.1. For production use, point RootCAs at a real CA bundle
-	// (or use SystemCertPool()) and remove InsecureSkipVerify. The local
-	// TLS rule is suppressed for this developer example only.
+	// Keep TLS verification enabled. Ensure the broker certificate is trusted
+	// by the host (or configure RootCAs) and includes "localhost" as a SAN.
 	tlsConf := &tls.Config{
-		// codeql[go/insecure-tls]  // dev-only localhost example; see comment above
-		InsecureSkipVerify: true, // #nosec G402 -- dev-only; see comment above
-		NextProtos:         []string{"aqueduct-v1"},
-		MinVersion:         tls.VersionTLS13,
+		ServerName: "localhost",
+		NextProtos: []string{"aqueduct-v1"},
+		MinVersion: tls.VersionTLS13,
 	}
 
 	conn, err := quic.DialAddr(context.Background(), "127.0.0.1:4242", tlsConf, nil)
