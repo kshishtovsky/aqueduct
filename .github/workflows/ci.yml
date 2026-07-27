@@ -25,8 +25,9 @@ jobs:
 
       - name: Run golangci-lint
         run: |
-          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run \
-            --out-format checkstyle > golangci-lint-report.out 2>&1 || true
+          # Pin golangci-lint to a specific commit SHA for reproducible lint runs.
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@8c13211dd7a0f9e9c1688c93a4a4e4fbc690537b5 \
+            run --out-format checkstyle > golangci-lint-report.out 2>&1 || true
 
       - name: Upload lint report
         uses: actions/upload-artifact@v4
@@ -104,8 +105,10 @@ jobs:
 
       - name: Run gosec (Go Security Scanner)
         continue-on-error: true
+        # Pin gosec to a specific release tag (mutable tag, but scoped and intentional)
+        # so CI fetches a deterministic version rather than rolling @latest.
         run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
           gosec -fmt=sarif -out=gosec-report.sarif ./...
 
       - name: Upload gosec SARIF to GitHub

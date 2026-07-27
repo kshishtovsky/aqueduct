@@ -379,214 +379,221 @@ func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *qui
 // dispatchFrames splits buf[:off] into complete frames and invokes handlers
 // or the built-in router. Returns the new offset after consuming all complete
 // frames (preserving any trailing partial frame bytes for the next read).
+//
+// Refactored into a slim orchestrator: header/decompress/authz/AAL are
+// handled by prepareFrame, routing decisions by routeFrame. Each complete
+// frame is parsed exactly once.
 func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []byte, off int, stream *quic.Stream, clientIDStr string) (int, error) {
 	consumed := 0
 	for consumed < off {
-		remaining := off - consumed
-		if remaining < protocol.HeaderSize {
-			if remaining > b.maxBufSize {
-				return 0, errBufferExceeded
-			}
-			break
-		}
-
-		payloadLen := protocol.PayloadLen(buf[consumed:])
-		totalLen := protocol.HeaderSize + int(payloadLen)
-
-		if int(payloadLen) > b.maxBufSize || totalLen > b.maxBufSize {
-			return 0, errOversizedPayload
-		}
-
-		if remaining < totalLen {
-			break
-		}
-
-		frame, err := protocol.ParseFrame(buf[consumed:])
+		frame, totalLen, partial, err := b.prepareFrame(jig, logger, buf, off, consumed, stream, clientIDStr)
 		if err != nil {
-			logger.Warn("frame parse error", "err", err)
 			return 0, err
 		}
-
-		// Decompress payload if Compression TLV extension is present.
-		// This must happen before authorization and routing.
-		var extToRelease []byte
-		frame, extToRelease, err = b.decompressFrame(frame)
-		if err != nil {
-			logger.Warn("frame decompression error", "err", err)
-			stream.CancelRead(1)
-			stream.CancelWrite(1)
-			return 0, errFrameDecompressionFailed
+		if partial {
+			break
 		}
-		if extToRelease != nil {
-			defer protocol.ReleaseExtensions(extToRelease)
-		}
-
-		// Authorization check
-		if b.authz != nil {
-			var requiredPerm authz.Permission
-			switch frame.Command {
-			case protocol.CmdPublish, protocol.CmdPublishBatch:
-				requiredPerm = authz.PermPublish
-			case protocol.CmdSubscribe:
-				requiredPerm = authz.PermSubscribe
-			}
-			if requiredPerm != authz.PermNone {
-				topicBytes := extractTopicBytes(frame.Payload)
-				if !b.authz.Allowed(clientIDStr, topicBytes, requiredPerm) {
-					metrics.AuthzDenied.WithLabelValues(clientIDStr, string(topicBytes)).Inc()
-					return 0, errUnauthorized
-				}
-			}
-		}
-
-		// Append-Only Logging for CmdPublish and CmdPublishBatch
-		if (frame.Command == protocol.CmdPublish || frame.Command == protocol.CmdPublishBatch) && b.aal != nil {
-			if err := b.aal.WriteFrame(buf[consumed : consumed+totalLen]); err != nil {
-				logger.Warn("aal write error", "err", err)
-			}
-		}
-
-		// Route pub/sub commands through the built-in router.
-		if b.router != nil {
-			// If the MeshForwarded bit is set, deliver only to local subscribers (no re-forwarding).
-			if protocol.IsForwarded(frame.Command) {
-				switch protocol.OpcodeOf(frame.Command) {
-				case protocol.CmdPublish:
-					publishCtx := jig
-					endSpan := func() {}
-					if b.tracer != nil && frame.HasExtensions() {
-						traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
-						if ok {
-							publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameForward,
-								traceID, spanID, traceFlags,
-								trace.WithAttributes(
-									attribute.Int("stream_id", int(frame.StreamID)),
-								),
-							)
-							metrics.TracingSpansTotal.Inc()
-						}
-					}
-					if err := b.router.PublishFromPeer(publishCtx, frame); err != nil {
-						logger.Warn("peer publish error", "err", err)
-					}
-					endSpan()
-				case protocol.CmdPublishBatch:
-					publishCtx := jig
-					endSpan := func() {}
-					if b.tracer != nil && frame.HasExtensions() {
-						traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
-						if ok {
-							publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameForward,
-								traceID, spanID, traceFlags,
-								trace.WithAttributes(
-									attribute.Int("stream_id", int(frame.StreamID)),
-									attribute.String("messaging.operation", "batch_publish"),
-								),
-							)
-						}
-					}
-					if err := b.router.PublishBatch(publishCtx, frame); err != nil {
-						logger.Warn("peer batch publish error", "err", err)
-					}
-					endSpan()
-				}
-				consumed += totalLen
-				continue
-			}
-
-			switch protocol.OpcodeOf(frame.Command) {
-			case protocol.CmdSubscribe:
-				if err := b.router.Subscribe(jig, stream, frame); err != nil {
-					logger.Warn("subscribe error", "err", err)
-				}
-				consumed += totalLen
-				continue
-			case protocol.CmdPublish:
-				publishCtx := jig
-				endSpan := func() {}
-				if b.tracer != nil && frame.HasExtensions() {
-					traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
-					if ok {
-						publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameProcess,
-							traceID, spanID, traceFlags,
-							trace.WithAttributes(
-								attribute.Int("stream_id", int(frame.StreamID)),
-							),
-						)
-						metrics.TracingSpansTotal.Inc()
-					}
-				}
-				if err := b.router.PublishWithClientID(publishCtx, frame, clientIDStr); err != nil {
-					b.logger.Warn("publish error", "err", err)
-				}
-				endSpan()
-				consumed += totalLen
-				continue
-			case protocol.CmdPublishBatch:
-				publishCtx := jig
-				endSpan := func() {}
-				if b.tracer != nil && frame.HasExtensions() {
-					traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
-					if ok {
-						publishCtx, endSpan = b.tracer.StartSpanWithTraceContext(jig, tracing.SpanNameProcess,
-							traceID, spanID, traceFlags,
-							trace.WithAttributes(
-								attribute.Int("stream_id", int(frame.StreamID)),
-								attribute.String("messaging.operation", "batch_publish"),
-							),
-						)
-						metrics.TracingSpansTotal.Inc()
-					}
-				}
-				if err := b.router.PublishBatch(publishCtx, frame); err != nil {
-					b.logger.Warn("batch publish error", "err", err)
-				}
-				endSpan()
-				consumed += totalLen
-				continue
-			case protocol.CmdAck:
-				if consumerID, topic, offset, err := parseAckPayload(frame.Payload); err == nil {
-					b.router.AckOffset(consumerID, topic, offset)
-				} else {
-					logger.Warn("ack payload error", "err", err)
-				}
-				consumed += totalLen
-				continue
-			case protocol.CmdNack:
-				if len(frame.Payload) >= 8 {
-					nackOffset := binary.LittleEndian.Uint64(frame.Payload[:8])
-					b.router.NackByStream(uint32(stream.StreamID()), nackOffset)
-				} else {
-					logger.Warn("nack payload too short", "len", len(frame.Payload))
-				}
-				consumed += totalLen
-				continue
-			}
-		}
-
-		h, ok := b.handlers[frame.Command]
-		if !ok {
-			logger.Warn("no handler for command", "cmd", frame.Command)
-			consumed += totalLen
-			continue
-		}
-
-		resp, err := h(jig, frame)
-		if err != nil {
-			logger.Warn("handler error", "cmd", frame.Command, "err", err)
-			consumed += totalLen
-			continue
-		}
-
-		if resp != nil {
-			b.sendResponse(stream, frame.StreamID, resp)
-		}
-
+		b.routeFrame(jig, logger, stream, frame, clientIDStr)
 		consumed += totalLen
 	}
 
 	n := copy(buf, buf[consumed:off])
 	return n, nil
+}
+
+// prepareFrame validates the header, decompresses (if a Compression TLV is
+// present), runs authorization and append-only logging for publish frames.
+// It returns the parsed frame (zero-copy header view into the buffer) plus:
+//
+//	totalLen — the wire length to advance the buffer by (0 when partial)
+//	partial  — true when the buffer holds no complete frame; caller breaks
+//	err      — non-nil on protocol/auth/decompression failures
+func (b *Broker) prepareFrame(jig context.Context, logger *slog.Logger, buf []byte, off int, consumed int, stream *quic.Stream, clientIDStr string) (protocol.Frame, int, bool, error) {
+	remaining := off - consumed
+	if remaining < protocol.HeaderSize {
+		if remaining > b.maxBufSize {
+			return protocol.Frame{}, 0, false, errBufferExceeded
+		}
+		return protocol.Frame{}, 0, true, nil
+	}
+
+	payloadLen := protocol.PayloadLen(buf[consumed:])
+	totalLen := protocol.HeaderSize + int(payloadLen)
+	if int(payloadLen) > b.maxBufSize || totalLen > b.maxBufSize {
+		return protocol.Frame{}, 0, false, errOversizedPayload
+	}
+	if remaining < totalLen {
+		return protocol.Frame{}, 0, true, nil
+	}
+
+	frame, perr := protocol.ParseFrame(buf[consumed:])
+	if perr != nil {
+		logger.Warn("frame parse error", "err", perr)
+		return protocol.Frame{}, 0, false, perr
+	}
+
+	// Decompress payload if Compression TLV extension is present.
+	// This must happen before authorization and routing.
+	_, extToRelease, derr := b.decompressFrame(frame)
+	if derr != nil {
+		logger.Warn("frame decompression error", "err", derr)
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		return protocol.Frame{}, 0, false, errFrameDecompressionFailed
+	}
+	if extToRelease != nil {
+		defer protocol.ReleaseExtensions(extToRelease)
+	}
+
+	// Authorization check.
+	if b.authz != nil {
+		requiredPerm := permissionForFrame(frame.Command)
+		if requiredPerm != authz.PermNone {
+			topicBytes := extractTopicBytes(frame.Payload)
+			if !b.authz.Allowed(clientIDStr, topicBytes, requiredPerm) {
+				metrics.AuthzDenied.WithLabelValues(clientIDStr, string(topicBytes)).Inc()
+				return protocol.Frame{}, 0, false, errUnauthorized
+			}
+		}
+	}
+
+	// Append-Only Logging for CmdPublish and CmdPublishBatch.
+	if (frame.Command == protocol.CmdPublish || frame.Command == protocol.CmdPublishBatch) && b.aal != nil {
+		if werr := b.aal.WriteFrame(buf[consumed : consumed+totalLen]); werr != nil {
+			logger.Warn("aal write error", "err", werr)
+		}
+	}
+	return frame, totalLen, false, nil
+}
+
+// routeFrame dispatches a parsed frame through either a peer-forwarder
+// (when MeshForwarded is set) or the local router (subscribe/publish/ack/nack)
+// or the legacy handler map.
+func (b *Broker) routeFrame(jig context.Context, logger *slog.Logger, stream *quic.Stream, frame protocol.Frame, clientIDStr string) {
+	if b.router != nil {
+		if protocol.IsForwarded(frame.Command) {
+			b.handleForwardedFrame(jig, logger, frame)
+			return
+		}
+		if b.handleLocalFrame(jig, logger, stream, frame, clientIDStr) {
+			return
+		}
+	}
+
+	h, ok := b.handlers[frame.Command]
+	if !ok {
+		logger.Warn("no handler for command", "cmd", frame.Command)
+		return
+	}
+	resp, err := h(jig, frame)
+	if err != nil {
+		logger.Warn("handler error", "cmd", frame.Command, "err", err)
+		return
+	}
+	if resp != nil {
+		b.sendResponse(stream, frame.StreamID, resp)
+	}
+}
+
+// handleForwardedFrame dispatches a frame received from a peer (MeshForwarded
+// bit set) to the local router without re-forwarding to other peers.
+func (b *Broker) handleForwardedFrame(jig context.Context, logger *slog.Logger, frame protocol.Frame) {
+	switch protocol.OpcodeOf(frame.Command) {
+	case protocol.CmdPublish:
+		publishCtx, endSpan := b.startPublishSpan(jig, tracing.SpanNameForward, frame, false)
+		if err := b.router.PublishFromPeer(publishCtx, frame); err != nil {
+			logger.Warn("peer publish error", "err", err)
+		}
+		endSpan()
+	case protocol.CmdPublishBatch:
+		publishCtx, endSpan := b.startPublishSpan(jig, tracing.SpanNameForward, frame, true)
+		if err := b.router.PublishBatch(publishCtx, frame); err != nil {
+			logger.Warn("peer batch publish error", "err", err)
+		}
+		endSpan()
+	}
+}
+
+// handleLocalFrame dispatches local (non-forwarded) pub/sub/ack/nack frames
+// to the router. Returns true if the command matched a router opcode, false
+// when routeFrame should fall through to the legacy handler map.
+func (b *Broker) handleLocalFrame(jig context.Context, logger *slog.Logger, stream *quic.Stream, frame protocol.Frame, clientIDStr string) bool {
+	switch protocol.OpcodeOf(frame.Command) {
+	case protocol.CmdSubscribe:
+		if err := b.router.Subscribe(jig, stream, frame); err != nil {
+			logger.Warn("subscribe error", "err", err)
+		}
+		return true
+	case protocol.CmdPublish:
+		publishCtx, endSpan := b.startPublishSpan(jig, tracing.SpanNameProcess, frame, false)
+		if err := b.router.PublishWithClientID(publishCtx, frame, clientIDStr); err != nil {
+			logger.Warn("publish error", "err", err)
+		}
+		endSpan()
+		return true
+	case protocol.CmdPublishBatch:
+		publishCtx, endSpan := b.startPublishSpan(jig, tracing.SpanNameProcess, frame, true)
+		if err := b.router.PublishBatch(publishCtx, frame); err != nil {
+			logger.Warn("batch publish error", "err", err)
+		}
+		endSpan()
+		return true
+	case protocol.CmdAck:
+		if consumerID, topic, offset, err := parseAckPayload(frame.Payload); err == nil {
+			b.router.AckOffset(consumerID, topic, offset)
+		} else {
+			logger.Warn("ack payload error", "err", err)
+		}
+		return true
+	case protocol.CmdNack:
+		if len(frame.Payload) >= 8 {
+			nackOffset := binary.LittleEndian.Uint64(frame.Payload[:8])
+			b.router.NackByStream(uint32(stream.StreamID()), nackOffset)
+		} else {
+			logger.Warn("nack payload too short", "len", len(frame.Payload))
+		}
+		return true
+	}
+	return false
+}
+
+// startPublishSpan is the zero-allocation tracer wrapper used by every
+// publish path. When tracing is disabled or the frame has no W3C Trace
+// Context extension, it returns the original context and a shared no-op
+// finish closure.
+func (b *Broker) startPublishSpan(jig context.Context, spanName string, frame protocol.Frame, batch bool) (context.Context, func()) {
+	if b.tracer == nil || !frame.HasExtensions() {
+		return jig, noopSpan
+	}
+	traceID, spanID, traceFlags, ok := protocol.ExtractTraceContext(frame.Extensions)
+	if !ok {
+		return jig, noopSpan
+	}
+	attrs := []attribute.KeyValue{attribute.Int("stream_id", int(frame.StreamID))}
+	if batch {
+		attrs = append(attrs, attribute.String("messaging.operation", "batch_publish"))
+	}
+	ctx, end := b.tracer.StartSpanWithTraceContext(jig, spanName,
+		traceID, spanID, traceFlags, trace.WithAttributes(attrs...))
+	metrics.TracingSpansTotal.Inc()
+	return ctx, end
+}
+
+// noopSpan is a shared no-op span finish callback for the hot path. Returning
+// the same function value avoids allocating a fresh closure per publish.
+func noopSpan() {}
+
+// permissionForFrame maps a wire command to the ACL permission it requires.
+// Returns PermNone for commands that are not ACL-gated.
+func permissionForFrame(cmd protocol.Command) authz.Permission {
+	switch cmd {
+	case protocol.CmdPublish, protocol.CmdPublishBatch:
+		return authz.PermPublish
+	case protocol.CmdSubscribe:
+		return authz.PermSubscribe
+	default:
+		return authz.PermNone
+	}
 }
 
 func (b *Broker) sendResponse(stream *quic.Stream, streamID uint32, payload []byte) {

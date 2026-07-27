@@ -36,7 +36,7 @@ CONTRIBUTORS=$(
 # ── Checksums ──────────────────────────────────────────────────────
 CHECKSUMS=""
 if [ -d "$DIST_DIR" ] && [ "$(ls -A "$DIST_DIR"/*.tar.gz 2>/dev/null)" ]; then
-  CHECKSUMS=$(cd "$DIST_DIR" && sha256sum *.tar.gz)
+  CHECKSUMS=$(cd "$DIST_DIR" && sha256sum ./*.tar.gz)
 fi
 
 # ── Build the markdown body ────────────────────────────────────────

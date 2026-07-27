@@ -83,6 +83,8 @@ func NewWithLogger(ctx context.Context, addrs []string, tlsConf *tls.Config, qui
 }
 
 // reconnectLoop dials the peer and reopens its stream whenever it drops.
+//
+// Refactored to keep cognitive complexity low: each step is its own helper.
 func (pm *PeerManager) reconnectLoop(ctx context.Context, p *PeerRef) {
 	backoff := initialBackoff
 	for {
@@ -97,54 +99,62 @@ func (pm *PeerManager) reconnectLoop(ctx context.Context, p *PeerRef) {
 
 		conn, err := quic.DialAddr(ctx, p.addr, pm.tlsConf, pm.quicConf)
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if pm.waitBackoffOrDone(ctx, &backoff) {
 				return
-			case <-time.After(backoff):
-				if backoff < maxBackoff {
-					backoff *= 2
-				}
-				continue
 			}
+			continue
 		}
 		backoff = initialBackoff
 
-		stream, err := conn.OpenStreamSync(ctx)
-		if err != nil {
-			_ = conn.CloseWithError(0, "stream open failed")
-			continue
-		}
-
-		p.mu.Lock()
-		p.stream = stream
-		p.mu.Unlock()
-
-		metrics.ClusterPeersActive.Set(float64(pm.ActivePeers()))
-
-		// Wait for stream to close (read drains EOF).
-		buf := make([]byte, 1)
-		for {
-			_, err := stream.Read(buf)
-			if err != nil {
-				break
-			}
-		}
-
-		p.mu.Lock()
-		p.stream = nil
-		p.mu.Unlock()
-
-		metrics.ClusterPeersActive.Set(float64(pm.ActivePeers()))
-
-		select {
-		case <-ctx.Done():
+		if !pm.runPeerStream(ctx, p, conn) {
 			return
-		case <-time.After(backoff):
-			if backoff < maxBackoff {
-				backoff *= 2
-			}
+		}
+		if pm.waitBackoffOrDone(ctx, &backoff) {
+			return
 		}
 	}
+}
+
+// waitBackoffOrDone sleeps for the backoff window or returns true if ctx is
+// cancelled. The backoff doubles up to maxBackoff.
+func (pm *PeerManager) waitBackoffOrDone(ctx context.Context, backoff *time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	case <-time.After(*backoff):
+	}
+	if *backoff < maxBackoff {
+		*backoff *= 2
+	}
+	return false
+}
+
+// runPeerStream opens a stream, sets it as the active stream, drains reads
+// until EOF, and clears the active stream. Returns false if ctx is cancelled.
+func (pm *PeerManager) runPeerStream(ctx context.Context, p *PeerRef, conn *quic.Conn) bool {
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		_ = conn.CloseWithError(0, "stream open failed")
+		return true
+	}
+
+	p.mu.Lock()
+	p.stream = stream
+	p.mu.Unlock()
+	metrics.ClusterPeersActive.Set(float64(pm.ActivePeers()))
+
+	buf := make([]byte, 1)
+	for {
+		if _, rerr := stream.Read(buf); rerr != nil {
+			break
+		}
+	}
+
+	p.mu.Lock()
+	p.stream = nil
+	p.mu.Unlock()
+	metrics.ClusterPeersActive.Set(float64(pm.ActivePeers()))
+	return true
 }
 
 // AddPeer dynamically adds a new peer address and starts its reconnect loop.
