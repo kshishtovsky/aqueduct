@@ -25,8 +25,9 @@ jobs:
 
       - name: Run golangci-lint
         run: |
-          go run github.com/golangci/golangci-lint/cmd/golangci-lint@latest run \
-            --out-format checkstyle > golangci-lint-report.out 2>&1 || true
+          # Pin golangci-lint to a specific commit SHA for reproducible lint runs.
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@8c13211dd7a0f9e9c1688c93a4a4e4fbc690537b5 \
+            run --out-format checkstyle > golangci-lint-report.out 2>&1 || true
 
       - name: Upload lint report
         uses: actions/upload-artifact@v4
@@ -104,9 +105,11 @@ jobs:
 
       - name: Run gosec (Go Security Scanner)
         continue-on-error: true
+        # Use `go run` against the locked version in tools.go (// +build tools)
+        # instead of `go install @tag`, so the dependency is tracked in go.sum
+        # per SonarQube rule S8545 (lock-file enforcing command).
         run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec -fmt=sarif -out=gosec-report.sarif ./...
+          go run github.com/securego/gosec/v2/cmd/gosec -fmt=sarif -out=gosec-report.sarif ./...
 
       - name: Upload gosec SARIF to GitHub
         uses: github/codeql-action/upload-sarif@v3

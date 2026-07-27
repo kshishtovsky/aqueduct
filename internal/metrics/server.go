@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -16,9 +17,15 @@ func StartServer(addr string) error {
 		_, _ = w.Write([]byte("OK"))
 	})
 
+	// G112: ReadHeaderTimeout prevents Slowloris attacks (gosec).
+	// The /metrics endpoint is scrape-only; a 5s header read is plenty.
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
 		_ = srv.ListenAndServe()

@@ -764,7 +764,8 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 			binary.LittleEndian.PutUint64(retryExt[protocol.ExtHeaderLen+2:], nackOffset)
 
 			_ = r.Publish(ctx, protocol.Frame{
-				Command:    protocol.CmdPublish,
+				Command: protocol.CmdPublish,
+				// #nosec G115 -- topicName is a domain identifier bounded by ACL config; the publish path validates against maxBufSize.
 				PayloadLen: uint32(len(topicName)),
 				Payload:    []byte(topicName),
 				Extensions: retryExt,
@@ -779,7 +780,8 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 		r.nackMu.Unlock()
 
 		_ = r.Publish(ctx, protocol.Frame{
-			Command:    protocol.CmdPublish,
+			Command: protocol.CmdPublish,
+			// #nosec G115 -- dlqTopic = "__dlq__" + topicName; same bounds as above.
 			PayloadLen: uint32(len(dlqTopic)),
 			Payload:    []byte(dlqTopic),
 		})

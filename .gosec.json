@@ -1,0 +1,7 @@
+{
+  "global": {
+    "nosec": false,
+    "audit": "audit"
+  },
+  "exclude-dir": "third_party,vendor"
+}

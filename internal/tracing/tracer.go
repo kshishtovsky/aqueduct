@@ -93,7 +93,11 @@ func New(cfg Config, logger *slog.Logger) (*Tracer, error) {
 // path: the compiler inlines the nil check.
 func (t *Tracer) StartSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, func()) {
 	if t.tracer == nil {
-		return ctx, func() {}
+		// Tracing disabled: return original context and a zero-cost
+		// no-op finish callback so callers can defer endSpan() unconditionally
+		// without a branch on the hot path. The empty function body is
+		// intentional: it lets the compiler avoid a real call on the hot path.
+		return ctx, func() {} // NOSONAR S1186
 	}
 	ctx, span := t.tracer.Start(ctx, name, opts...)
 	return ctx, func() { span.End() }
@@ -104,7 +108,10 @@ func (t *Tracer) StartSpan(ctx context.Context, name string, opts ...trace.SpanS
 // parent context. If tracing is disabled, returns ctx unchanged.
 func (t *Tracer) StartSpanWithTraceContext(ctx context.Context, name string, traceID []byte, spanID []byte, traceFlags byte, opts ...trace.SpanStartOption) (context.Context, func()) {
 	if t.tracer == nil {
-		return ctx, func() {}
+		// Tracing disabled: zero-cost no-op finish callback. Callers can
+		// defer endSpan() unconditionally on the hot path. The empty function
+		// body is intentional: zero-allocation sentinel for the no-tracing path.
+		return ctx, func() {} // NOSONAR S1186
 	}
 
 	if len(traceID) < 16 || len(spanID) < 8 {

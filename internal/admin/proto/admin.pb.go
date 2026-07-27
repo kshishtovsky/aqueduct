@@ -306,7 +306,7 @@ var (
 
 func file_internal_admin_proto_admin_proto_rawDescGZIP() []byte {
 	file_internal_admin_proto_admin_proto_rawDescOnce.Do(func() {
-		file_internal_admin_proto_admin_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_admin_proto_admin_proto_rawDesc), len(file_internal_admin_proto_admin_proto_rawDesc)))
+		file_internal_admin_proto_admin_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_admin_proto_admin_proto_rawDesc), len(file_internal_admin_proto_admin_proto_rawDesc))) // #nosec G103
 	})
 	return file_internal_admin_proto_admin_proto_rawDescData
 }
@@ -341,6 +341,7 @@ func file_internal_admin_proto_admin_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			// #nosec G103 -- generated code; protoc-gen-go uses unsafe to view []byte as string.
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_admin_proto_admin_proto_rawDesc), len(file_internal_admin_proto_admin_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   5,
