@@ -60,38 +60,48 @@ func dummyPeerManager(ctx context.Context, t *testing.T) *cluster.PeerManager {
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	go func() {
-		for {
-			conn, err := ln.Accept(ctx)
-			if err != nil {
-				return
-			}
-			go func() {
-				for {
-					stream, err := conn.AcceptStream(ctx)
-					if err != nil {
-						return
-					}
-					go func(s *quic.Stream) {
-						buf := make([]byte, 4096)
-						for {
-							if _, err := s.Read(buf); err != nil {
-								break
-							}
-						}
-					}(stream)
-				}
-			}()
-		}
-	}()
+	go dummyAcceptLoop(ctx, ln)
 
 	pm := cluster.NewWithLogger(ctx, []string{}, cTLS, qConf, slog.Default())
 	t.Cleanup(func() { pm.Close() })
 	return pm
 }
 
+// dummyAcceptLoop accepts connections in a loop and drains every accepted
+// stream until EOF. Splitting this into a helper keeps dummyPeerManager well
+// under Sonar's cognitive-complexity threshold.
+func dummyAcceptLoop(ctx context.Context, ln *quic.Listener) {
+	for {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			return
+		}
+		go dummyAcceptStreams(ctx, conn)
+	}
+}
+
+func dummyAcceptStreams(ctx context.Context, conn *quic.Conn) {
+	for {
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		go drainStream(stream)
+	}
+}
+
+func drainStream(s *quic.Stream) {
+	buf := make([]byte, 4096)
+	for {
+		if _, err := s.Read(buf); err != nil {
+			return
+		}
+	}
+}
+
 // TestDiscoveryInitialResolution verifies that Start resolves DNS immediately
-// and adds discovered peers.
+// and adds discovered peers. Refactored to helpers to keep cognitive
+// complexity under Sonar's threshold.
 func TestDiscoveryInitialResolution(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -99,29 +109,31 @@ func TestDiscoveryInitialResolution(t *testing.T) {
 	resolver := newMockResolver([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"})
 	pm := dummyPeerManager(ctx, t)
 
-	disc := cluster.NewDiscovery(resolver, cluster.DiscoveryConfig{
-		Enabled:  true,
+	disc := startDiscovery(t, ctx, resolver, pm, cluster.DiscoveryConfig{
 		Host:     "aqueduct-headless.default.svc.cluster.local",
 		Port:     "4242",
-		Interval: 1 * time.Hour, // won't tick during test
-	}, pm, slog.Default())
-
-	disc.Start(ctx)
-	time.Sleep(200 * time.Millisecond) // wait for async resolution
+		Interval: 1 * time.Hour,
+	})
+	time.Sleep(200 * time.Millisecond)
 
 	peers := disc.KnownPeers()
 	if len(peers) != 3 {
 		t.Fatalf("expected 3 known peers, got %d: %v", len(peers), peers)
 	}
+	assertAllPeersUsePort(t, peers, "4242")
+}
 
-	// Verify addresses have port appended.
+// assertAllPeersUsePort fails the test if any peer address does not carry
+// the expected port suffix.
+func assertAllPeersUsePort(t *testing.T, peers []string, want string) {
+	t.Helper()
 	for _, p := range peers {
 		_, port, err := net.SplitHostPort(p)
 		if err != nil {
 			t.Fatalf("invalid peer addr %q: %v", p, err)
 		}
-		if port != "4242" {
-			t.Errorf("expected port 4242, got %s", port)
+		if port != want {
+			t.Errorf("expected port %s, got %s", want, port)
 		}
 	}
 }
@@ -173,7 +185,8 @@ func TestDiscoveryNewPeerAdded(t *testing.T) {
 }
 
 // TestDiscoveryPeerRemoved verifies that when an IP disappears from DNS,
-// the corresponding peer is removed.
+// the corresponding peer is removed. Refactored to a helper to keep
+// cognitive complexity under Sonar's threshold.
 func TestDiscoveryPeerRemoved(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -181,19 +194,13 @@ func TestDiscoveryPeerRemoved(t *testing.T) {
 	resolver := newMockResolver([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"})
 	pm := dummyPeerManager(ctx, t)
 
-	disc := cluster.NewDiscovery(resolver, cluster.DiscoveryConfig{
-		Enabled:  true,
+	disc := startDiscovery(t, ctx, resolver, pm, cluster.DiscoveryConfig{
 		Host:     "aqueduct-headless.default.svc.cluster.local",
 		Port:     "4242",
 		Interval: 1 * time.Hour,
-	}, pm, slog.Default())
-
-	disc.Start(ctx)
+	})
 	time.Sleep(200 * time.Millisecond)
-
-	if len(disc.KnownPeers()) != 3 {
-		t.Fatalf("expected 3 peers, got %d", len(disc.KnownPeers()))
-	}
+	assertKnownPeerCount(t, disc, 3)
 
 	// Simulate scale-down: pod with IP 10.0.0.2 is terminated.
 	resolver.setIPs([]string{"10.0.0.1", "10.0.0.3"})
@@ -204,12 +211,31 @@ func TestDiscoveryPeerRemoved(t *testing.T) {
 	if len(peers) != 2 {
 		t.Fatalf("expected 2 peers after scale-down, got %d: %v", len(peers), peers)
 	}
-
 	for _, p := range peers {
 		host, _, _ := net.SplitHostPort(p)
 		if host == "10.0.0.2" {
 			t.Error("peer 10.0.0.2 should have been removed")
 		}
+	}
+}
+
+// startDiscovery is a test helper that wires a Discovery instance with the
+// standard aqueduct-headless config, overriding only the host/port/interval.
+func startDiscovery(t *testing.T, ctx context.Context, resolver *mockResolver, pm *cluster.PeerManager, cfg cluster.DiscoveryConfig) *cluster.Discovery {
+	t.Helper()
+	cfg.Enabled = true
+	disc := cluster.NewDiscovery(resolver, cfg, pm, slog.Default())
+	disc.Start(ctx)
+	return disc
+}
+
+// assertKnownPeerCount fails the test when the discovery reports the wrong
+// number of known peers.
+func assertKnownPeerCount(t *testing.T, disc *cluster.Discovery, want int) {
+	t.Helper()
+	got := len(disc.KnownPeers())
+	if got != want {
+		t.Fatalf("expected %d known peers, got %d: %v", want, got, disc.KnownPeers())
 	}
 }
 

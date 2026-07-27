@@ -22,9 +22,18 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
       containers:
         - name: broker
-          image: aqueduct-broker:latest
+          image: aqueduct-broker:1.15.0
           imagePullPolicy: IfNotPresent
           args:
             - "-config"
@@ -52,9 +61,11 @@ spec:
             requests:
               cpu: 100m
               memory: 64Mi
+              ephemeral-storage: 1Gi
             limits:
               cpu: 500m
               memory: 256Mi
+              ephemeral-storage: 2Gi
           livenessProbe:
             exec:
               command:

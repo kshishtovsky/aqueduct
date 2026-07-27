@@ -219,13 +219,32 @@ func Load(path string) (*Config, error) {
 
 // applyEnvOverrides inspects environment variables starting with AQUEDUCT_
 // and overrides matching configuration values.
+//
+// Split into per-subsystem helpers so each function stays well under
+// Sonar's 15-cognitive-complexity threshold.
 func applyEnvOverrides(cfg *Config) {
+	applyListenEnv(cfg)
+	applyTLSEnv(cfg)
+	applyAALEnv(cfg)
+	applyACLEnv(cfg)
+	applyAdminEnv(cfg)
+	applyBrokerEnv(cfg)
+	applyTransportEnv(cfg)
+	applyTracingEnv(cfg)
+	applyClusterEnv(cfg)
+	applyCompressionEnv(cfg)
+}
+
+func applyListenEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_LISTEN_ADDR"); v != "" {
 		cfg.ListenAddr = v
 	}
 	if v := os.Getenv("AQUEDUCT_METRICS_ADDR"); v != "" {
 		cfg.MetricsAddr = v
 	}
+}
+
+func applyTLSEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_TLS_GENERATE"); v != "" {
 		cfg.TLS.Generate = parseBool(v, cfg.TLS.Generate)
 	}
@@ -241,6 +260,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_TLS_CLIENT_CA_FILE"); v != "" {
 		cfg.TLS.ClientCAFile = v
 	}
+}
+
+func applyAALEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_AAL_ENABLED"); v != "" {
 		cfg.AAL.Enabled = parseBool(v, cfg.AAL.Enabled)
 	}
@@ -255,18 +277,27 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.AAL.MaxFileSize = n
 		}
 	}
+}
+
+func applyACLEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_ACL_ENABLED"); v != "" {
 		cfg.ACL.Enabled = parseBool(v, cfg.ACL.Enabled)
 	}
 	if v := os.Getenv("AQUEDUCT_ACL_DEFAULT"); v != "" {
 		cfg.ACL.Default = v
 	}
+}
+
+func applyAdminEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_ADMIN_ENABLED"); v != "" {
 		cfg.Admin.Enabled = parseBool(v, cfg.Admin.Enabled)
 	}
 	if v := os.Getenv("AQUEDUCT_ADMIN_ADDR"); v != "" {
 		cfg.Admin.Addr = v
 	}
+}
+
+func applyBrokerEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_BROKER_QUEUE_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Broker.QueueSize = n
@@ -300,6 +331,9 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Broker.Quotas.DefaultBurstSize = n
 		}
 	}
+}
+
+func applyTransportEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_TRANSPORT_MAX_BUF_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Transport.MaxBufSize = n
@@ -310,6 +344,9 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Transport.ReadBufSize = n
 		}
 	}
+}
+
+func applyTracingEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_TRACING_ENABLED"); v != "" {
 		cfg.Tracing.Enabled = parseBool(v, cfg.Tracing.Enabled)
 	}
@@ -319,6 +356,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_TRACING_ENDPOINT"); v != "" {
 		cfg.Tracing.Endpoint = v
 	}
+}
+
+func applyClusterEnv(cfg *Config) {
 	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_ENABLED"); v != "" {
 		cfg.Cluster.Discovery.Enabled = parseBool(v, cfg.Cluster.Discovery.Enabled)
 	}
@@ -330,6 +370,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AQUEDUCT_CLUSTER_DISCOVERY_INTERVAL"); v != "" {
 		cfg.Cluster.Discovery.Interval = v
+	}
+}
+
+func applyCompressionEnv(cfg *Config) {
+	if v := os.Getenv("AQUEDUCT_COMPRESSION_ENABLED"); v != "" {
+		cfg.Compression.Enabled = parseBool(v, cfg.Compression.Enabled)
 	}
 }
 
