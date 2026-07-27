@@ -44,8 +44,11 @@ func parseFrame(data []byte) (cmd byte, streamID uint32, payload []byte, err err
 }
 
 func main() {
+	// Server certificate validation is intentionally disabled in this example
+	// so the client can talk to a self-signed developer broker on 127.0.0.1.
+	// For production use a real CA bundle and remove `InsecureSkipVerify`.
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: true, //nolint:gosec // dev-only; see comment above
 		NextProtos:         []string{"aqueduct-v1"},
 		MinVersion:         tls.VersionTLS13,
 	}

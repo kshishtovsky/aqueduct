@@ -45,11 +45,11 @@ func genSelfSigned(t testing.TB) (serverTLS *tls.Config, clientTLS *tls.Config) 
 }
 
 // TestPeerManagerForward verifies that PeerManager connects to a peer and forwards frames.
+// Refactored into helpers to keep cognitive complexity under Sonar's threshold.
 func TestPeerManagerForward(t *testing.T) {
 	sTLS, cTLS := genSelfSigned(t)
 	quicConf := &quic.Config{MaxIdleTimeout: 5 * time.Second}
 
-	// Start a listener that acts as the peer node.
 	ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, quicConf)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -60,42 +60,12 @@ func TestPeerManagerForward(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Accept one connection and count received frames.
-	go func() {
-		conn, err := ln.Accept(ctx)
-		if err != nil {
-			return
-		}
-		stream, err := conn.AcceptStream(ctx)
-		if err != nil {
-			return
-		}
-		buf := make([]byte, 1024)
-		for {
-			n, err := stream.Read(buf)
-			if err != nil || n == 0 {
-				return
-			}
-			if protocol.IsForwarded(protocol.Command(buf[1])) {
-				received.Add(1)
-			}
-		}
-	}()
+	go countForwardedReceives(ctx, ln, &received)
 
 	pm := cluster.New(ctx, []string{ln.Addr().String()}, cTLS, quicConf)
 	defer pm.Close()
 
-	// Wait for connection to establish.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if pm.ActivePeers() > 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if pm.ActivePeers() == 0 {
-		t.Fatal("expected at least 1 active peer after dial")
-	}
+	waitForActivePeer(t, pm, 2*time.Second)
 
 	// Build a publish frame and forward it.
 	payload := []byte("mesh/test/topic")
@@ -103,12 +73,48 @@ func TestPeerManagerForward(t *testing.T) {
 	pm.Forward(*buf, true)
 	protocol.ReleaseBuffer(buf)
 
-	// Allow forwarding to land.
 	time.Sleep(200 * time.Millisecond)
 
 	if received.Load() == 0 {
 		t.Error("expected peer to receive forwarded frame with MeshForwarded bit set")
 	}
+}
+
+// countForwardedReceives is a test helper that counts how many bytes marked
+// with the MeshForwarded bit have arrived on the first accepted stream.
+func countForwardedReceives(ctx context.Context, ln *quic.Listener, received *atomic.Int32) {
+	conn, err := ln.Accept(ctx)
+	if err != nil {
+		return
+	}
+	stream, err := conn.AcceptStream(ctx)
+	if err != nil {
+		return
+	}
+	buf := make([]byte, 1024)
+	for {
+		n, err := stream.Read(buf)
+		if err != nil || n == 0 {
+			return
+		}
+		if protocol.IsForwarded(protocol.Command(buf[1])) {
+			received.Add(1)
+		}
+	}
+}
+
+// waitForActivePeer blocks until pm reports at least one active peer or
+// until the timeout elapses. Fatal if no peer connects in time.
+func waitForActivePeer(t *testing.T, pm *cluster.PeerManager, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if pm.ActivePeers() > 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("expected at least 1 active peer after dial")
 }
 
 // TestMeshStormProtection verifies that receiving a MeshForwarded frame does NOT re-forward it.
@@ -231,6 +237,7 @@ func Test2NodeMeshForwarding(t *testing.T) {
 }
 
 // acceptLoop is a reusable accept-dispatch goroutine used by integration tests.
+// Refactored into helpers to keep cognitive complexity low.
 func acceptLoop(ctx context.Context, router *broker.Router, ln *quic.Listener) {
 	for {
 		c, err := ln.Accept(ctx)
@@ -243,33 +250,47 @@ func acceptLoop(ctx context.Context, router *broker.Router, ln *quic.Listener) {
 				if err != nil {
 					return
 				}
-				go func(s *quic.Stream) {
-					buf := make([]byte, 4096)
-					n, err := s.Read(buf)
-					if err != nil || n < protocol.HeaderSize {
-						return
-					}
-					frame, err := protocol.ParseFrame(buf[:n])
-					if err != nil {
-						return
-					}
-					if protocol.IsForwarded(frame.Command) {
-						if protocol.OpcodeOf(frame.Command) == protocol.CmdPublish {
-							_ = router.PublishFromPeer(ctx, frame)
-						}
-					} else if frame.Command == protocol.CmdSubscribe {
-						_ = router.Subscribe(ctx, s, frame)
-					} else if frame.Command == protocol.CmdPublish {
-						_ = router.Publish(ctx, frame)
-					}
-				}(stream)
+				go dispatchAcceptedFrame(ctx, router, stream)
 			}
 		}()
 	}
 }
 
+// dispatchAcceptedFrame reads a single frame from a freshly accepted stream
+// and routes it through the broker router.
+func dispatchAcceptedFrame(ctx context.Context, router *broker.Router, s *quic.Stream) {
+	buf := make([]byte, 4096)
+	n, err := s.Read(buf)
+	if err != nil || n < protocol.HeaderSize {
+		return
+	}
+	frame, err := protocol.ParseFrame(buf[:n])
+	if err != nil {
+		return
+	}
+	routeAcceptedFrame(ctx, router, s, frame)
+}
+
+// routeAcceptedFrame applies the same routing rules the broker uses for
+// forwarded/local frames.
+func routeAcceptedFrame(ctx context.Context, router *broker.Router, s *quic.Stream, frame protocol.Frame) {
+	if protocol.IsForwarded(frame.Command) {
+		if protocol.OpcodeOf(frame.Command) == protocol.CmdPublish {
+			_ = router.PublishFromPeer(ctx, frame)
+		}
+		return
+	}
+	switch frame.Command {
+	case protocol.CmdSubscribe:
+		_ = router.Subscribe(ctx, s, frame)
+	case protocol.CmdPublish:
+		_ = router.Publish(ctx, frame)
+	}
+}
+
 // Test3NodeClusterMeshForwarding spins up 3 nodes, subscribes on node 3,
 // publishes on node 1, and verifies delivery on node 3 via mesh forwarding.
+// Refactored into helpers to keep cognitive complexity under Sonar's threshold.
 func Test3NodeClusterMeshForwarding(t *testing.T) {
 	sTLS, cTLS := genSelfSigned(t)
 	qConf := &quic.Config{MaxIdleTimeout: 15 * time.Second}
@@ -277,27 +298,60 @@ func Test3NodeClusterMeshForwarding(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start 3 listeners.
-	var listeners []*quic.Listener
-	var addrs []string
-	for i := 0; i < 3; i++ {
-		ln, err := quic.ListenAddr("127.0.0.1:0", sTLS, qConf)
+	listeners, addrs := start3Listeners(t, sTLS, qConf)
+	defer closeListeners(listeners)
+
+	routers, managers := spinUpClusterNodes(ctx, listeners, addrs, cTLS, qConf)
+	waitForClusterPeers(t, managers)
+
+	subStream := subscribeToNode3(ctx, t, addrs[2], cTLS, qConf, "topic:cluster3")
+	defer subConnCleanup(t, subStream)
+
+	_ = routers[0].Publish(ctx, protocol.Frame{
+		Command:    protocol.CmdPublish,
+		PayloadLen: 8,
+		Payload:    []byte("cluster3"),
+	})
+
+	verifyDeliveredPayload(t, subStream, "cluster3")
+}
+
+// start3Listeners brings up three local QUIC listeners and returns their
+// addresses.
+func start3Listeners(t *testing.T, tlsConf *tls.Config, qConf *quic.Config) ([]*quic.Listener, []string) {
+	t.Helper()
+	const n = 3
+	listeners := make([]*quic.Listener, 0, n)
+	addrs := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ln, err := quic.ListenAddr("127.0.0.1:0", tlsConf, qConf)
 		if err != nil {
 			t.Fatalf("listen %d: %v", i, err)
 		}
-		defer ln.Close()
 		listeners = append(listeners, ln)
 		addrs = append(addrs, ln.Addr().String())
 	}
+	return listeners, addrs
+}
 
-	// Create 3 nodes, each with a router + PeerManager + acceptLoop.
-	var routers []*broker.Router
-	var managers []*cluster.PeerManager
-	for i := 0; i < 3; i++ {
-		peers := make([]string, 0, 2)
-		for j := range addrs {
+// closeListeners closes every listener — best-effort because tests may have
+// already closed some via deferred Close().
+func closeListeners(ls []*quic.Listener) {
+	for _, ln := range ls {
+		_ = ln.Close()
+	}
+}
+
+// spinUpClusterNodes creates one router+PeerManager per node, wires each to
+// its listener via acceptLoop, and returns the resulting slices.
+func spinUpClusterNodes(ctx context.Context, listeners []*quic.Listener, addrs []string, cTLS *tls.Config, qConf *quic.Config) ([]*broker.Router, []*cluster.PeerManager) {
+	routers := make([]*broker.Router, 0, len(listeners))
+	managers := make([]*cluster.PeerManager, 0, len(listeners))
+	for i := range listeners {
+		peers := make([]string, 0, len(addrs)-1)
+		for j, addr := range addrs {
 			if i != j {
-				peers = append(peers, addrs[j])
+				peers = append(peers, addr)
 			}
 		}
 		pm := cluster.New(ctx, peers, cTLS, qConf)
@@ -306,8 +360,13 @@ func Test3NodeClusterMeshForwarding(t *testing.T) {
 		routers = append(routers, router)
 		managers = append(managers, pm)
 	}
+	return routers, managers
+}
 
-	// Wait for all peers to connect.
+// waitForClusterPeers blocks until every node has connected to all of its
+// peers (2 per node in this 3-node topology).
+func waitForClusterPeers(t *testing.T, managers []*cluster.PeerManager) {
+	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		allGood := true
@@ -318,7 +377,7 @@ func Test3NodeClusterMeshForwarding(t *testing.T) {
 			}
 		}
 		if allGood {
-			break
+			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -327,30 +386,39 @@ func Test3NodeClusterMeshForwarding(t *testing.T) {
 			t.Fatalf("node%d: %d peers (expected 2)", i+1, pm.ActivePeers())
 		}
 	}
+}
 
-	// Subscriber connects to node 3 (index 2).
-	subConn, err := quic.DialAddr(ctx, addrs[2], cTLS, qConf)
+// subscribeToNode3 opens a stream to node 3 and sends a subscribe frame for
+// the given topic.
+func subscribeToNode3(ctx context.Context, t *testing.T, addr string, cTLS *tls.Config, qConf *quic.Config, topic string) *quic.Stream {
+	t.Helper()
+	subConn, err := quic.DialAddr(ctx, addr, cTLS, qConf)
 	if err != nil {
 		t.Fatalf("dial node3: %v", err)
 	}
-	defer subConn.CloseWithError(0, "done")
+	t.Cleanup(func() { _ = subConn.CloseWithError(0, "done") })
 	subStream, err := subConn.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatalf("open sub stream: %v", err)
 	}
-	sendBuf := protocol.SerializeFrame(protocol.CmdSubscribe, 1, []byte("topic:cluster3"))
+	sendBuf := protocol.SerializeFrame(protocol.CmdSubscribe, 1, []byte(topic))
 	_, _ = subStream.Write(*sendBuf)
 	protocol.ReleaseBuffer(sendBuf)
 	time.Sleep(500 * time.Millisecond)
+	return subStream
+}
 
-	// Publisher publishes on node 1 (index 0) via router.
-	_ = routers[0].Publish(ctx, protocol.Frame{
-		Command:    protocol.CmdPublish,
-		PayloadLen: 8,
-		Payload:    []byte("cluster3"),
-	})
+// subConnCleanup closes the subscriber stream. The owning connection is
+// registered separately via t.Cleanup.
+func subConnCleanup(t *testing.T, stream *quic.Stream) {
+	t.Helper()
+	_ = stream.Close()
+}
 
-	// Verify subscriber on node 3 gets the message.
+// verifyDeliveredPayload reads a frame from the subscriber stream and asserts
+// its payload equals want and that the MeshForwarded bit is not set.
+func verifyDeliveredPayload(t *testing.T, subStream *quic.Stream, want string) {
+	t.Helper()
 	subStream.SetReadDeadline(time.Now().Add(5 * time.Second))
 	readBuf := make([]byte, 4096)
 	n, err := subStream.Read(readBuf)
@@ -361,8 +429,8 @@ func Test3NodeClusterMeshForwarding(t *testing.T) {
 	if pe != nil {
 		t.Fatalf("parse: %v", pe)
 	}
-	if string(f.Payload) != "cluster3" {
-		t.Errorf("expected 'cluster3', got %q", f.Payload)
+	if string(f.Payload) != want {
+		t.Errorf("expected %q, got %q", want, string(f.Payload))
 	}
 	if protocol.IsForwarded(f.Command) {
 		t.Error("delivered frame must not have MeshForwarded bit set")
@@ -472,45 +540,14 @@ func TestPeerManagerForwardNoBit(t *testing.T) {
 	defer cancel()
 
 	var receivedNormal, receivedForwarded atomic.Int32
-	go func() {
-		conn, err := ln.Accept(ctx)
-		if err != nil {
-			return
-		}
-		stream, err := conn.AcceptStream(ctx)
-		if err != nil {
-			return
-		}
-		buf := make([]byte, 1024)
-		for {
-			n, err := stream.Read(buf)
-			if err != nil || n == 0 {
-				return
-			}
-			if protocol.IsForwarded(protocol.Command(buf[1])) {
-				receivedForwarded.Add(1)
-			} else {
-				receivedNormal.Add(1)
-			}
-		}
-	}()
+	go countForwardedAndNormal(ctx, ln, &receivedNormal, &receivedForwarded)
 
 	pm := cluster.New(ctx, []string{ln.Addr().String()}, cTLS, qConf)
 	defer pm.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if pm.ActivePeers() > 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if pm.ActivePeers() == 0 {
-		t.Fatal("expected active peer")
-	}
+	waitForActivePeer(t, pm, 2*time.Second)
 
 	payload := []byte("normal/topic")
-	// Forward WITHOUT mesh forwarded bit
 	buf := protocol.SerializeFrame(protocol.CmdPublish, 0, payload)
 	pm.Forward(*buf, false)
 	protocol.ReleaseBuffer(buf)
@@ -521,6 +558,32 @@ func TestPeerManagerForwardNoBit(t *testing.T) {
 	}
 	if receivedForwarded.Load() != 0 {
 		t.Error("expected no forwarded frames when addForwardedBit=false")
+	}
+}
+
+// countForwardedAndNormal is a test helper that classifies every received
+// frame byte as either forwarded or normal and increments the matching
+// counter. Stops on EOF or read error.
+func countForwardedAndNormal(ctx context.Context, ln *quic.Listener, normal, forwarded *atomic.Int32) {
+	conn, err := ln.Accept(ctx)
+	if err != nil {
+		return
+	}
+	stream, err := conn.AcceptStream(ctx)
+	if err != nil {
+		return
+	}
+	buf := make([]byte, 1024)
+	for {
+		n, err := stream.Read(buf)
+		if err != nil || n == 0 {
+			return
+		}
+		if protocol.IsForwarded(protocol.Command(buf[1])) {
+			forwarded.Add(1)
+		} else {
+			normal.Add(1)
+		}
 	}
 }
 
