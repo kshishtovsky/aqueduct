@@ -88,6 +88,8 @@ type MessageRef struct {
 
 ## 6. Direct Mesh Clustering (P2P Federation) и DNS Discovery
 
+
+
 Aqueduct поддерживает формирование кластера из брокеров, соединённых через прямую P2P QUIC-сеть. Центральный координатор или консенсус (Raft/Paxos) отсутствует — пересылка сообщений работает по принципу fire-and-forget.
 
 ### PeerManager (RCU-паттерн, v1.14.0)
@@ -146,7 +148,30 @@ type Discovery struct {
 
 ---
 
-## 7. Батчинг и коалесцированная запись
+## 7. WebTransport Gateway (HTTP/3, v1.16.0+)
+
+Браузеры не могут использовать нативный ALPN брокера `aqueduct-v1` — они поддерживают только HTTP/3 + W3C WebTransport API. Шлюз транслирует на транспортном уровне без изменений в протоколе:
+
+```
+   ┌─────────────┐     HTTP/3     ┌──────────────────────┐     QUIC bidi     ┌───────────────────┐
+   │ Браузер     │ ─ WebTransport► │ internal/webtransport│ ────────────────► │ internal/transport│
+   │ (W3C API)   │     streams    │ (этот пакет)         │  *quic.Stream    │ (broker)          │
+   └─────────────┘                └──────────────────────┘                   └───────────────────┘
+                                            │                                        │
+                                            └─── повторно используется через broker.HandleStream ────┘
+```
+
+Гарантии дизайна:
+
+- **Один TLS-конфиг — два листенера.** Шлюз вызывает `http3.ConfigureTLSConfig` поверх `*tls.Config` брокера, поэтому одним mTLS-сертификатом защищены оба порта. `h3` добавляется в `NextProtos` без мутации основного конфига.
+- **Hijack handshake-стрима.** `responseWriter.HTTPStream()` возвращает базовый `*http3.Stream`. Мы отправляем `200 OK` для завершения WebTransport Extended CONNECT handshake, затем в цикле вызываем `conn.AcceptStream()` и передаём каждый bidi-стрим в `broker.HandleStream(ctx, conn, s, clientID)` — ту же функцию, что вызывает нативная QUIC-сессия.
+- **Без трансляции протокола.** Браузер пишет `[Magic:1][Cmd:1][StreamID:4][DataLen:4][Payload:N]` в `WebTransportBidirectionalStream`; парсер фреймов брокера обрабатывает это без изменений. Межтранспортная маршрутизация (браузер → нативный QUIC-подписчик и обратно) автоматическая, потому что оба транспорта подключены к одному `*broker.Router`.
+- **Синхронный handshake timeout.** Через `WithHandshakeTimeout(...)` (по умолчанию 10s) мы блокируем Slowloris-атаки; незавершённый handshake получает `stream.CancelRead(1)` + `conn.CloseWithError(ErrCodeRequestRejected, "wt handshake timeout")`.
+- **0-RTT по умолчанию.** QUIC-конфиг устанавливает `Allow0RTT: true` и `MaxIncomingStreams: 100`. Браузеры с сохранённым session ticket используют его прозрачно.
+
+Шлюз живёт в `internal/webtransport/`. Покрытие тестами — 79.7% операторов (`server_test.go`, `stream_dispatch_test.go`, `server_bench_test.go`).
+
+## 8. Батчинг и коалесцированная запись
 
 ### Проблема: OS PPS лимиты
 
@@ -199,7 +224,7 @@ broker:
 
 ---
 
-## 8. NACK-редиливери и очереди мертвых сообщений (DLQ)
+## 9. NACK-редиливери и очереди мертвых сообщений (DLQ)
 
 Aqueduct v1.7.0 добавляет механизм отрицательного подтверждения (NACK) для надежной доставки:
 
@@ -241,7 +266,7 @@ Aqueduct v1.7.0 добавляет механизм отрицательного
 
 ---
 
-## 9. Slab-аллокатор
+## 10. Slab-аллокатор
 
 Aqueduct v1.8.0 заменяет `sync.Pool` для буферов `*[]byte` на горячем пути на высокопроизводительный slab-аллокатор:
 
@@ -268,7 +293,7 @@ Aqueduct v1.8.0 заменяет `sync.Pool` для буферов `*[]byte` н�
 
 ---
 
-## 10. Per-Tenant Rate Limiting (Token Bucket)
+## 11. Per-Tenant Rate Limiting (Token Bucket)
 
 Aqueduct v1.8.0 добавляет безблокировочный rate limiting на арендатора с использованием алгоритма Token Bucket:
 

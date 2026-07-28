@@ -67,3 +67,12 @@ tracing:
 transport:
   max_buf_size: 1048576     # 64 KB maximum buffer limit per stream
   read_buf_size: 1024     # 1 KB initial read buffer per stream
+
+# WebTransport (HTTP/3) Gateway \u2014 lets web browsers connect transparently.
+# Reuses the broker's mTLS certificate (cfg.tls); only the listen port is independent.
+# Set enabled: true to accept browser clients via the W3C WebTransport API.
+webtransport:
+  enabled: false             # toggle the WebTransport gateway on/off
+  listen_addr: ":4433"      # distinct from cfg.listen_addr (no two UDP ports can share)
+  path_prefix: "/aqueduct/wt"  # Extended CONNECT path clients use
+

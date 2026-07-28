@@ -37,6 +37,17 @@ var (
 	errTopicEmpty    = errors.New("topic cannot be empty")
 )
 
+// prefixTopic is the byte slice used by parsePublishTopic and parseSubscriptionPayload
+// to detect and strip the "topic:" routing-metadata prefix from publish payloads.
+//
+// Background: the broker's publish wire format historically only carried the bare
+// topic name as the frame payload (the topic IS the payload — subscribers receive
+// the same payload). To stay consistent with subscribe payloads (which DO carry
+// the "topic:" prefix) and with the ACL extractor in transport/broker.go, the
+// router strips an optional "topic:" prefix defensively. The routing key is
+// always the post-strip clean topic name, never the raw payload.
+var prefixTopic = []byte("topic:")
+
 // BackpressurePolicy defines how queue overflow is handled for slow consumers.
 type BackpressurePolicy uint8
 
@@ -333,7 +344,11 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 	nackCh := make(chan uint64, 8)
 	notifyCh := make(chan struct{}, 1)
 	subCtx, cancel := context.WithCancel(ctx)
-	topicHash := authz.CombineHashStrings("topic", spec.Topic)
+	// Routing key derived from spec.Topic (already parsed via
+	// parseSubscriptionPayload) goes through the single source of truth
+	// topicHashKey so it matches the publisher side. See TopicHash bug
+	// fix (v1.16.0).
+	topicHash := topicHashKey(spec.Topic)
 
 	subQueues := &[4]chan *MessageRef{}
 	subMu := &sync.RWMutex{}
@@ -528,11 +543,13 @@ func (r *Router) runBackfillWorker(ctx context.Context, topic, consumerID string
 			return nil
 		}
 		if frame.Command == protocol.CmdPublish {
-			tExp, cleanPayload := parseTTL(frame.Payload)
-			if string(cleanPayload) == topic {
+			// Use the canonical extractor so an AAL replay through
+			// `ParseFrame + Subscriber` lines up with live publishes.
+			tExp, cleanTopic := parsePublishTopic(frame.Payload)
+			if string(cleanTopic) == topic {
 				currentMsgOffset++
 				if currentMsgOffset > startOffset && currentMsgOffset <= endOffset {
-					buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+					buf := protocol.SerializeFrame(protocol.CmdPublish, 0, cleanTopic)
 					msgRef := AcquireMessageRef(buf)
 					msgRef.SetExpiresAt(tExp)
 					msgRef.SetOffset(currentMsgOffset)
@@ -929,16 +946,20 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 		}
 	}
 
+	// parsePublishTopic strips BOTH "ttl:<ms>:" AND the optional "topic:"
+	// prefix, guaranteeing the routing key matches subscriber keys built
+	// from parseSubscriptionPayload. See parsePublishTopic docs for the
+	// full rationale (TopicHash collision bug fix, v1.16.0).
 	var expiresAt int64
-	var cleanPayload []byte
+	var cleanTopic []byte
 	if r.priorityTTLs[pLevel] > 0 {
-		_, cleanPayload = parseTTL(frame.Payload)
+		_, cleanTopic = parsePublishTopic(frame.Payload)
 		expiresAt = time.Now().UnixNano() + r.priorityTTLs[pLevel].Nanoseconds()
 	} else {
-		expiresAt, cleanPayload = parseTTL(frame.Payload)
+		expiresAt, cleanTopic = parsePublishTopic(frame.Payload)
 	}
 
-	topicHash := authz.CombineHashes("topic", cleanPayload)
+	topicHash := topicHashKey(string(cleanTopic))
 	msgOffset := r.nextTopicOffset(topicHash)
 
 	r.mu.RLock()
@@ -954,17 +975,17 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 	}
 
 	if r.metrics != nil {
-		r.metrics.OnPublish(string(cleanPayload))
+		r.metrics.OnPublish(string(cleanTopic))
 	}
 
 	// Preserve TLV extensions in the serialized frame for subscriber delivery
 	// and peer forwarding. The original frame byte slice is used when HasExtensions
-	// is true; otherwise, we create a new frame from the clean payload.
+	// is true; otherwise, we create a new frame from the clean topic name.
 	var buf *[]byte
 	if frame.HasExtensions() {
-		buf = protocol.SerializeFrameWithExtensions(protocol.CmdPublish, 0, frame.Extensions, cleanPayload)
+		buf = protocol.SerializeFrameWithExtensions(protocol.CmdPublish, 0, frame.Extensions, cleanTopic)
 	} else {
-		buf = protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+		buf = protocol.SerializeFrame(protocol.CmdPublish, 0, cleanTopic)
 	}
 	msgRef := AcquireMessageRef(buf)
 	msgRef.SetExpiresAt(expiresAt)
@@ -995,7 +1016,7 @@ func (r *Router) publishWithClientID(ctx context.Context, frame protocol.Frame, 
 		for _, wSub := range r.wildcardSubs {
 			idx := wSub.idx
 			if idx < len(r.active) && r.active[idx] {
-				if MatchWildcard(wSub.pattern, cleanPayload) {
+				if MatchWildcard(wSub.pattern, cleanTopic) {
 					msgRef.Retain()
 					dc := r.enqueueToSubscriber(idx, msgRef, pLevel)
 					if dc >= 0 {
@@ -1062,16 +1083,19 @@ func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
 		}
 	}
 
+	// parsePublishTopic strips BOTH "ttl:<ms>:" AND the optional "topic:"
+	// prefix. See parsePublishTopic docs for the full rationale
+	// (TopicHash collision bug fix, v1.16.0).
 	var expiresAt int64
-	var cleanPayload []byte
+	var cleanTopic []byte
 	if r.priorityTTLs[pLevel] > 0 {
-		_, cleanPayload = parseTTL(frame.Payload)
+		_, cleanTopic = parsePublishTopic(frame.Payload)
 		expiresAt = time.Now().UnixNano() + r.priorityTTLs[pLevel].Nanoseconds()
 	} else {
-		expiresAt, cleanPayload = parseTTL(frame.Payload)
+		expiresAt, cleanTopic = parsePublishTopic(frame.Payload)
 	}
 
-	topicHash := authz.CombineHashes("topic", cleanPayload)
+	topicHash := topicHashKey(string(cleanTopic))
 	msgOffset := r.nextTopicOffset(topicHash)
 
 	r.mu.RLock()
@@ -1085,14 +1109,14 @@ func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
 	}
 
 	if r.metrics != nil {
-		r.metrics.OnPublish(string(cleanPayload))
+		r.metrics.OnPublish(string(cleanTopic))
 	}
 
 	var buf *[]byte
 	if frame.HasExtensions() {
-		buf = protocol.SerializeFrameWithExtensions(protocol.CmdPublish, 0, frame.Extensions, cleanPayload)
+		buf = protocol.SerializeFrameWithExtensions(protocol.CmdPublish, 0, frame.Extensions, cleanTopic)
 	} else {
-		buf = protocol.SerializeFrame(protocol.CmdPublish, 0, cleanPayload)
+		buf = protocol.SerializeFrame(protocol.CmdPublish, 0, cleanTopic)
 	}
 	msgRef := AcquireMessageRef(buf)
 	msgRef.SetExpiresAt(expiresAt)
@@ -1115,7 +1139,7 @@ func (r *Router) publishLocal(ctx context.Context, frame protocol.Frame) error {
 		for _, wSub := range r.wildcardSubs {
 			idx := wSub.idx
 			if idx < len(r.active) && r.active[idx] {
-				if MatchWildcard(wSub.pattern, cleanPayload) {
+				if MatchWildcard(wSub.pattern, cleanTopic) {
 					msgRef.Retain()
 					dc := r.enqueueToSubscriber(idx, msgRef, pLevel)
 					if dc >= 0 {
@@ -1233,8 +1257,12 @@ func (r *Router) PublishBatch(ctx context.Context, frame protocol.Frame) error {
 		if subErr != nil {
 			return nil // skip malformed sub-frames
 		}
-		_, subTopic := parseTTL(sub.Payload)
-		subTopicHash := authz.CombineHashes("topic", subTopic)
+		// parsePublishTopic strips BOTH the "ttl:<ms>:" prefix AND the
+		// optional "topic:" prefix from the sub-frame payload. This
+		// prevents TopicHash collisions when a batch publisher sends
+		// aliasing forms of the same logical topic.
+		_, subTopic := parsePublishTopic(sub.Payload)
+		subTopicHash := topicHashKey(string(subTopic))
 
 		// Assign monotonic topic offset for this sub-frame (shared with non-batch Publish).
 		msgOffset := r.nextTopicOffset(subTopicHash)
@@ -1490,4 +1518,39 @@ func parseTTL(payload []byte) (int64, []byte) {
 		}
 	}
 	return 0, payload
+}
+
+// parsePublishTopic is the canonical topic-name extractor for every Publish /
+// PublishBatch path. It strips BOTH:
+//
+//  1. the optional TTL prefix: "ttl:<ms>:<topic>"
+//  2. the optional "topic:" routing-prefix
+//
+// and returns the (expiry nanos, cleanTopic) tuple.
+//
+// WHY: before this helper existed, the router built its routing key from
+// "cleanPayload" — which still had the "topic:" prefix if a publisher sent
+// it that way. Subscribers registered via parseSubscriptionPayload, by
+// contrast, stored their slot under the post-"topic:" name. The two keys
+// drifted apart, breaking fan-out AND creating a hash collision surface in
+// the OnPublish metric / ACL key.
+//
+// The router and the transport-layer ACL engine now agree on topic identity:
+// a publish to "orders" and a publish to "topic:orders" route to the same
+// subscribers.
+func parsePublishTopic(payload []byte) (expiresAt int64, cleanTopic []byte) {
+	expiresAt, cleanTopic = parseTTL(payload)
+	if bytes.HasPrefix(cleanTopic, prefixTopic) && len(cleanTopic) > len(prefixTopic) {
+		cleanTopic = cleanTopic[len(prefixTopic):]
+	}
+	return expiresAt, cleanTopic
+}
+
+// topicHashKey is the single source of truth for the FNV-1a composite hash
+// used to key the router's SoA tables (topicIndex, groups, durableOffsets).
+// Subscribers and publishers MUST go through this function — inlining a raw
+// authz.CombineHashes(..., "topic", ...) call reintroduces the bug where one
+// path forgets to strip a metadata prefix.
+func topicHashKey(topic string) uint64 {
+	return authz.CombineHashStrings("topic", topic)
 }

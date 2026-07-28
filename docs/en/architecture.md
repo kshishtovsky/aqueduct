@@ -135,6 +135,31 @@ type Discovery struct {
 - Polls `net.LookupHost(hostname)` every `interval` (default 10s)
 - Diffs against `knownIPs` map → calls `AddPeer()`/`RemovePeer()` only on change
 - `normalize()` deduplicates IPs and filters link-local (`169.254.x.x`) addresses
+
+---
+
+## 7. WebTransport Gateway (HTTP/3, v1.16.0+)
+
+Browsers cannot speak the broker's native `aqueduct-v1` ALPN — they only support HTTP/3 + the W3C WebTransport API. The gateway translates at the transport layer without touching the protocol:
+
+```
+   ┌─────────────┐     HTTP/3     ┌──────────────────────┐     QUIC bidi     ┌───────────────────┐
+   │ Browser     │ ─ WebTransport► │ internal/webtransport│ ────────────────► │ internal/transport│
+   │ (W3C API)   │     streams    │ (this package)       │  raw *quic.Stream │ (broker)          │
+   └─────────────┘                └──────────────────────┘                   └───────────────────┘
+                                            │                                        │
+                                            └─── reused via broker.HandleStream ────┘
+```
+
+Design constraints:
+
+- **One TLS config, two listeners.** The gateway calls `http3.ConfigureTLSConfig` on the broker's `*tls.Config` so the same mTLS cert secures both ports. Adds `h3` to `NextProtos` without mutating the broker's config.
+- **Hijack the handshake stream.** `responseWriter.HTTPStream()` returns the underlying `*http3.Stream`. We send `200 OK` to complete the WebTransport Extended CONNECT handshake, then loop on `conn.AcceptStream()` to feed every subsequent bidi stream into `broker.HandleStream(ctx, conn, s, clientID)` — the same call a native QUIC session makes.
+- **0 protocol translation.** The browser writes `[Magic:1][Cmd:1][StreamID:4][DataLen:4][Payload:N]` into a `WebTransportBidirectionalStream`; the broker's existing frame parser handles it unchanged. Cross-transport routing (browser publishes → native QUIC subscriber, and vice versa) is automatic because both transports feed the same `*broker.Router`.
+- **Synchronous handshake timeout.** A bounded `WithHandshakeTimeout(...)` (default 10s) prevents Slowloris-style attacks; an in-flight handshake that exceeds the timeout gets `stream.CancelRead(1)` + `conn.CloseWithError(ErrCodeRequestRejected, "wt handshake timeout")`.
+- **0-RTT by default.** The QUIC config sets `Allow0RTT: true` and `MaxIncomingStreams: 100`. Browsers with a stored session ticket re-use it transparently; the gateway validates the server certificate the same as for native connections.
+
+The gateway lives in `internal/webtransport/` and contains three test files (`server_test.go`, `stream_dispatch_test.go`, `server_bench_test.go`) covering handshakes, multi-stream sessions, cross-transport routing, and benchmark latency for capacity planning. Total statement coverage is 79.7%.
 - `Resolver` interface allows mocking DNS in tests without external deps
 
 ### MeshForwarded Bit

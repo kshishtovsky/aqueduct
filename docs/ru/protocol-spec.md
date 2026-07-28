@@ -87,3 +87,54 @@
 | (Little-Endian)   | (Сессия+Счетчик)  | Кадр (AEAD Seal)  |
 +-------------------+-------------------+-------------------+
 ```
+
+---
+
+## 6. WebTransport Transport Binding (v1.16.0+)
+
+Браузерные клиенты подключаются через W3C [WebTransport API](https://www.w3.org/TR/webtransport/), инкапсулирующий HTTP/3 поверх QUIC. Кадрирование **идентично** нативному QUIC-транспорту — шлюз WebTransport (`internal/webtransport/`) переводит только HTTP/3-слой.
+
+### 6.1 Установка соединения
+
+Browser JS:
+```js
+const transport = new WebTransport("https://broker.example.com:4433/aqueduct/wt");
+await transport.ready;
+```
+
+Серверная сторона: `webtransport.Gateway.handleConn` вызывает `http3.NewRawServerConn`, завершает обмен HTTP/3 SETTINGS, затем разбирает входящий Extended CONNECT и проверяет:
+
+- `:method = CONNECT`
+- `:scheme = https`
+- `:authority = broker.example.com:4433`
+- `:path = /aqueduct/wt` (настраивается через `webtransport.path_prefix`)
+- `:protocol = webtransport`
+
+Ответ 200 OK завершает handshake. Последующие bidirectional-стримы на том же QUIC-соединении несут бинарные фреймы брокера.
+
+### 6.2 Маппинг стримов
+
+| Тип стрима WebTransport | Пара в брокере |
+| :------------------------ | :------------------ |
+| Server-initiated uni | (зарезервирован для HTTP/3 control, игнорируется шлюзом) |
+| Client-initiated uni | (отбрасывается — стримы с неизвестным типом по RFC 9298) |
+| Client-initiated bidi | `*quic.Stream` из `conn.AcceptStream()` |
+| Server-initiated bidi | (сам request-стрим handshake, остаётся открытым для capsule) |
+
+После handshake каждый клиентский bidi-стрим передаётся в `transport.Broker.HandleStream(ctx, conn, stream, clientID)` — тот же метод, что использует нативный QUIC-транспорт.
+
+### 6.3 0-RTT и TLS
+
+QUIC-слой под HTTP/3 договаривается о 0-RTT при условии `quic.Config.Allow0RTT = true` на обеих сторонах. Шлюз включает это по умолчанию. Браузеры сохраняют session ticket при первом подключении и переиспользуют его.
+
+Брокер принудительно выставляет TLS 1.3 (`MinVersion = tls.VersionTLS13`) на WebTransport-листенере даже если операторский сертификат это отключает — старые версии TLS молча отвергаются.
+
+### 6.4 Формат фрейма из браузера
+
+Браузер, пишущий в WebTransport bidi-стрим, формирует **тот же бинарный layout**, что и нативные клиенты:
+
+```
+[Magic: 1 байт = 0x1F][Cmd: 1 байт][StreamID: 4 байта (little-endian)][DataLen: 4 байта (little-endian)][Payload: N байт]
+```
+
+Идентичные константы (см. §1, §2). Идентичное TLV-кодирование расширений (см. §3). Реализация в `examples/web/app.js` (`buildFrame()` / `parseFrame()`) соответствует этому layout.

@@ -87,3 +87,54 @@ Aqueduct 使用 10 字节扁平二进制标头，后跟可选 TLV 扩展块与�
 | (Little-Endian)   | (会话前缀+计数器) | (AEAD Seal)       |
 +-------------------+-------------------+-------------------+
 ```
+
+---
+
+## 6. WebTransport 传输绑定 (v1.16.0+)
+
+浏览器客户端通过 W3C [WebTransport API](https://www.w3.org/TR/webtransport/) 连接，它在 QUIC 之上封装 HTTP/3。上面的帧格式与原生 QUIC 传输**完全相同**——WebTransport 网关 (`internal/webtransport/`) 仅翻译 HTTP/3 连接层。
+
+### 6.1 建立连接
+
+浏览器 JS:
+```js
+const transport = new WebTransport("https://broker.example.com:4433/aqueduct/wt");
+await transport.ready;
+```
+
+服务端: `webtransport.Gateway.handleConn` 调用 `http3.NewRawServerConn` 完成 HTTP/3 SETTINGS 交换，然后解析入站 Extended CONNECT 请求并校验：
+
+- `:method = CONNECT`
+- `:scheme = https`
+- `:authority = broker.example.com:4433`
+- `:path = /aqueduct/wt`（通过 `webtransport.path_prefix` 配置）
+- `:protocol = webtransport`
+
+200 OK 完成握手。同一 QUIC 连接上的后续双向流承载 Broker 的二进制帧。
+
+### 6.2 流映射
+
+| WebTransport 流类型 | Broker 对应物 |
+| :------------------------ | :------------------ |
+| Server-initiated uni      | (HTTP/3 control 预留，网关忽略) |
+| Client-initiated uni      | (丢弃——按 RFC 9298 未知类型) |
+| Client-initiated bidi     | `*quic.Stream` 来自 `conn.AcceptStream()` |
+| Server-initiated bidi     | (handshake 请求流本身，为 capsule 协议保持打开) |
+
+握手之后，每个客户端打开的 bidi 流都送入 `transport.Broker.HandleStream(ctx, conn, stream, clientID)`——与原生 QUIC 传输使用同一方法。
+
+### 6.3 0-RTT 与 TLS
+
+HTTP/3 之下的 QUIC 在双方均设置 `quic.Config.Allow0RTT = true` 时协商 0-RTT。网关默认启用。浏览器在首次连接时保存 session ticket 并在后续连接中复用，节省一个完整的 RTT。
+
+Broker 在 WebTransport 监听器上强制 TLS 1.3（`MinVersion = tls.VersionTLS13`），即便运维证书禁用了它——老版本 TLS 被静默拒绝。
+
+### 6.4 浏览器帧格式
+
+写入 WebTransport 双向流的浏览器产生与原生客户端**完全相同的二进制布局**：
+
+```
+[Magic: 1 字节 = 0x1F][Cmd: 1 字节][StreamID: 4 字节 (little-endian)][DataLen: 4 字节 (little-endian)][Payload: N 字节]
+```
+
+常量相同（见 §1, §2）。TLV 扩展编码相同（见 §3）。`examples/web/app.js` 参考客户端实现了匹配此布局的 `buildFrame()` / `parseFrame()`。
