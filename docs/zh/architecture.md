@@ -146,7 +146,30 @@ type Discovery struct {
 
 ---
 
-## 7. 批处理协议与写合并
+## 7. WebTransport Gateway (HTTP/3, v1.16.0+)
+
+浏览器无法使用 Broker 的原生 ALPN `aqueduct-v1`——它们仅支持 HTTP/3 + W3C WebTransport API。网关在传输层转换，不修改协议：
+
+```
+   ┌─────────────┐     HTTP/3     ┌──────────────────────┐     QUIC bidi     ┌───────────────────┐
+   │ 浏览器      │ ─ WebTransport► │ internal/webtransport│ ────────────────► │ internal/transport│
+   │ (W3C API)   │     streams    │ (此包)               │  *quic.Stream    │ (broker)          │
+   └─────────────┘                └──────────────────────┘                   └───────────────────┘
+                                            │                                        │
+                                            └─ 通过 broker.HandleStream 复用 ─┘
+```
+
+设计约束：
+
+- **一份 TLS，两套监听。** 网关在 Broker 的 `*tls.Config` 上调用 `http3.ConfigureTLSConfig`，从而一份 mTLS 证书同时保护两个端口。仅向 `NextProtos` 添加 `h3`，不修改 Broker 自身的配置。
+- **劫持握手流。** `responseWriter.HTTPStream()` 返回底层 `*http3.Stream`。我们发送 `200 OK` 完成 WebTransport Extended CONNECT 握手，然后循环调用 `conn.AcceptStream()` 将每个后续双向流送入 `broker.HandleStream(ctx, conn, s, clientID)`——与原生 QUIC 会话调用同一函数。
+- **零协议转换。** 浏览器把 `[Magic:1][Cmd:1][StreamID:4][DataLen:4][Payload:N]` 写入 `WebTransportBidirectionalStream`；Broker 现有的帧解析器原样处理。跨传输路由（浏览器 → 原生 QUIC 订阅者，反之亦然）是自动的，因为两种传输都接入同一个 `*broker.Router`。
+- **同步握手超时。** 通过 `WithHandshakeTimeout(...)`（默认 10s）防御 Slowloris 攻击；超时未完成的握手将被 `stream.CancelRead(1)` + `conn.CloseWithError(ErrCodeRequestRejected, "wt handshake timeout")`。
+- **默认启用 0-RTT。** QUIC 配置设置 `Allow0RTT: true`、`MaxIncomingStreams: 100`。持有 session ticket 的浏览器会透明复用。
+
+网关位于 `internal/webtransport/`。测试覆盖率为 79.7% 语句（`server_test.go`、`stream_dispatch_test.go`、`server_bench_test.go`）。
+
+## 8. 批处理协议与写合并
 
 ### 问题: OS PPS 限制
 
@@ -199,7 +222,7 @@ broker:
 
 ---
 
-## 8. 基于 NACK 的重投递与死信队列
+## 9. 基于 NACK 的重投递与死信队列
 
 Aqueduct v1.7.0 引入否定确认 (NACK) 机制实现可靠投递：
 
@@ -241,7 +264,7 @@ Aqueduct v1.7.0 引入否定确认 (NACK) 机制实现可靠投递：
 
 ---
 
-## 9. Slab 分配器
+## 10. Slab 分配器
 
 Aqueduct v1.8.0 在热路径上使用高性能 slab 分配器替代 `sync.Pool` 管理 `*[]byte` 帧缓冲区：
 
@@ -268,7 +291,7 @@ Aqueduct v1.8.0 在热路径上使用高性能 slab 分配器替代 `sync.Pool` 
 
 ---
 
-## 10. 每租户速率限制 (Token Bucket)
+## 11. 每租户速率限制 (Token Bucket)
 
 Aqueduct v1.8.0 使用令牌桶算法实现无锁每租户速率限制：
 

@@ -12,17 +12,18 @@ import (
 
 // Config holds the complete configuration for the Aqueduct broker.
 type Config struct {
-	ListenAddr  string            `yaml:"listen_addr"`
-	MetricsAddr string            `yaml:"metrics_addr"`
-	TLS         TLSConfig         `yaml:"tls"`
-	AAL         AALConfig         `yaml:"aal"`
-	ACL         ACLConfig         `yaml:"acl"`
-	Admin       AdminConfig       `yaml:"admin"`
-	Broker      BrokerConfig      `yaml:"broker"`
-	Transport   TransportConfig   `yaml:"transport"`
-	Cluster     ClusterConfig     `yaml:"cluster"`
-	Tracing     TracingConfig     `yaml:"tracing"`
-	Compression CompressionConfig `yaml:"compression"`
+	ListenAddr    string            `yaml:"listen_addr"`
+	MetricsAddr   string            `yaml:"metrics_addr"`
+	TLS           TLSConfig         `yaml:"tls"`
+	AAL           AALConfig         `yaml:"aal"`
+	ACL           ACLConfig         `yaml:"acl"`
+	Admin         AdminConfig       `yaml:"admin"`
+	Broker        BrokerConfig      `yaml:"broker"`
+	Transport     TransportConfig   `yaml:"transport"`
+	Cluster       ClusterConfig     `yaml:"cluster"`
+	Tracing       TracingConfig     `yaml:"tracing"`
+	Compression   CompressionConfig `yaml:"compression"`
+	WebTransport  WebTransportConfig `yaml:"webtransport"`
 }
 
 // AdminConfig defines settings for the gRPC Admin API.
@@ -151,6 +152,16 @@ type CompressionConfig struct {
 	Level        int  `yaml:"level"`          // ZSTD compression level (0=default, 1=fastest, 3=default)
 }
 
+// WebTransportConfig configures the optional WebTransport (HTTP/3)
+// gateway that lets web browsers connect to the broker on a separate UDP
+// port. The gateway reuses the broker's mTLS certificate from cfg.TLS —
+// only the listen address is independently configured.
+type WebTransportConfig struct {
+	Enabled  bool   `yaml:"enabled"`   // if false (default), the gateway is not started
+	ListenAddr string `yaml:"listen_addr"` // e.g. ":4433" — must be distinct from cfg.ListenAddr
+	PathPrefix string `yaml:"path_prefix"` // URL path for Extended CONNECT; defaults to "/aqueduct/wt"
+}
+
 // TransportConfig defines internal buffer limits.
 type TransportConfig struct {
 	MaxBufSize  int `yaml:"max_buf_size"`
@@ -208,6 +219,11 @@ func Default() *Config {
 			ServiceName: "aqueduct-broker",
 			Endpoint:    "localhost:4317",
 		},
+		WebTransport: WebTransportConfig{
+			Enabled:    false,
+			ListenAddr: ":4433",
+			PathPrefix: "/aqueduct/wt",
+		},
 	}
 }
 
@@ -247,6 +263,7 @@ func applyEnvOverrides(cfg *Config) {
 	applyTracingEnv(cfg)
 	applyClusterEnv(cfg)
 	applyCompressionEnv(cfg)
+	applyWebTransportEnv(cfg)
 }
 
 func applyListenEnv(cfg *Config) {
@@ -376,6 +393,12 @@ func applyClusterEnv(cfg *Config) {
 
 func applyCompressionEnv(cfg *Config) {
 	envBool("AQUEDUCT_COMPRESSION_ENABLED", &cfg.Compression.Enabled)
+}
+
+func applyWebTransportEnv(cfg *Config) {
+	envBool("AQUEDUCT_WEBTRANSPORT_ENABLED", &cfg.WebTransport.Enabled)
+	envString("AQUEDUCT_WEBTRANSPORT_LISTEN_ADDR", &cfg.WebTransport.ListenAddr)
+	envString("AQUEDUCT_WEBTRANSPORT_PATH_PREFIX", &cfg.WebTransport.PathPrefix)
 }
 
 func parseBool(str string, fallback bool) bool {

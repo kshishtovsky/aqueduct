@@ -29,6 +29,7 @@ import (
 	"github.com/kshishtovsky/aqueduct/internal/metrics"
 	"github.com/kshishtovsky/aqueduct/internal/protocol"
 	"github.com/kshishtovsky/aqueduct/internal/transport"
+	"github.com/kshishtovsky/aqueduct/internal/webtransport"
 	"github.com/quic-go/quic-go"
 )
 
@@ -72,6 +73,7 @@ func main() {
 	}
 
 	var tlsConf *tls.Config
+	var webTransportTLS *tls.Config // separate *tls.Config for the WT gateway so we don't mutate tlsConf
 
 	if !cfg.TLS.Generate && cfg.TLS.CertFile != "" && cfg.TLS.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
@@ -321,6 +323,48 @@ func main() {
 
 	logger.Info("broker started", "addr", b.Addr())
 
+	// WebTransport (HTTP/3) gateway — optionally started on its own
+	// UDP port. Reuses the broker's mTLS cert so browser clients and
+	// native QUIC clients share the same trust root.
+	//
+	// Browser clients connect via the W3C WebTransport API, transparently
+	// proxied into the broker's binary frame protocol. Zero changes to
+	// the wire format and zero changes to the router.
+	var wtGateway *webtransport.Gateway
+	if cfg.WebTransport.Enabled {
+		// Build a TLS config that mirrors the broker's, minus the
+		// ALPN `aqueduct-v1` selector (the gateway speaks HTTP/3).
+		webTransportTLS = tlsConf.Clone()
+		foundH3 := false
+		for _, p := range webTransportTLS.NextProtos {
+			if p == "h3" {
+				foundH3 = true
+				break
+			}
+		}
+		if !foundH3 {
+			webTransportTLS.NextProtos = append(webTransportTLS.NextProtos, "h3")
+		}
+
+		wtOpts := []webtransport.Option{
+			webtransport.WithBroker(b),
+		}
+		if cfg.WebTransport.PathPrefix != "" {
+			wtOpts = append(wtOpts, webtransport.WithPathPrefix(cfg.WebTransport.PathPrefix))
+		}
+		gw, err := webtransport.New(wtOpts...)
+		if err != nil {
+			logger.Error("failed to build webtransport gateway", "err", err)
+			os.Exit(1)
+		}
+		if err := gw.ListenAndServe(ctx, cfg.WebTransport.ListenAddr, webTransportTLS); err != nil {
+			logger.Error("failed to start webtransport listener", "err", err)
+			os.Exit(1)
+		}
+		wtGateway = gw
+		logger.Info("webtransport gateway started", "addr", gw.Addr(), "path_prefix", cfg.WebTransport.PathPrefix)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -332,6 +376,10 @@ func main() {
 
 	if adminServer != nil {
 		adminServer.Stop()
+	}
+
+	if wtGateway != nil {
+		_ = wtGateway.Close()
 	}
 
 	if err := b.Shutdown(shutdownCtx); err != nil {

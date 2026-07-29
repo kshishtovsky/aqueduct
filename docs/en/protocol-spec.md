@@ -90,3 +90,54 @@ When stored in Append-Only Log files (encrypted or raw), records are framed as:
 | (Little-Endian)   | (Session+Counter) | (Header+Payload)  |
 +-------------------+-------------------+-------------------+
 ```
+
+---
+
+## 6. WebTransport Transport Binding (v1.16.0+)
+
+Browser clients reach the broker via the W3C [WebTransport API](https://www.w3.org/TR/webtransport/), which encapsulates HTTP/3 over QUIC. The framing above is **identical** to the native QUIC transport — the WebTransport gateway (`internal/webtransport/`) only translates the HTTP/3 connection layer.
+
+### 6.1 Connection Establishment
+
+Browser JS:
+```js
+const transport = new WebTransport("https://broker.example.com:4433/aqueduct/wt");
+await transport.ready;
+```
+
+Server-side: `webtransport.Gateway.handleConn` calls `http3.NewRawServerConn` to complete the HTTP/3 SETTINGS exchange, then parses the inbound Extended CONNECT request and validates:
+
+- `:method = CONNECT`
+- `:scheme = https`
+- `:authority = broker.example.com:4433`
+- `:path = /aqueduct/wt` (configurable via `webtransport.path_prefix`)
+- `:protocol = webtransport`
+
+A 200 OK response completes the handshake. Subsequent bi-directional streams on the same QUIC connection carry the broker's binary frames.
+
+### 6.2 Stream Mapping
+
+| WebTransport stream type | Broker counterpart |
+| :------------------------ | :------------------ |
+| Server-initiated unidirectional | (reserved for HTTP/3 control; ignored by the gateway) |
+| Client-initiated unidirectional | (dropped — streams with unknown type per RFC 9298) |
+| Client-initiated bidirectional | `*quic.Stream` from `conn.AcceptStream()` |
+| Server-initiated bidirectional | (the handshake request stream itself, kept open for capsule protocol) |
+
+After handshake, every client-opened bidi stream is fed to `transport.Broker.HandleStream(ctx, conn, stream, clientID)` — the same method the native QUIC transport uses. The frame parser dispatches `CmdSubscribe`, `CmdPublish`, etc., identically.
+
+### 6.3 0-RTT and TLS
+
+The QUIC layer underneath HTTP/3 negotiates 0-RTT as long as `quic.Config.Allow0RTT = true` is set on both sides. The gateway sets this by default. Browsers store the session ticket on the first connection and reuse it on subsequent connections, eliminating a full RTT.
+
+The broker enforces TLS 1.3 (`MinVersion = tls.VersionTLS13`) on the WebTransport listener even if the operator's certificate disables it — older TLS versions are silently rejected.
+
+### 6.4 Browser Frame Format
+
+Browsers writing to a WebTransport bidirectional stream produce the **same binary layout** as native clients:
+
+```
+[Magic: 1 byte = 0x1F][Cmd: 1 byte][StreamID: 4 bytes (little-endian)][DataLen: 4 bytes (little-endian)][Payload: N bytes]
+```
+
+Identical constants (see §1, §2). Identical TLV extension encoding (see §3). The `examples/web/app.js` reference client implements `buildFrame()` and `parseFrame()` matching this layout.

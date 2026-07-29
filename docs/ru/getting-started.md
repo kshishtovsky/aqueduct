@@ -1,4 +1,4 @@
-# Руководство: Быстрый старт с Aqueduct (v1.14.0)
+# Руководство: Быстрый старт с Aqueduct (v1.16.0)
 
 Это пошаговое руководство поможет вам установить, настроить и запустить мессендж-брокер Aqueduct.
 
@@ -133,3 +133,69 @@ cluster:
 ## 5. NACK и Dead Letter Queue (DLQ)
 
 Подписчики могут отправить NACK (Negative Acknowledgement) для сообщения по смещению с помощью команды `CmdNack` (0x05). Брокер автоматически выполняет повторную доставку (до `max_retries`), после чего сообщение направляется в очередь недоставленных сообщений `__dlq__<topic>`.
+
+---
+
+## 6. WebTransport (подключение из браузера) (v1.16.0+)
+
+Aqueduct содержит опциональный шлюз HTTP/3 + WebTransport, который позволяет браузерам подключаться через W3C [WebTransport API](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport). Шлюз переиспользует mTLS-сертификат брокера — единый trust root для нативных и браузерных клиентов.
+
+### 6.1 Включение шлюза в `config.yaml`
+
+```yaml
+tls:
+  generate: false                  # ОБЯЗАТЕЛЬНО для WebTransport — браузеры отвергают самоподписанные сертификаты.
+  cert_file: "/etc/aqueduct/fullchain.pem"
+  key_file:  "/etc/aqueduct/privkey.pem"
+
+webtransport:
+  enabled: true
+  listen_addr: ":4433"            # UDP-порт отличный от основного broker.listen_addr
+  path_prefix: "/aqueduct/wt"     # клиенты шлют Extended CONNECT сюда
+```
+
+Для локальной разработки самый простой путь — [`mkcert`](https://github.com/FiloSottile/mkcert):
+
+```bash
+mkcert -install
+mkcert localhost 127.0.0.1 ::1
+# → localhost+2.pem / localhost+2-key.pem
+```
+
+Затем `tls.cert_file` / `tls.key_file` указывают на эти файлы.
+
+### 6.2 Запуск брокера
+
+```bash
+go run ./cmd/broker -config config.yaml
+# INFO  webtransport gateway started addr=:4433 path_prefix=/aqueduct/wt
+```
+
+### 6.3 Браузерный пример
+
+```bash
+cd examples/web
+go run -mod=mod - <<'EOF'
+package main
+import ("log"; "net/http")
+func main() {
+    log.Fatal(http.ListenAndServeTLS(":8443",
+        "/path/to/localhost+2.pem",
+        "/path/to/localhost+2-key.pem",
+        http.FileServer(http.Dir("."))))
+}
+EOF
+```
+
+Откройте `https://localhost:8443/index.html`. Нажмите **Connect** для открытия WebTransport-сессии, затем **Open Subscribe Stream** — и публикации с любых клиентов (браузер, нативный Go, Node.js) появятся в логе.
+
+### 6.4 Формат фрейма в браузере
+
+Идентичен нативному QUIC-клиенту: 10-байтовый заголовок `[Magic:1][Cmd:1][StreamID:4][DataLen:4][Payload:N]`. Magic = `0x1F`, `CmdSubscribe = 0x02`, `CmdPublish = 0x01`. Полная реализация — в `examples/web/app.js` (`buildFrame`/`parseFrame`).
+
+### 6.5 Чек-лист для production
+
+- Публично доверенный сертификат (Let's Encrypt или внутренний CA).
+- SAN сертификата содержит хостнейм, по которому ходят клиенты (например `broker.example.com`).
+- Откройте UDP/443 (или настроенный порт) на фаерволе.
+- Если клиенты не имеют клиентского сертификата, оставьте `tls.require_client_cert: false` — шлюз наследует политику брокера.

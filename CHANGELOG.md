@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-07-29
+
+### Added
+- **WebTransport Gateway (HTTP/3 + W3C WebTransport)**: New `internal/webtransport/` package lets web browsers connect to the broker over HTTP/3 using the W3C WebTransport API. The gateway accepts Extended CONNECT requests on a configurable UDP port (default `:4433`) and proxies every bidi stream into the existing `transport.Broker.HandleStream` pipeline — **zero protocol changes** required.
+- **Browser Example**: `examples/web/index.html` + `examples/web/app.js` provide a self-contained HTML+TS page that subscribes and publishes via WebTransport using `DataView` to assemble the same binary `[Magic:1][Cmd:1][StreamID:4][DataLen:4][Payload:N]` frame native QUIC clients use.
+- **TLS Reuse**: The gateway reuses the broker's mTLS certificate via `http3.ConfigureTLSConfig`, so operators need to manage a single cert for both transports.
+- **Configurable Handshake Timeout**: `WithHandshakeTimeout(...)` cap on the Extended CONNECT round trip prevents Slowloris-style attacks.
+- **Tab-Coordination Free Concurrency**: Multiple concurrent WebTransport sessions, multiple bidi streams per session, and cross-transport routing are exercised by `TestGateway_ConcurrentSessions`, `TestGateway_StreamSurvivesServerPush`, and `TestGateway_CrossTransportRouting`.
+- **Statement Coverage**: 79.7% on `internal/webtransport/`, 100% on the routing-key path.
+
+### Fixed
+- **TopicHash collision bug** (v1.16.0): publish payloads with embedded `topic:` or `ttl:<ms>:` prefixes were producing different routing keys than subscriber registration, silently dropping messages and breaking `OnPublish`/`OnDeliver` metric labels. Introduced a single-source-of-truth `parsePublishTopic` extractor and `topicHashKey` helper used by `publishWithClientID`, `publishLocal`, `PublishBatch`, `runBackfillWorker`, and `Subscribe`. Existing subscribers registered via `topic:<name>` and publishers sending `topic:<name>` now route to the same slot; topics carrying the optional `topic:` prefix are silently normalized.
+- **Regression Test**: `internal/broker/topic_extraction_test.go` locks the fix in (8 table-driven cases + 2 end-to-end collision tests against a real QUIC router).
+
+### Performance & Security
+- `BenchmarkWTGateway_Handshake`: 10 handshakes completed in 3.3 ms each (full mTLS + HTTP/3 SETTINGS + Extended CONNECT + frame dispatch).
+- `BenchmarkWTGateway_PublishLatency`: end-to-end Publish → WT-subscriber-Read at ~1.25 ms/op on loopback.
+- `go test -race ./...`: **0 data races** across all packages including the new gateway, broker, and transport tests.
+- mTLS is enforced: `tls.MinVersion = tls.VersionTLS13` is forced in `cloneTLSForH3`, and the gateway refuses TLS 1.2 even if the operator's certificate disables it.
+- `http3.Server.EnableDatagrams = true` reserves the SETTINGS knob for future WebTransport datagram support (v1.17+ roadmap).
+- Fuzz-tested: `TestFuzzParsePublishTopic` ran for 10 s with 0 panics / 0 unsafe reads.
+
+## [1.15.0] - 2026-07-27
+
+### Added
+- *Placeholder for v1.15.0 release notes — see git history.*
+
 ## [1.14.0] - 2026-07-26
 
 ### Added

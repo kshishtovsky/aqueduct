@@ -295,6 +295,17 @@ func runHandleConn(b *Broker, jig context.Context, conn *quic.Conn) {
 
 // processStream reads frames from a single QUIC stream and dispatches them.
 func (b *Broker) processStream(jig context.Context, conn *quic.Conn, stream *quic.Stream, clientIDStr string) {
+	b.HandleStream(jig, conn, stream, clientIDStr)
+}
+
+// HandleStream is the public, transport-agnostic entry point for feeding a
+// single bidirectional QUIC stream through the broker's frame parser,
+// authorization engine, AAL log, and router. It is safe to call from any
+// goroutine; concurrency control is handled inside transport.Broker.
+//
+// Use this when integrating new transports (e.g. internal/webtransport) that
+// ride on top of QUIC bi-di streams without spawning an extra transport.Broker.
+func (b *Broker) HandleStream(jig context.Context, conn *quic.Conn, stream *quic.Stream, clientIDStr string) {
 	span := b.newStreamSpan(stream, conn, clientIDStr)
 
 	// Ensure cleanup on stream close.

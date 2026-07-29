@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Aqueduct WebTransport Example</title>
+  <style>
+    body {
+      font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+      max-width: 960px;
+      margin: 32px auto;
+      padding: 0 24px;
+      color: #1a1a1a;
+      background: #fafaf7;
+      line-height: 1.5;
+    }
+    h1 { color: #0a2e6e; }
+    code, pre { background: #f0f0ea; padding: 2px 6px; border-radius: 4px; }
+    pre { padding: 12px; overflow-x: auto; }
+    .log {
+      background: #1a1a1a;
+      color: #cef0d6;
+      padding: 12px;
+      border-radius: 6px;
+      max-height: 320px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-size: 12px;
+    }
+    .log .err { color: #ff7878; }
+    .log .ok  { color: #79e87c; }
+    .log .info { color: #b8d9ff; }
+    section {
+      background: white;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+      border: 1px solid #e0e0d8;
+      border-radius: 6px;
+    }
+    button {
+      background: #0a2e6e;
+      color: white;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      margin-right: 8px;
+    }
+    button:disabled { background: #999; cursor: not-allowed; }
+    input[type="text"] {
+      padding: 6px 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font: inherit;
+      width: 240px;
+    }
+    .status {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 4px;
+      background: #ddd;
+      color: #555;
+      font-size: 12px;
+    }
+    .status.connected { background: #c8f0c8; color: #186218; }
+    .status.connecting { background: #fff7c0; color: #806200; }
+    .status.error { background: #ffd2d2; color: #a01818; }
+  </style>
+</head>
+<body>
+  <h1>🌊 Aqueduct WebTransport Example</h1>
+  <p>
+    This page connects to a running Aqueduct broker via the browser's native
+    <strong>WebTransport API</strong> (HTTP/3 + QUIC). It opens a bidi stream
+    and sends a <code>CmdSubscribe</code> frame; messages published on the
+    same topic over <em>any</em> transport (native QUIC, another WebTransport
+    client, the cluster mesh) are echoed back in the log.
+  </p>
+  <p>The wire protocol is the same binary frame used by native clients — no JSON, no protobuf, no parsing.</p>
+
+  <section>
+    <h2>1. Connection</h2>
+    <label>Broker URL (HTTPS):
+      <input id="brokerUrl" type="text" value="https://localhost:4433/aqueduct/wt" />
+    </label>
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+    <span id="status" class="status">disconnected</span>
+  </section>
+
+  <section>
+    <h2>2. Subscribe to a topic</h2>
+    <label>Topic (e.g. <code>orders</code>):
+      <input id="topic" type="text" value="orders" />
+    </label>
+    <button id="subscribeBtn" disabled>Open Subscribe Stream</button>
+    <p style="font-size:13px;color:#666;">
+      The browser opens a WebTransport bidirectional stream and writes a single
+      <code>CmdSubscribe</code> binary frame. Any subsequent binary frames
+      arriving on the same stream are parsed and rendered.
+    </p>
+  </section>
+
+  <section>
+    <h2>3. Publish a message</h2>
+    <label>Topic:
+      <input id="publishTopic" type="text" value="orders" />
+    </label>
+    <label>Message:
+      <input id="publishMsg" type="text" value="hello from the browser" />
+    </label>
+    <button id="publishBtn" disabled>Open Publish Stream</button>
+    <p style="font-size:13px;color:#666;">
+      Each click opens a NEW WebTransport bidi stream and writes a single
+      <code>CmdPublish</code> frame. The frame bytes match the broker's
+      native QUIC wire format — the gateway doesn't translate or reformat.
+    </p>
+  </section>
+
+  <section>
+    <h2>Event Log</h2>
+    <div id="log" class="log"></div>
+  </section>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
