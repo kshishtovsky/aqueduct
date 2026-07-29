@@ -68,7 +68,7 @@ jobs:
           echo "path=release_body.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@be72d2e152a185f1b5b5a87ae1cbb44664a8145e # action-gh-release v2.3.1
+        uses: softprops/action-gh-release@v3 # action-gh-release v3
         with:
           files: dist/*.tar.gz
           body_path: ${{ steps.release_notes.outputs.path }}
