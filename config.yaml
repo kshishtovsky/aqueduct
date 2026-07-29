@@ -72,7 +72,7 @@ transport:
 # Reuses the broker's mTLS certificate (cfg.tls); only the listen port is independent.
 # Set enabled: true to accept browser clients via the W3C WebTransport API.
 webtransport:
-  enabled: false             # toggle the WebTransport gateway on/off
+  enabled: true              # toggle the WebTransport gateway on/off
   listen_addr: ":4433"      # distinct from cfg.listen_addr (no two UDP ports can share)
   path_prefix: "/aqueduct/wt"  # Extended CONNECT path clients use
 
