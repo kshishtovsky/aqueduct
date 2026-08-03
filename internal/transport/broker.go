@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	defaultReadBufSize = 1024
-	defaultMaxBufSize  = 64 * 1024
+	defaultReadBufSize              = 1024
+	defaultMaxBufSize               = 64 * 1024
+	defaultMaxDecompressedPerStream = 16 * 1024 * 1024 // 16 MB per stream
 )
 
 var (
@@ -67,6 +68,8 @@ type Broker struct {
 
 	compression        broker.CompressionEngine
 	compressionMinSize int
+
+	maxDecompressedPerStream int
 }
 
 // Option configures the Broker.
@@ -127,13 +130,21 @@ func WithCompression(engine broker.CompressionEngine, minBatchSize int) Option {
 	}
 }
 
+// WithMaxDecompressedPerStream sets the maximum total decompressed bytes per
+// stream before the broker rejects further compressed frames. Default: 16 MB.
+// Prevents a single malicious peer from exhausting memory via compression bombs.
+func WithMaxDecompressedPerStream(n int) Option {
+	return func(b *Broker) { b.maxDecompressedPerStream = n }
+}
+
 // New creates a Broker with the given options. Call Listen to start accepting.
 func New(opts ...Option) *Broker {
 	b := &Broker{
-		handlers:    make(map[protocol.Command]Handler),
-		readBufSize: defaultReadBufSize,
-		maxBufSize:  defaultMaxBufSize,
-		logger:      slog.Default(),
+		handlers:                 make(map[protocol.Command]Handler),
+		readBufSize:              defaultReadBufSize,
+		maxBufSize:               defaultMaxBufSize,
+		maxDecompressedPerStream: defaultMaxDecompressedPerStream,
+		logger:                   slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -319,7 +330,10 @@ func (b *Broker) HandleStream(jig context.Context, conn *quic.Conn, stream *quic
 	buf := _rp.GetBuf(b.readBufSize)
 	defer _rp.PutBuf(buf)
 
-	b.runStreamReadLoop(jig, span, stream, clientIDStr, buf)
+	// Per-stream decompressed byte counter for compression bomb protection.
+	var decompressedBytes int64
+
+	b.runStreamReadLoop(jig, span, stream, clientIDStr, buf, &decompressedBytes)
 }
 
 // runStreamReadLoop drives the read-dispatch-grow cycle. Each iteration:
@@ -329,11 +343,11 @@ func (b *Broker) HandleStream(jig context.Context, conn *quic.Conn, stream *quic
 //
 // Errors from dispatch (oversized payload, unauthorized) cause a CancelRead/Write
 // and return. Errors from stream.Read on a closed stream are silent.
-func (b *Broker) runStreamReadLoop(jig context.Context, span *slog.Logger, stream *quic.Stream, clientIDStr string, buf []byte) {
+func (b *Broker) runStreamReadLoop(jig context.Context, span *slog.Logger, stream *quic.Stream, clientIDStr string, buf []byte, decompressedBytes *int64) {
 	off := 0
 	for {
 		if off == cap(buf) {
-			if !b.drainAndMaybeGrow(jig, span, stream, clientIDStr, &buf, &off) {
+			if !b.drainAndMaybeGrow(jig, span, stream, clientIDStr, &buf, &off, decompressedBytes) {
 				return
 			}
 		}
@@ -341,7 +355,7 @@ func (b *Broker) runStreamReadLoop(jig context.Context, span *slog.Logger, strea
 		n, err := stream.Read(buf[off:])
 		if n > 0 {
 			off += n
-			newOff, dispatchErr := b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr)
+			newOff, dispatchErr := b.dispatchFrames(jig, span, buf[:off], off, stream, clientIDStr, decompressedBytes)
 			if dispatchErr != nil {
 				b.handleDispatchError(span, stream, dispatchErr)
 				return
@@ -361,8 +375,8 @@ func (b *Broker) runStreamReadLoop(jig context.Context, span *slog.Logger, strea
 // drainAndMaybeGrow dispatches the buffered complete frames and, if the buffer
 // is still full, doubles its capacity up to b.maxBufSize. Returns false when
 // the stream must be torn down (oversized payload, unauthorized, hit max).
-func (b *Broker) drainAndMaybeGrow(jig context.Context, span *slog.Logger, stream *quic.Stream, clientIDStr string, buf *[]byte, off *int) bool {
-	newOff, err := b.dispatchFrames(jig, span, (*buf)[:*off], *off, stream, clientIDStr)
+func (b *Broker) drainAndMaybeGrow(jig context.Context, span *slog.Logger, stream *quic.Stream, clientIDStr string, buf *[]byte, off *int, decompressedBytes *int64) bool {
+	newOff, err := b.dispatchFrames(jig, span, (*buf)[:*off], *off, stream, clientIDStr, decompressedBytes)
 	if err != nil {
 		b.handleDispatchError(span, stream, err)
 		return false
@@ -432,10 +446,10 @@ func (b *Broker) newStreamSpan(stream *quic.Stream, conn *quic.Conn, clientIDStr
 // Refactored into a slim orchestrator: header/decompress/authz/AAL are
 // handled by prepareFrame, routing decisions by routeFrame. Each complete
 // frame is parsed exactly once.
-func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []byte, off int, stream *quic.Stream, clientIDStr string) (int, error) {
+func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []byte, off int, stream *quic.Stream, clientIDStr string, decompressedBytes *int64) (int, error) {
 	consumed := 0
 	for consumed < off {
-		frame, totalLen, partial, err := b.prepareFrame(jig, logger, buf, off, consumed, stream, clientIDStr)
+		frame, totalLen, partial, err := b.prepareFrame(jig, logger, buf, off, consumed, stream, clientIDStr, decompressedBytes)
 		if err != nil {
 			return 0, err
 		}
@@ -457,7 +471,7 @@ func (b *Broker) dispatchFrames(jig context.Context, logger *slog.Logger, buf []
 //	totalLen — the wire length to advance the buffer by (0 when partial)
 //	partial  — true when the buffer holds no complete frame; caller breaks
 //	err      — non-nil on protocol/auth/decompression failures
-func (b *Broker) prepareFrame(jig context.Context, logger *slog.Logger, buf []byte, off int, consumed int, stream *quic.Stream, clientIDStr string) (protocol.Frame, int, bool, error) {
+func (b *Broker) prepareFrame(jig context.Context, logger *slog.Logger, buf []byte, off int, consumed int, stream *quic.Stream, clientIDStr string, decompressedBytes *int64) (protocol.Frame, int, bool, error) {
 	remaining := off - consumed
 	if remaining < protocol.HeaderSize {
 		if remaining > b.maxBufSize {
@@ -483,7 +497,7 @@ func (b *Broker) prepareFrame(jig context.Context, logger *slog.Logger, buf []by
 
 	// Decompress payload if Compression TLV extension is present.
 	// This must happen before authorization and routing.
-	_, extToRelease, derr := b.decompressFrame(frame)
+	_, extToRelease, derr := b.decompressFrame(frame, decompressedBytes)
 	if derr != nil {
 		logger.Warn("frame decompression error", "err", derr)
 		stream.CancelRead(1)
@@ -500,7 +514,7 @@ func (b *Broker) prepareFrame(jig context.Context, logger *slog.Logger, buf []by
 		if requiredPerm != authz.PermNone {
 			topicBytes := extractTopicBytes(frame.Payload)
 			if !b.authz.Allowed(clientIDStr, topicBytes, requiredPerm) {
-				metrics.AuthzDenied.WithLabelValues(clientIDStr, string(topicBytes)).Inc()
+				metrics.AuthzDenied.WithLabelValues(metrics.SanitizeClient(clientIDStr), metrics.SanitizeTopic(string(topicBytes))).Inc()
 				return protocol.Frame{}, 0, false, errUnauthorized
 			}
 		}
@@ -736,7 +750,7 @@ func parseAckPayload(payload []byte) (consumerID, topic string, offset uint64, e
 // On decompression, strips the Compression TLV from extensions so downstream
 // routing does not see it. The second return value is a slab-allocated extension
 // block that the caller must ReleaseExtensions when routing is complete.
-func (b *Broker) decompressFrame(frame protocol.Frame) (protocol.Frame, []byte, error) {
+func (b *Broker) decompressFrame(frame protocol.Frame, decompressedBytes *int64) (protocol.Frame, []byte, error) {
 	if b.compression == nil {
 		return frame, nil, nil
 	}
@@ -754,6 +768,17 @@ func (b *Broker) decompressFrame(frame protocol.Frame) (protocol.Frame, []byte, 
 	}
 	if uncompressedSize > uint32(b.maxBufSize)*16 { // #nosec G115 -- maxBufSize is operator-configured and bounded (< 2^28 default 64KB).
 		return frame, nil, errors.New("decompressed size exceeds max limit")
+	}
+
+	// Per-stream decompression byte budget: reject if this stream has already
+	// decompressed more than the configured limit. Prevents compression bombs
+	// from exhausting server memory via repeated small compressed frames.
+	if decompressedBytes != nil {
+		newTotal := *decompressedBytes + int64(uncompressedSize)
+		if newTotal > int64(b.maxDecompressedPerStream) {
+			return frame, nil, errors.New("per-stream decompressed byte limit exceeded")
+		}
+		*decompressedBytes = newTotal
 	}
 
 	decompressed, err := b.compression.Decompress(frame.Payload, int(uncompressedSize))

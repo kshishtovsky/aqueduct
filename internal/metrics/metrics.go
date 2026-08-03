@@ -1,10 +1,70 @@
 package metrics
 
 import (
+	"hash/fnv"
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// maxUniqueLabels is the hard cap on unique label values per metric family.
+// When exceeded, new values are hashed into a single overflow bucket to prevent
+// unbounded memory growth from high-cardinality attacker-controlled labels.
+const maxUniqueLabels = 4096
+
+// labelBounded is a concurrent-safe map that caps the number of unique label
+// values. New values beyond the cap are collapsed into an overflow bucket.
+type labelBounded struct {
+	mu       sync.RWMutex
+	mapping  map[string]string
+	count    int
+	overflow string
+}
+
+func newLabelBounded() *labelBounded {
+	return &labelBounded{
+		mapping:  make(map[string]string, 64),
+		overflow: "__overflow__",
+	}
+}
+
+// sanitize returns a bounded label value. Known values pass through instantly.
+// Unknown values are admitted until the cap is hit, then mapped to the overflow bucket.
+func (b *labelBounded) sanitize(val string) string {
+	b.mu.RLock()
+	if mapped, ok := b.mapping[val]; ok {
+		b.mu.RUnlock()
+		return mapped
+	}
+	b.mu.RUnlock()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Re-check after acquiring write lock.
+	if mapped, ok := b.mapping[val]; ok {
+		return mapped
+	}
+
+	if b.count >= maxUniqueLabels {
+		// Hash to detect collisions but always return overflow bucket.
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(val))
+		b.mapping[val] = b.overflow
+		return b.overflow
+	}
+
+	b.mapping[val] = val
+	b.count++
+	return val
+}
+
 var (
+	// Bounded label sanitizers for high-cardinality labels.
+	sanitizeTopic    = newLabelBounded()
+	sanitizeClient   = newLabelBounded()
+	sanitizeConsumer = newLabelBounded()
+
 	MessagesPublished = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "aqueduct_messages_published_total",
@@ -84,7 +144,7 @@ var (
 	DurableSubscribersActive = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "aqueduct_durable_subscriptions_active",
-			Help: "Current number of active durable subscribers across all topics",
+			Help: "Current number of active durable subscriptions across all topics",
 		},
 	)
 
@@ -163,6 +223,15 @@ var (
 		[]string{"method"},
 	)
 )
+
+// SanitizeTopic returns a cardinality-bounded topic label value.
+func SanitizeTopic(topic string) string { return sanitizeTopic.sanitize(topic) }
+
+// SanitizeClient returns a cardinality-bounded client label value.
+func SanitizeClient(client string) string { return sanitizeClient.sanitize(client) }
+
+// SanitizeConsumer returns a cardinality-bounded consumer label value.
+func SanitizeConsumer(consumer string) string { return sanitizeConsumer.sanitize(consumer) }
 
 func init() {
 	prometheus.MustRegister(MessagesPublished)

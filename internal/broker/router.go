@@ -390,7 +390,7 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 			} else {
 				r.durableOffsets[groupDurableKey] = spec.RequestedOffset
 			}
-			metrics.ConsumerOffset.WithLabelValues(spec.GroupID, spec.Topic).Set(float64(r.durableOffsets[groupDurableKey]))
+			metrics.ConsumerOffset.WithLabelValues(metrics.SanitizeConsumer(spec.GroupID), metrics.SanitizeTopic(spec.Topic)).Set(float64(r.durableOffsets[groupDurableKey]))
 		}
 	} else {
 		r.topicIndex[topicHash] = append(r.topicIndex[topicHash], idx)
@@ -407,7 +407,7 @@ func (r *Router) Subscribe(ctx context.Context, stream *quic.Stream, frame proto
 		durableKey := authz.CombineHashStrings(spec.ConsumerID, spec.Topic)
 		r.durableOffsets[durableKey] = spec.RequestedOffset
 		metrics.DurableSubscribersActive.Inc()
-		metrics.ConsumerOffset.WithLabelValues(spec.ConsumerID, spec.Topic).Set(float64(spec.RequestedOffset))
+		metrics.ConsumerOffset.WithLabelValues(metrics.SanitizeConsumer(spec.ConsumerID), metrics.SanitizeTopic(spec.Topic)).Set(float64(spec.RequestedOffset))
 	}
 
 	if r.metrics != nil {
@@ -486,13 +486,13 @@ func (r *Router) AckOffset(consumerID, topic string, offset uint64) {
 			groupKey := authz.CombineHashStrings(groupID, topic)
 			if groupID == consumerID || (r.active[i] && r.subGroups[i] == consumerID) {
 				r.durableOffsets[groupKey] = offset
-				metrics.ConsumerOffset.WithLabelValues(groupID, topic).Set(float64(offset))
+				metrics.ConsumerOffset.WithLabelValues(metrics.SanitizeConsumer(groupID), metrics.SanitizeTopic(topic)).Set(float64(offset))
 			}
 		}
 	}
 	r.mu.Unlock()
 
-	metrics.ConsumerOffset.WithLabelValues(consumerID, topic).Set(float64(offset))
+	metrics.ConsumerOffset.WithLabelValues(metrics.SanitizeConsumer(consumerID), metrics.SanitizeTopic(topic)).Set(float64(offset))
 }
 
 // GetGroupOffset returns the acknowledged offset for a consumer group on topic.
@@ -769,7 +769,7 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 		r.nackCounters[key] = count
 		r.nackMu.Unlock()
 
-		metrics.MessagesNacked.WithLabelValues(topicName).Inc()
+		metrics.MessagesNacked.WithLabelValues(metrics.SanitizeTopic(topicName)).Inc()
 
 		if int(count) < r.maxRetries {
 			// Attach original offset as TLV extension so the retry delivery
@@ -791,7 +791,7 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 		}
 
 		dlqTopic := "__dlq__" + topicName
-		metrics.MessagesDeadLettered.WithLabelValues(topicName).Inc()
+		metrics.MessagesDeadLettered.WithLabelValues(metrics.SanitizeTopic(topicName)).Inc()
 		r.nackMu.Lock()
 		delete(r.nackCounters, key)
 		r.nackMu.Unlock()
@@ -811,7 +811,7 @@ func (r *Router) runSubscriberWriter(ctx context.Context, stream *quic.Stream, t
 			if msgRef.IsExpired(nowNano) {
 				msgRef.Release()
 				pStr := strconv.Itoa(int(pLevel))
-				metrics.MessagesExpired.WithLabelValues(topic, pStr).Inc()
+				metrics.MessagesExpired.WithLabelValues(metrics.SanitizeTopic(topic), pStr).Inc()
 				continue
 			}
 
@@ -1189,7 +1189,7 @@ func (r *Router) handleOverflow(idx int, topic string, q chan *MessageRef, msgRe
 			if oldest != nil {
 				oldest.Release()
 			}
-			metrics.MessagesDropped.WithLabelValues(topic, "drop_oldest").Inc()
+			metrics.MessagesDropped.WithLabelValues(metrics.SanitizeTopic(topic), "drop_oldest").Inc()
 			select {
 			case q <- msgRef:
 			default:
@@ -1206,7 +1206,7 @@ func (r *Router) handleOverflow(idx int, topic string, q chan *MessageRef, msgRe
 
 	case PolicyDropNewest:
 		msgRef.Release()
-		metrics.MessagesDropped.WithLabelValues(topic, "drop_newest").Inc()
+		metrics.MessagesDropped.WithLabelValues(metrics.SanitizeTopic(topic), "drop_newest").Inc()
 		return -1
 
 	case PolicyDisconnect:

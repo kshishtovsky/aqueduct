@@ -28,8 +28,10 @@ type Config struct {
 
 // AdminConfig defines settings for the gRPC Admin API.
 type AdminConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Addr    string `yaml:"addr"`
+	Enabled         bool     `yaml:"enabled"`
+	Addr            string   `yaml:"addr"`
+	ClientCAFile    string   `yaml:"client_ca_file"`    // CA PEM for verifying admin client certs
+	CNAllowlist     []string `yaml:"cn_allowlist"`       // exact CN values allowed (e.g. ["admin-primary"])
 }
 
 // TracingConfig defines OpenTelemetry tracing settings.
@@ -37,6 +39,8 @@ type TracingConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	ServiceName string `yaml:"service_name"`
 	Endpoint    string `yaml:"endpoint"`
+	TLSEnabled  bool   `yaml:"tls_enabled"`  // use TLS for OTLP gRPC connection
+	CAFile      string `yaml:"ca_file"`      // custom CA PEM for OTLP server verification
 }
 
 // ClusterConfig holds peer addresses and discovery settings for Direct Mesh Federation.
@@ -172,7 +176,7 @@ type TransportConfig struct {
 func Default() *Config {
 	return &Config{
 		ListenAddr:  ":4242",
-		MetricsAddr: ":9090",
+		MetricsAddr: "127.0.0.1:9090",
 		TLS: TLSConfig{
 			Generate:          true,
 			RequireClientCert: false,
@@ -294,6 +298,8 @@ func applyACLEnv(cfg *Config) {
 func applyAdminEnv(cfg *Config) {
 	envBool("AQUEDUCT_ADMIN_ENABLED", &cfg.Admin.Enabled)
 	envString("AQUEDUCT_ADMIN_ADDR", &cfg.Admin.Addr)
+	envString("AQUEDUCT_ADMIN_CLIENT_CA_FILE", &cfg.Admin.ClientCAFile)
+	envStringList("AQUEDUCT_ADMIN_CN_ALLOWLIST", &cfg.Admin.CNAllowlist)
 }
 
 // applyBrokerEnv reads AQUEDUCT_BROKER_* env vars into cfg.Broker.
@@ -313,6 +319,13 @@ func applyBrokerEnv(cfg *Config) {
 func envString(name string, dst *string) {
 	if v := os.Getenv(name); v != "" {
 		*dst = v
+	}
+}
+
+// envStringList splits a comma-separated env var into a string slice.
+func envStringList(name string, dst *[]string) {
+	if v := os.Getenv(name); v != "" {
+		*dst = strings.Split(v, ",")
 	}
 }
 
@@ -380,6 +393,8 @@ func applyTracingEnv(cfg *Config) {
 	envBool("AQUEDUCT_TRACING_ENABLED", &cfg.Tracing.Enabled)
 	envString("AQUEDUCT_TRACING_SERVICE_NAME", &cfg.Tracing.ServiceName)
 	envString("AQUEDUCT_TRACING_ENDPOINT", &cfg.Tracing.Endpoint)
+	envBool("AQUEDUCT_TRACING_TLS_ENABLED", &cfg.Tracing.TLSEnabled)
+	envString("AQUEDUCT_TRACING_CA_FILE", &cfg.Tracing.CAFile)
 }
 
 func applyClusterEnv(cfg *Config) {
