@@ -11,8 +11,8 @@ func TestConfigDefault(t *testing.T) {
 	if cfg.ListenAddr != ":4242" {
 		t.Errorf("expected default ListenAddr :4242, got %q", cfg.ListenAddr)
 	}
-	if cfg.MetricsAddr != ":9090" {
-		t.Errorf("expected default MetricsAddr :9090, got %q", cfg.MetricsAddr)
+	if cfg.MetricsAddr != "127.0.0.1:9090" {
+		t.Errorf("expected default MetricsAddr 127.0.0.1:9090, got %q", cfg.MetricsAddr)
 	}
 	if !cfg.TLS.Generate {
 		t.Errorf("expected default TLS.Generate true, got false")

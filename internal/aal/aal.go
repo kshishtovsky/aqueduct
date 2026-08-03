@@ -223,9 +223,11 @@ func decodeReplayChunk(buf []byte, gcm cipher.AEAD, handler func([]byte) error, 
 		}
 		recLen := int(binary.LittleEndian.Uint32(buf[consumed : consumed+4]))
 		if recLen <= 0 || recLen > 10*1024*1024 {
-			// Corrupt record length; recover by advancing 1 byte and
-			// continuing (best-effort resync).
-			consumed++
+			// Corrupt record length; scan forward to the next plausible
+			// record boundary instead of blind 1-byte advance. This avoids
+			// processing garbage data as valid frames when corrupted bytes
+			// happen to align with a frame structure.
+			consumed = resyncToNextRecord(buf, consumed)
 			continue
 		}
 		if remaining < 4+recLen {
@@ -244,6 +246,31 @@ func decodeReplayChunk(buf []byte, gcm cipher.AEAD, handler func([]byte) error, 
 		consumed += 4 + recLen
 	}
 	return consumed, count, nil
+}
+
+// resyncToNextRecord scans forward from pos to find the next plausible AAL
+// record boundary. It looks for a 4-byte length prefix followed by data that
+// starts with the frame magic byte (0x1F) — the first byte of every valid
+// Aqueduct frame. This is much safer than blind 1-byte advance because it
+// reduces the chance of processing garbage data as a valid frame.
+func resyncToNextRecord(buf []byte, pos int) int {
+	// Cap scan distance to avoid quadratic blowup on fully corrupted data.
+	maxScan := pos + 1024
+	if maxScan > len(buf) {
+		maxScan = len(buf)
+	}
+	for i := pos + 1; i+4 < maxScan; i++ {
+		recLen := int(binary.LittleEndian.Uint32(buf[i : i+4]))
+		if recLen <= 0 || recLen > 10*1024*1024 {
+			continue
+		}
+		// Check if the record body starts with the frame magic byte.
+		if i+4+recLen <= len(buf) && buf[i+4] == 0x1F {
+			return i
+		}
+	}
+	// No plausible boundary found; skip the corrupted region entirely.
+	return maxScan
 }
 
 // decryptReplayRecord decrypts one AAL record. Returns (plaintext, ok, err).

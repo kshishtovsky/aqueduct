@@ -310,9 +310,6 @@ func (g *Gateway) serveHandshake(rawConn *http3.RawServerConn, first *quic.Strea
 // open for the WT session's capsule protocol (per RFC 9298 §3.1).
 func (g *Gateway) handler(conn *quic.Conn) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// TEMP DEBUG: log exactly what we received.
-		fmt.Printf("[DEBUG wt-handler] method=%q proto=%q path=%q ua=%q\n",
-			r.Method, r.Proto, r.URL.Path, r.Header.Get("User-Agent"))
 		if r.Proto != "webtransport" {
 			http.Error(w, "expected extended CONNECT with :protocol=webtransport", http.StatusMethodNotAllowed)
 			return

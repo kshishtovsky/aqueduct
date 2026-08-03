@@ -3,10 +3,12 @@ package admin
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 
 	adminpb "github.com/kshishtovsky/aqueduct/internal/admin/proto"
@@ -28,6 +30,8 @@ type Server struct {
 	logger       *slog.Logger
 	listener     net.Listener
 	grpcServer   *grpc.Server
+	clientCAPool *x509.CertPool // CA pool for verifying admin client certs; nil = skip CA check
+	cnAllowlist  map[string]bool // exact CN values allowed; nil = fall back to "admin-" prefix
 }
 
 // Option configures the admin Server.
@@ -55,6 +59,42 @@ func NewServer(quotaManager *quotas.Manager, authzEngine *authz.Engine, opts ...
 	return s
 }
 
+// WithClientCAFile loads a PEM CA certificate file for verifying admin client
+// certificates. When set, only clients whose certificate chains back to this CA
+// are authenticated. When empty, the default system CA pool is used.
+func WithClientCAFile(path string) Option {
+	return func(s *Server) {
+		if path == "" {
+			return
+		}
+		caPEM, err := os.ReadFile(path)
+		if err != nil {
+			s.logger.Warn("admin: failed to read client CA file", "path", path, "err", err)
+			return
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			s.logger.Warn("admin: failed to parse client CA file", "path", path)
+			return
+		}
+		s.clientCAPool = pool
+	}
+}
+
+// WithCNAllowlist sets the exact Common Name values that are permitted to call
+// the admin API. When non-empty, this replaces the default "admin-" prefix check.
+func WithCNAllowlist(cns []string) Option {
+	return func(s *Server) {
+		if len(cns) == 0 {
+			return
+		}
+		s.cnAllowlist = make(map[string]bool, len(cns))
+		for _, cn := range cns {
+			s.cnAllowlist[strings.TrimSpace(cn)] = true
+		}
+	}
+}
+
 // Start launches the gRPC admin server on the given TCP address with mTLS configuration.
 func (s *Server) Start(addr string, tlsConfig *tls.Config) error {
 	lis, err := net.Listen("tcp", addr)
@@ -65,10 +105,17 @@ func (s *Server) Start(addr string, tlsConfig *tls.Config) error {
 
 	var grpcOpts []grpc.ServerOption
 	if tlsConfig != nil {
-		creds := credentials.NewTLS(tlsConfig)
+		tc := tlsConfig.Clone()
+		// When a dedicated admin CA pool is configured, restrict client cert
+		// verification to that pool instead of the system/default CA pool.
+		if s.clientCAPool != nil {
+			tc.ClientCAs = s.clientCAPool
+			tc.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+		creds := credentials.NewTLS(tc)
 		grpcOpts = append(grpcOpts, grpc.Creds(creds))
 	}
-	grpcOpts = append(grpcOpts, grpc.UnaryInterceptor(adminAuthInterceptor(s.logger)))
+	grpcOpts = append(grpcOpts, grpc.UnaryInterceptor(s.adminAuthInterceptor()))
 
 	s.grpcServer = grpc.NewServer(grpcOpts...)
 	adminpb.RegisterAdminServiceServer(s.grpcServer, s)
@@ -175,7 +222,7 @@ func (s *Server) extractCallerCN(ctx context.Context) string {
 	return "unknown"
 }
 
-func adminAuthInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
+func (s *Server) adminAuthInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 		p, ok := peer.FromContext(ctx)
 		if !ok || p.AuthInfo == nil {
@@ -186,9 +233,19 @@ func adminAuthInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 			return nil, status.Error(codes.Unauthenticated, "missing client TLS certificate")
 		}
 		cn := tlsInfo.State.PeerCertificates[0].Subject.CommonName
-		if !strings.HasPrefix(cn, "admin-") {
-			logger.Warn("admin API access denied: invalid common name", "cn", cn, "method", info.FullMethod)
-			return nil, status.Errorf(codes.PermissionDenied, "access denied: client CN %q does not have admin role", cn)
+
+		// When an explicit CN allowlist is configured, require an exact match.
+		// Otherwise, fall back to the "admin-" prefix check (backwards-compatible).
+		if s.cnAllowlist != nil {
+			if !s.cnAllowlist[cn] {
+				s.logger.Warn("admin API access denied: CN not in allowlist", "cn", cn, "method", info.FullMethod)
+				return nil, status.Errorf(codes.PermissionDenied, "access denied: client CN %q is not in the admin allowlist", cn)
+			}
+		} else {
+			if !strings.HasPrefix(cn, "admin-") {
+				s.logger.Warn("admin API access denied: invalid common name", "cn", cn, "method", info.FullMethod)
+				return nil, status.Errorf(codes.PermissionDenied, "access denied: client CN %q does not have admin role", cn)
+			}
 		}
 		return handler(ctx, req)
 	}

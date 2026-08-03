@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-08-03
+
+### Security
+- **Debug Logging Removed** (`webtransport/server.go`): Removed `fmt.Printf("[DEBUG wt-handler]...")` that leaked request metadata (Method, Proto, Path, User-Agent) to stdout on every WebTransport handshake.
+- **Metrics Server Bound to Localhost** (`config.go`): Default `MetricsAddr` changed from `:9090` to `127.0.0.1:9090`. Prometheus `/metrics` and `/healthz` endpoints are no longer reachable from the network without explicit configuration.
+- **Per-Stream Decompression Byte Budget** (`broker.go`): Added `maxDecompressedPerStream` (default 16 MB) to prevent memory exhaustion via compression bombs. Each stream tracks cumulative decompressed bytes; compressed frames exceeding the budget are rejected. New option `WithMaxDecompressedPerStream(n)` for tuning.
+- **Admin mTLS Hardening** (`admin/server.go`, `config.go`): Added `client_ca_file` and `cn_allowlist` configuration for the gRPC Admin API. When `cn_allowlist` is set, only exact CN matches are permitted (replacing the default `admin-` prefix check). When `client_ca_file` is set, client certificates are verified against a dedicated CA pool. Env: `AQUEDUCT_ADMIN_CLIENT_CA_FILE`, `AQUEDUCT_ADMIN_CN_ALLOWLIST` (comma-separated). Backwards-compatible: empty allowlist falls back to `admin-` prefix.
+- **TLS for OTLP Tracing Exporter** (`tracer.go`, `config.go`): Added `tls_enabled` and `ca_file` to `TracingConfig`. When `tls_enabled: true`, the OTLP gRPC exporter uses TLS (with optional custom CA). Env: `AQUEDUCT_TRACING_TLS_ENABLED`, `AQUEDUCT_TRACING_CA_FILE`. Default remains insecure for backwards compatibility; a startup warning is logged when tracing is enabled without TLS.
+- **Prometheus Label Cardinality Cap** (`metrics.go`): Added `labelBounded` concurrent-safe map (max 4096 unique values per metric family) to prevent memory exhaustion from high-cardinality attacker-controlled labels. `SanitizeTopic()`, `SanitizeClient()`, `SanitizeConsumer()` wrap all `.WithLabelValues()` calls with user-controlled data in `router.go` and `broker.go`.
+- **AAL Replay Resync Improvement** (`aal.go`): Replaced blind 1-byte advance on corrupt record length with `resyncToNextRecord()` that scans forward up to 1024 bytes for a plausible record boundary (4-byte length prefix + frame magic byte `0x1F`). Prevents processing garbage data as valid frames during AAL replay.
+
+### Changed
+- Config default `MetricsAddr` is now `127.0.0.1:9090` (was `:9090`).
+- Admin API auth interceptor is now a method on `*Server` (was a standalone function) to support per-instance CA pool and CN allowlist.
+
 ## [1.16.0] - 2026-07-29
 
 ### Added

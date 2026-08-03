@@ -2,8 +2,11 @@ package tracing
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -13,6 +16,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -35,6 +39,8 @@ type Config struct {
 	Enabled     bool   `yaml:"enabled"`
 	ServiceName string `yaml:"service_name"`
 	Endpoint    string `yaml:"endpoint"`
+	TLSEnabled  bool   `yaml:"tls_enabled"`
+	CAFile      string `yaml:"ca_file"`
 }
 
 // New creates a Tracer based on config. If tracing is disabled, returns a
@@ -64,10 +70,31 @@ func New(cfg Config, logger *slog.Logger) (*Tracer, error) {
 		endpoint = "localhost:4317"
 	}
 
-	exp, err := otlptracegrpc.New(context.Background(),
+	exporterOpts := []otlptracegrpc.Option{
 		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	}
+
+	if cfg.TLSEnabled {
+		// Build TLS credentials for the OTLP gRPC connection.
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
+		if cfg.CAFile != "" {
+			// #nosec G304 -- CAFile is operator-controlled config.
+			caPEM, err := os.ReadFile(cfg.CAFile)
+			if err != nil {
+				return nil, fmt.Errorf("tracing: read CA file %q: %w", cfg.CAFile, err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(caPEM) {
+				return nil, fmt.Errorf("tracing: failed to parse CA file %q", cfg.CAFile)
+			}
+			tlsCfg.RootCAs = pool
+		}
+		exporterOpts = append(exporterOpts, otlptracegrpc.WithTLSCredentials(credentials.NewTLS(tlsCfg)))
+	} else {
+		exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
+	}
+
+	exp, err := otlptracegrpc.New(context.Background(), exporterOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("tracing: create exporter: %w", err)
 	}
